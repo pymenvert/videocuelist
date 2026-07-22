@@ -39,7 +39,8 @@ videocuelist/
 │   ├── core/                # bus de commandes, modèle de show, validation, écritures atomiques
 │   ├── params/              # système de paramètres : plages, courbes, lissage, adressage
 │   ├── cue/                 # cuelist, decks A/B, transitions, follow, préchargement (testé unitairement)
-│   ├── engine/              # players GStreamer (trait PlayerBackend), horloges média
+│   ├── engine/              # players vidéo derrière trait PlayerBackend (v1 : ffmpeg subprocess ; GStreamer en phase Pi), horloges média
+│   ├── modulation/          # LFO, BPM maître, analyse audio d'entrée (FFT) → modulateurs de paramètres
 │   ├── isf/                 # parseur ISF + traduction GLSL 330/ES300 + wrapper GLSL brut
 │   ├── compositor/          # GL : slices, homographie, effets, blend A/B, multi-outputs, mires
 │   ├── control-osc/         # serveur/client OSC (rosc)

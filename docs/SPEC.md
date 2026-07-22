@@ -23,7 +23,7 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 - **Préchargement** : la cue en standby est totalement prête (fichiers ouverts, première frame décodée, shaders compilés). Le GO est instantané.
 - **Pool de médias** : vignettes, tags, état OK/manquant, re-link, **« Collecter le show »** (copie de tous les médias dans un dossier autonome → clé USB, autre machine).
 - **Transcodeur intégré** « Optimiser pour le spectacle » (ffmpeg → HAP, file d'attente, progression).
-- **Audio** : son des vidéos lu, choix du périphérique de sortie, volume par cue + master audio.
+- **Audio** : **aucune sortie audio** (décision 2026-07-23) — le son du spectacle vit ailleurs (QLab, console son). L'audio n'entre dans l'outil que comme source de modulation (voir §7).
 
 ## 3. Matériaux — ISF & GLSL
 
@@ -44,7 +44,7 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 
 ## 5. Sorties
 
-- **Plusieurs slices par sortie, plusieurs sorties par show.** Sorties plein écran sans bordure, choix du display, bouton « identifier ».
+- **Plusieurs slices par sortie, jusqu'à 4 sorties simultanées par show.** Sorties plein écran sans bordure, choix du display, bouton « identifier ». 1080p par défaut, 4K selon machine (bench).
 - **Preview program** dans l'UI, indépendante des vraies sorties.
 - Plus tard : edge blending multi-projecteurs, NDI in/out, Spout (Windows) / Syphon (macOS).
 
@@ -69,7 +69,17 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 - Par mapping : courbe de réponse, min/max, inversion, mode **live** (override temps réel, non écrasé par les cues, avec indicateur visuel) vs **scénarisé** (enregistré dans les cues). Règle de priorité : dernière action gagne.
 - **Déclencheurs par cue** : GO manuel, note MIDI dédiée, adresse OSC, MSC.
 
-## 7. Cues & conduite
+## 7. Modulation — LFO & audio-réactif
+
+Remplace toute notion de sortie audio. Un **modulateur** est une source de signal interne qu'on branche sur n'importe quel paramètre (profondeur, offset, lissage par branchement).
+
+- **LFO** : sinus, triangle, carré (avec largeur d'impulsion), dent de scie, random S&H, drift perlin. Fréquence en **Hz définie proprement** (0,01–30 Hz) ou synchronisée BPM (division/multiplication), phase réglable, retrigger sur GO de cue.
+- **BPM maître** : tap-tempo (UI, MIDI, OSC), nudge, resync sur cue.
+- **Audio-réactif** : entrée micro/ligne de la machine, FFT fenêtrée (Hann), bandes définissables (plages de fréquences en Hz, gain, plancher), enveloppe attack/release par bande → chaque bande est un modulateur comme un autre.
+- **Qualité exigée** : évaluation à chaque frame sur horloge monotone (pas de jitter), interpolation lisse, zéro allocation en boucle de rendu, comportement identique quelle que soit la charge.
+- Les branchements modulateur→paramètre sont **enregistrés dans les cues** (une cue peut activer/désactiver/changer la profondeur d'une modulation).
+
+## 8. Cues & conduite
 
 - **Contenu d'une cue** : assignations média/matériau → slice, valeurs des paramètres scénarisés, réglages de lecture (IN/OUT, vitesse, mode de fin), transition d'entrée.
 - **Transition par cue** : durée, courbe (linéaire, ease in/out, S), type — **cut, crossfade, fondu par le noir** ; overrides par slice possibles.
@@ -79,7 +89,7 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 - GO / BACK / GOTO ; **standby** toujours visible ; préchargement systématique de la cue suivante.
 - **Master intensité** + **DBO** (fondu au noir d'urgence, temps réglable) toujours accessibles, y compris par protocoles.
 
-## 8. Vue Live (en jeu)
+## 9. Vue Live (en jeu)
 
 - **Cuelist en grand** : cue active surlignée avec **barre de progression** (temps média restant / compte à rebours de follow / progression de transition), cue suivante en standby, notes de régie visibles.
 - Moniteurs **Program** (ce qui sort réellement) et **Preview** (la cue suivante, rendue à blanc).
@@ -87,7 +97,7 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 - **Bandeau santé** : FPS par sortie, frames perdues, CPU/GPU/RAM, température (Pi), heartbeat MIDI/OSC/Art-Net.
 - **Mode show verrouillé** : édition impossible, fermeture confirmée deux fois, sorties insensibles aux clics.
 
-## 9. Fiabilité (doctrine, non négociable)
+## 10. Fiabilité (doctrine, non négociable)
 
 1. Le thread de rendu ne fait **ni I/O disque, ni compilation shader, ni allocation lourde** pendant le show.
 2. Chargement **tolérant** : média manquant → placeholder visible + avertissement ; le show se charge toujours.
@@ -96,7 +106,7 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 5. Logs horodatés + console interne ; compteurs de drops par sortie.
 6. **Mode player headless** (Pi) : boot direct sur le show, piloté OSC/MSC/Art-Net/web, watchdog systemd.
 
-## 10. UX
+## 11. UX
 
 - UI web moderne servie par le moteur : panneaux **Médias, Mapping, Cuelist, Paramètres, Patch, Sorties, Santé** ; layouts préréglés **Édition / Calage / Show**.
 - **Infobulles partout** (description + raccourci clavier), plus un mode « ? » : on l'active puis on survole n'importe quel élément pour une explication détaillée.

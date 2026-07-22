@@ -23,6 +23,17 @@ Source de vérité du projet. Format : date — décision — pourquoi.
 - **2026-07-23 — Continuité de lecture : si le même média reste sur le même slice d'une cue à l'autre, la lecture ne redémarre pas** (seuls les paramètres fondent). *Pourquoi : essentiel pour des enchaînements propres en spectacle.*
 - **2026-07-23 — Tout paramètre passe par un système unifié** : adresse OSC stable, MIDI learn avec soft-takeover, patch Art-Net 8/16 bits avec lissage (le DMX arrive à ~44 Hz), courbes de réponse, mode « live » (override non écrasé par les cues) vs « scénarisé ». *Pourquoi : une feature = un paramètre = automatiquement pilotable partout et enregistrable en cue — c'est la colonne vertébrale du produit.*
 
+## Réponses de Pym du 2026-07-23 (soir)
+
+- **2026-07-23 — Sorties : 4 simultanées maximum.** Résolution 1080p par défaut, 4K selon les vidéoprojecteurs — le moteur doit tenir 4×1080p confortablement, 4K à valider au bench par machine.
+- **2026-07-23 — Audio : AUCUNE sortie audio.** À la place, un module de **modulation** de qualité : générateurs de signaux basse fréquence (LFO sinus/triangle/carré/dent de scie/random S&H — fréquence en Hz ou synchro BPM, phase, profondeur, lissage) + **analyse audio d'entrée** (FFT fenêtrée Hann, bandes log réglables, enveloppes attack/release) pour faire évoluer n'importe quel paramètre sur des fréquences définies proprement. *Interprétation de « module de synthétisation du son » = synthèse de signaux de contrôle + audio-réactif, puisque pas de sortie son — à reconfirmer avec Pym.*
+- **2026-07-23 — Timecode : option utile confirmée** (chase MTC/LTC) — backlog v2, l'architecture des déclencheurs de cue doit le prévoir.
+- **2026-07-23 — MIDI : mapping 100 % générique + learn.** Aucune personnalité de console spécifique : « les consoles vont changer ».
+- **2026-07-23 — Partage de crates avec Lanterne : copie documentée** (en-tête de provenance dans chaque fichier repris). *Pourquoi : deux produits qui divergent, un seul mainteneur — une dépendance git créerait un enfer de versions croisées ; la copie est simple, fiable, maintenable. Décision demandée à Claude par Pym.*
+- **2026-07-23 — Backend vidéo v1 : ffmpeg en sous-processus** (frames brutes par pipe, HAP/H.264/HEVC décodés par le ffmpeg full build), derrière le trait `PlayerBackend`. *Pourquoi : pas de GStreamer sur la machine de dev, ffmpeg déjà présent et embarquable dans le dossier portable, zéro problème de linkage. GStreamer reste le backend visé pour la phase Raspberry Pi.*
+- **2026-07-23 — Rendu : OpenGL 3.3 (glow + winit/glutin).** *Pourquoi : ISF = GLSL compilé nativement par le driver (pas de traduction hasardeuse), shaders Lanterne repris tels quels, multi-fenêtres pour 4 sorties.*
+- **2026-07-23 — Distribution : dossier portable d'abord.** Binaire + web UI embarquée + `config.toml` + dossiers `media/ shows/ shaders/ logs/` relatifs à l'exécutable. Aucune installation requise.
+
 ## Organisation
 
 - **2026-07-23 — Convention de rangement héritée de Toolbox** : le cadrage vit dans `Programe Cue Video/` (dossier de travail), le code dans le repo `videocuelist/` (GitHub : pymenvert/videocuelist). Docs normatives : DECISIONS / SPEC / ARCHITECTURE / PLAN.
@@ -30,9 +41,6 @@ Source de vérité du projet. Format : date — décision — pourquoi.
 
 ## En attente / à trancher plus tard
 
-- Nombre max de sorties simultanées et résolutions cibles (dimensionne le bench phase 0) — à préciser par Pym.
-- Audio : lecture du son des vidéos + volume par cue suffit ? (routing multi-sorties audio = probablement jamais, QLab fait ça très bien).
-- Timecode (chase LTC/MTC) : besoin réel ou confort lointain — phase tardive de toute façon.
-- MIDI Show Control (MSC) : prévu, à confirmer quelle console en face.
-- Partage de crates avec Lanterne : dépendance git vs copie — trancher en phase 0 crate par crate (voir ARCHITECTURE).
-- Nom définitif du produit (VideoCuelist est le nom de travail).
+- Nom définitif du produit (recherche de collisions en cours — proposition au réveil de Pym).
+- Confirmer l'interprétation du « module de synthétisation du son » (LFO + audio-réactif, sans sortie son).
+- Machine(s) de show réelles pour le bench 4×1080p / 4K.

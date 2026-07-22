@@ -1,0 +1,11 @@
+﻿[package]
+name = "conduite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conduite"
+path = "src/main.rs"
+
+[dependencies]
