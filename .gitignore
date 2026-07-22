@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Web UI (si toolchain node plus tard)
+node_modules/
+dist/
+
+# Médias de test et shows locaux (jamais dans le repo)
+/media/
+/shows/
+*.mov
+*.mp4
+*.avi
+
+# Logs
+*.log
+/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
