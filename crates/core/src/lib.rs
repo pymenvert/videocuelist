@@ -24,7 +24,7 @@ pub use demo::demo_show;
 pub use error::CoreError;
 pub use event::{HealthSnapshot, RuntimeStatus, StateEvent};
 pub use model::{
-    AppMode, Content, Cue, CueNumber, CueTriggers, Curve, EndMode, FollowMode, MaterialId,
+    AppMode, Content, Cue, CueDefaults, CueNumber, CueTriggers, Curve, EndMode, FollowMode, MaterialId,
     MaterialRef, MediaId, MediaRef, ModId, OutputCfg, OutputId, ParamValue, PatternKind, Playback,
     Rect, Show, ShowSettings, Slice, SliceId, SliceState, Transition, TransitionKind,
     FORMAT_VERSION,

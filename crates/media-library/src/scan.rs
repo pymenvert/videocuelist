@@ -222,6 +222,70 @@ pub fn reconcile_materials(
     result
 }
 
+/// Dossier (relatif, séparateur `/`) d'un chemin relatif : `""` à la racine.
+fn rel_dir(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    }
+}
+
+/// Relocalisation en cascade : après qu'UN média manquant a été retrouvé
+/// (son chemin est passé de `old_rel` à `new_rel`, relatifs à `media_root`),
+/// re-teste tous les AUTRES médias manquants du même dossier d'origine (et
+/// de ses sous-dossiers) au même emplacement relatif sous le nouveau
+/// dossier ; chaque fichier présent est reconnecté (`path` mis à jour,
+/// `missing = false`). Retourne le nombre de médias reconnectés.
+///
+/// Référence produit : Resolume Media Manager / QLab 5 file search —
+/// « retrouver un fichier reconnecte tout le dossier ».
+pub fn relocate_cascade(
+    media: &mut [MediaRef],
+    media_root: &Path,
+    old_rel: &str,
+    new_rel: &str,
+) -> usize {
+    let old_dir = rel_dir(old_rel);
+    let new_dir = rel_dir(new_rel);
+    if old_dir == new_dir {
+        return 0; // même dossier : rien à propager
+    }
+    let mut relinked = 0usize;
+    for m in media.iter_mut() {
+        if !m.missing || m.path == old_rel {
+            continue;
+        }
+        // Queue du chemin sous l'ancien dossier (sous-dossiers compris).
+        let tail = if old_dir.is_empty() {
+            m.path.as_str()
+        } else {
+            match m.path.strip_prefix(old_dir).and_then(|r| r.strip_prefix('/')) {
+                Some(t) => t,
+                None => continue, // pas dans le dossier d'origine
+            }
+        };
+        let candidate = if new_dir.is_empty() {
+            tail.to_string()
+        } else {
+            format!("{new_dir}/{tail}")
+        };
+        if conduite_core::validate_relative_path(&candidate).is_ok()
+            && media_root.join(&candidate).is_file()
+        {
+            tracing::info!(target: "media_library::scan", id = m.id,
+                from = %m.path, to = %candidate, "média reconnecté (cascade)");
+            m.path = candidate;
+            m.missing = false;
+            relinked += 1;
+        }
+    }
+    if relinked > 0 {
+        tracing::info!(target: "media_library::scan", count = relinked,
+            "relocalisation en cascade");
+    }
+    relinked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +444,68 @@ mod tests {
         renamed.name = "Ouverture".to_string();
         let result = reconcile(&[renamed], vec![media(1, "a.mp4")]);
         assert_eq!(result[0].name, "Ouverture", "nom personnalisé préservé");
+    }
+
+    // -------------------------------------------------------------- cascade
+
+    fn missing_media(id: u32, path: &str) -> MediaRef {
+        let mut m = media(id, path);
+        m.missing = true;
+        m
+    }
+
+    /// Un fichier retrouvé dans un nouveau dossier reconnecte les autres
+    /// manquants du même dossier d'origine, sous-dossiers compris.
+    #[test]
+    fn relocate_cascade_relinks_siblings_and_subdirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("nouveau/sub")).expect("mkdir");
+        for f in ["nouveau/a.mp4", "nouveau/b.mp4", "nouveau/sub/c.mp4"] {
+            std::fs::write(root.join(f), b"x").expect("write");
+        }
+        let mut pool = vec![
+            media(1, "nouveau/a.mp4"), // le média relocalisé par l'utilisateur
+            missing_media(2, "ancien/b.mp4"),
+            missing_media(3, "ancien/sub/c.mp4"),
+            missing_media(4, "ancien/introuvable.mp4"),
+            missing_media(5, "ailleurs/d.mp4"),
+        ];
+        let n = relocate_cascade(&mut pool, root, "ancien/a.mp4", "nouveau/a.mp4");
+        assert_eq!(n, 2, "b et c reconnectés");
+        assert_eq!(pool[1].path, "nouveau/b.mp4");
+        assert!(!pool[1].missing);
+        assert_eq!(pool[2].path, "nouveau/sub/c.mp4");
+        assert!(!pool[2].missing);
+        // Fichier toujours absent : inchangé.
+        assert_eq!(pool[3].path, "ancien/introuvable.mp4");
+        assert!(pool[3].missing);
+        // Autre dossier d'origine : pas touché.
+        assert_eq!(pool[4].path, "ailleurs/d.mp4");
+        assert!(pool[4].missing);
+    }
+
+    /// Relocalisation depuis la racine et vers la racine.
+    #[test]
+    fn relocate_cascade_handles_root_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("b.mp4"), b"x").expect("write");
+        let mut pool = vec![missing_media(2, "ancien/b.mp4")];
+        let n = relocate_cascade(&mut pool, root, "ancien/a.mp4", "a.mp4");
+        assert_eq!(n, 1);
+        assert_eq!(pool[0].path, "b.mp4");
+        assert!(!pool[0].missing);
+    }
+
+    /// Même dossier (simple renommage du fichier) : aucune cascade.
+    #[test]
+    fn relocate_cascade_same_dir_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pool = vec![missing_media(2, "clips/b.mp4")];
+        let n = relocate_cascade(&mut pool, dir.path(), "clips/a.mp4", "clips/a2.mp4");
+        assert_eq!(n, 0);
+        assert!(pool[0].missing);
     }
 
     #[test]

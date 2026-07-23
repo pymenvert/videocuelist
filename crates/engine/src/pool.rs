@@ -13,6 +13,8 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use crate::PixelOrder;
+
 /// État partagé du pool (réserve bornée de buffers).
 struct PoolInner {
     /// Taille exacte (octets) des buffers gérés : `width * height * 4`.
@@ -60,6 +62,7 @@ impl BufferPool {
         FrameData {
             data,
             pool: Some(Arc::downgrade(&self.inner)),
+            order: PixelOrder::Rgba,
         }
     }
 
@@ -77,6 +80,21 @@ pub struct FrameData {
     data: Vec<u8>,
     /// `None` = buffer hors pool (libéré normalement au drop).
     pool: Option<Weak<PoolInner>>,
+    /// Ordre des canaux du contenu (RGBA par défaut, BGRA si le décodage
+    /// BGRA est actif — posé par le thread lecteur ffmpeg).
+    order: PixelOrder,
+}
+
+impl FrameData {
+    /// Ordre des canaux du contenu.
+    pub fn pixel_order(&self) -> PixelOrder {
+        self.order
+    }
+
+    /// Pose l'ordre des canaux (thread lecteur, après écriture du contenu).
+    pub(crate) fn set_pixel_order(&mut self, order: PixelOrder) {
+        self.order = order;
+    }
 }
 
 impl Drop for FrameData {
@@ -107,9 +125,9 @@ impl DerefMut for FrameData {
 }
 
 impl From<Vec<u8>> for FrameData {
-    /// Buffer hors pool : le drop libère normalement.
+    /// Buffer hors pool (contenu RGBA) : le drop libère normalement.
     fn from(data: Vec<u8>) -> Self {
-        FrameData { data, pool: None }
+        FrameData { data, pool: None, order: PixelOrder::Rgba }
     }
 }
 
@@ -119,6 +137,7 @@ impl Clone for FrameData {
         FrameData {
             data: self.data.clone(),
             pool: None,
+            order: self.order,
         }
     }
 }
@@ -128,6 +147,7 @@ impl std::fmt::Debug for FrameData {
         f.debug_struct("FrameData")
             .field("len", &self.data.len())
             .field("pooled", &self.pool.is_some())
+            .field("order", &self.order)
             .finish()
     }
 }

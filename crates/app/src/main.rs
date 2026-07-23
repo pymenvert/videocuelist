@@ -8,11 +8,13 @@ mod config;
 mod dirs;
 mod gfx;
 mod logsetup;
+mod platform;
 mod players;
 mod preview;
 mod protocols;
 mod saver;
 mod session;
+mod shaderwatch;
 mod undo;
 
 use std::net::SocketAddr;
@@ -32,6 +34,15 @@ use crate::dirs::Dirs;
 use crate::gfx::Gfx;
 use crate::session::{Session, SessionChannels};
 
+/// Codes de sortie (contrat supervision — le watchdog s'y fie) :
+/// 0 = arrêt normal, 1 = erreur générique, 2 = usage CLI,
+/// 10 = port web pris / instance déjà lancée (NE PAS relancer),
+/// 11 = perte GPU (relance par watchdog conseillée, < 5 s).
+const EXIT_OK: i32 = 0;
+const EXIT_GENERIC: i32 = 1;
+const EXIT_PORT_BUSY: i32 = 10;
+const EXIT_GPU_LOST: i32 = 11;
+
 /// Options de ligne de commande.
 #[derive(Debug, Default)]
 struct Cli {
@@ -39,7 +50,23 @@ struct Cli {
     port: Option<u16>,
     headless: bool,
     version: bool,
+    help: bool,
 }
+
+/// Texte de `--help` (aligné sur README.md et docs/MANUEL.md).
+const HELP: &str = "\
+Conduite — régie vidéo de spectacle
+
+Usage : conduite [OPTIONS]
+
+Options :
+  --show <nom>    Show à charger (dossier dans shows/) — défaut : dernier show ouvert
+  --port <port>   Port de l'interface web — défaut : 9820 (clé http_port de config.toml)
+  --headless      Sans fenêtres de sortie (moteur + interface web seulement)
+  -V, --version   Affiche la version et quitte
+  -h, --help      Affiche cette aide et quitte
+
+Une fois lancé, l'interface de régie est sur http://localhost:9820";
 
 fn parse_cli() -> Cli {
     let mut cli = Cli::default();
@@ -50,17 +77,45 @@ fn parse_cli() -> Cli {
             "--port" => cli.port = args.next().and_then(|p| p.parse().ok()),
             "--headless" => cli.headless = true,
             "--version" | "-V" => cli.version = true,
-            other => eprintln!("option inconnue ignorée : {other}"),
+            "--help" | "-h" => cli.help = true,
+            other => {
+                // Option inconnue = refus de démarrer : une faute de frappe
+                // ne doit jamais lancer un show avec de mauvais réglages.
+                eprintln!("option inconnue : {other}\n\n{HELP}");
+                std::process::exit(2);
+            }
         }
     }
     cli
 }
 
+/// Version affichable : `0.1.0 (abc1234)` — hash git court si disponible
+/// (embarqué au build par crates/app/build.rs).
+fn version_string() -> String {
+    let git = env!("CONDUITE_GIT_HASH");
+    if git.is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        format!("{} ({git})", env!("CARGO_PKG_VERSION"))
+    }
+}
+
 fn main() {
+    // Tout vit dans `run` : les gardes (verrou, logs, timer) sont relâchées
+    // AVANT `process::exit` (qui n'exécute aucun destructeur).
+    let code = run();
+    std::process::exit(code);
+}
+
+fn run() -> i32 {
     let cli = parse_cli();
+    if cli.help {
+        println!("{HELP}");
+        return EXIT_OK;
+    }
     if cli.version {
-        println!("conduite {}", env!("CARGO_PKG_VERSION"));
-        return;
+        println!("conduite {}", version_string());
+        return EXIT_OK;
     }
 
     // Canaux partagés (session ↔ serveur web ↔ journal). Bus de commandes
@@ -75,10 +130,18 @@ fn main() {
     let (preview_b_tx, _preview_b_keep) = broadcast::channel(8);
 
     let dirs = Dirs::detect();
-    let _log_guard = logsetup::init(&dirs.logs, events_tx.clone());
+    let log_handles = logsetup::init(&dirs.logs, events_tx.clone());
+    let _log_guard = log_handles.guard;
     logsetup::install_panic_hook();
     info!(target: "app", version = env!("CARGO_PKG_VERSION"),
         base = %dirs.base.display(), "démarrage de Conduite");
+
+    // Arrêt propre sur Ctrl-C / fermeture console (drapeau consulté par les
+    // boucles), résolution timer 1 ms (relâchée au drop) et promotion MMCSS
+    // du thread de rendu — dégradation silencieuse partout.
+    platform::install_quit_handler();
+    let _timer_res = platform::TimerResolution::new();
+    platform::promote_render_thread();
 
     // Verrou mono-instance (verrou de fichier OS : libéré même après crash).
     // Deux instances qui sauvent le même show se corrompent mutuellement.
@@ -92,7 +155,8 @@ fn main() {
                 "Conduite est déjà lancé (verrou : {path}).\n\
                  Fermez l'autre instance puis relancez."
             );
-            return;
+            // Même sémantique que le port pris : NE PAS relancer en boucle.
+            return EXIT_PORT_BUSY;
         }
         Err(e) => {
             warn!(target: "app", error = %e,
@@ -110,15 +174,27 @@ fn main() {
     );
     ensure_show_exists(&dirs, &show_name);
 
-    // Serveur web (port machine — indépendant des réglages du show).
-    let http = spawn_http(&config, &dirs, HttpDeps {
+    // Serveur web (port machine). Échec de bind = SORTIE IMMÉDIATE code 10 :
+    // plus jamais de moteur zombie sans UI qui ouvre les ports MIDI et
+    // dispute l'écriture du show à l'instance visible.
+    let tick_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        conduite_control_http::epoch_ms(),
+    ));
+    let http = match spawn_http(&config, HttpDeps {
         cmd_tx: cmd_tx.clone(),
         state_rx: state_rx.clone(),
         events_rx: events_tx.subscribe(),
         preview_rx: preview_tx.subscribe(),
         preview_b_rx: preview_b_tx.subscribe(),
         thumb_dir: dirs.thumbs.clone(),
-    });
+        about: about_info(),
+        tick_ms: tick_ms.clone(),
+        version: version_string(),
+        early_log: log_handles.early_log,
+    }) {
+        Ok(handle) => Some(handle),
+        Err(code) => return code,
+    };
 
     let session = Session::new(
         dirs,
@@ -131,36 +207,87 @@ fn main() {
             events_tx,
             preview_tx,
             preview_b_tx,
+            tick_ms,
         },
     );
 
-    if cli.headless {
+    let code = if cli.headless {
         info!(target: "app", "mode headless (--headless)");
-        run_headless(session, http);
+        run_headless(session, http)
     } else {
-        run_windowed(session, http);
-    }
+        run_windowed(session, http)
+    };
+    info!(target: "app", code, "arrêt de Conduite");
+    code
 }
 
-/// Démarre le serveur HTTP ; un échec n'empêche pas l'app de tourner.
-fn spawn_http(config: &AppConfig, _dirs: &Dirs, deps: HttpDeps) -> Option<HttpServerHandle> {
+/// Données « À propos » servies sur `GET /about` (l'affichage est fait par
+/// la webui, onglet Réglages) : version, licence, crédits, liens.
+fn about_info() -> serde_json::Value {
+    json!({
+        "name": "Conduite",
+        "description": "Régie vidéo de spectacle — cues, mapping, ISF, MIDI/OSC/Art-Net",
+        "version": env!("CARGO_PKG_VERSION"),
+        "git": env!("CONDUITE_GIT_HASH"),
+        "license": "MIT",
+        "copyright": "© 2026 Pym",
+        "website": "https://github.com/pymenvert/videocuelist",
+        "credits": [
+            {
+                "name": "FFmpeg",
+                "role": "décodage vidéo (programme séparé, appelé en sous-processus)",
+                "license": "LGPL v3",
+                "url": "https://ffmpeg.org",
+                "notice": "licenses/FFMPEG.txt"
+            },
+            {
+                "name": "Dépendances Rust",
+                "role": "bibliothèques du moteur et des surfaces de contrôle",
+                "license": "MIT / Apache-2.0 / BSD / ISC / Zlib",
+                "notice": "licenses/THIRD-PARTY-NOTICES.html"
+            },
+            {
+                "name": "Shaders DomePack",
+                "role": "matériaux ISF embarqués",
+                "license": "© Pym — Pack Sources Dome-Native",
+                "notice": "shaders/CREDITS.txt"
+            }
+        ]
+    })
+}
+
+/// Démarre le serveur HTTP. Échec = code de sortie (`Err`) : sans UI web,
+/// un moteur invisible qui ouvre quand même MIDI/OSC et l'autosave est un
+/// ZOMBIE dangereux — on refuse net (P0 double lancement).
+fn spawn_http(config: &AppConfig, deps: HttpDeps) -> Result<HttpServerHandle, i32> {
     let addr: SocketAddr = match format!("{}:{}", config.http_bind, config.http_port).parse() {
         Ok(a) => a,
         Err(e) => {
             error!(target: "app", bind = %config.http_bind, port = config.http_port,
-                error = %e, "adresse HTTP invalide — serveur web inactif");
-            return None;
+                error = %e, "adresse HTTP invalide (config.toml) — démarrage refusé");
+            eprintln!(
+                "Adresse web invalide dans config.toml : {}:{} ({e}).",
+                config.http_bind, config.http_port
+            );
+            return Err(EXIT_GENERIC);
         }
     };
     match HttpServer::spawn(addr, deps) {
         Ok(handle) => {
             info!(target: "app", addr = %handle.local_addr(), "web UI disponible");
-            Some(handle)
+            Ok(handle)
         }
         Err(e) => {
             error!(target: "app", %addr, error = %e,
-                "serveur web impossible (port occupé ?) — UI web inactive");
-            None
+                "port web indisponible : Conduite est probablement déjà lancé — \
+                 démarrage refusé (code 10, ne pas relancer)");
+            eprintln!(
+                "Conduite est déjà lancé (ou le port {} est pris par un autre \
+                 logiciel).\nOuvrez http://localhost:{} — ou fermez l'autre \
+                 instance puis relancez.",
+                config.http_port, config.http_port
+            );
+            Err(EXIT_PORT_BUSY)
         }
     }
 }
@@ -220,6 +347,7 @@ fn demo_video_cue(media: conduite_core::MediaId) -> conduite_core::Cue {
         name: "Vidéo démo".to_string(),
         color: Some("#3ff59a".to_string()),
         notes: "Lecture en boucle du premier média du dossier media/.".to_string(),
+        armed: true,
         transition: Transition {
             kind: TransitionKind::Crossfade,
             dur_s: 1.5,
@@ -255,13 +383,19 @@ fn demo_video_cue(media: conduite_core::MediaId) -> conduite_core::Cue {
 // ------------------------------------------------------------------ headless
 
 /// Boucle headless : tick simple avec cadence `target_fps`, sans winit.
-fn run_headless(mut session: Session, _http: Option<HttpServerHandle>) {
+/// Sort proprement (sauvegarde si modifié) sur `Command::Quit` ou Ctrl-C.
+fn run_headless(mut session: Session, _http: Option<HttpServerHandle>) -> i32 {
     let period = Duration::from_secs_f64(1.0 / f64::from(session.target_fps().max(1)));
     let mut gfx = Gfx::headless();
     let mut next = Instant::now();
     loop {
         session.tick(&mut gfx);
         let _ = session.take_outputs_dirty(); // pas de fenêtres en headless
+        if session.take_quit() || platform::quit_requested() {
+            info!(target: "app", "arrêt propre demandé (Quit / Ctrl-C)");
+            session.emergency_save();
+            return EXIT_OK;
+        }
         next += period;
         let now = Instant::now();
         if next > now {
@@ -275,12 +409,18 @@ fn run_headless(mut session: Session, _http: Option<HttpServerHandle>) {
 
 // ------------------------------------------------------------------ fenêtré
 
+/// Période du poll de topologie des moniteurs (reconnexion projecteur).
+const MONITOR_POLL_PERIOD: Duration = Duration::from_secs(2);
+
 /// Application winit : fenêtres de sortie GL + tick cadencé.
 struct App {
     session: Session,
     gfx: Gfx,
     period: Duration,
     next_frame: Instant,
+    last_monitor_poll: Instant,
+    /// Code de sortie décidé par la boucle (Quit = 0, perte GPU = 11).
+    exit_code: i32,
     _http: Option<HttpServerHandle>,
 }
 
@@ -309,7 +449,33 @@ impl ApplicationHandler for App {
             if self.session.take_outputs_dirty() {
                 self.gfx.ensure_windows(el, self.session.outputs());
             }
+            // Topologie des moniteurs (~0,5 Hz) : ré-application du plein
+            // écran sur le moniteur retrouvé, repli fenêtré + warning sinon.
+            if now.duration_since(self.last_monitor_poll) >= MONITOR_POLL_PERIOD {
+                self.last_monitor_poll = now;
+                self.gfx.poll_monitors(el);
+            }
             self.session.tick(&mut self.gfx);
+            // Anti-veille : maintenu tant qu'au moins une sortie est active.
+            platform::keep_awake(self.gfx.ready());
+
+            // Perte GPU (TDR / échecs GL fatals répétés) : log + sauvegarde
+            // + sortie code 11 — le watchdog relance en < 5 s.
+            if let Some(msg) = self.gfx.take_fatal() {
+                error!(target: "app", "PERTE GPU : {msg} — sauvegarde puis sortie code 11");
+                self.session.emergency_save();
+                self.exit_code = EXIT_GPU_LOST;
+                el.exit();
+                return;
+            }
+            // Arrêt propre (Command::Quit / Ctrl-C) : sauvegarde si modifié.
+            if self.session.take_quit() || platform::quit_requested() {
+                info!(target: "app", "arrêt propre demandé (Quit / Ctrl-C)");
+                self.session.emergency_save();
+                self.exit_code = EXIT_OK;
+                el.exit();
+                return;
+            }
             self.next_frame += self.period;
             if self.next_frame <= now {
                 self.next_frame = now + self.period;
@@ -320,15 +486,14 @@ impl ApplicationHandler for App {
 }
 
 /// Mode fenêtré ; si winit est indisponible (session RDP minimale…),
-/// bascule headless — l'app tourne quand même.
-fn run_windowed(session: Session, http: Option<HttpServerHandle>) {
+/// bascule headless — l'app tourne quand même. Retourne le code de sortie.
+fn run_windowed(session: Session, http: Option<HttpServerHandle>) -> i32 {
     let event_loop = match EventLoop::new() {
         Ok(el) => el,
         Err(e) => {
             error!(target: "app", error = %e,
                 "boucle d'événements impossible : bascule headless");
-            run_headless(session, http);
-            return;
+            return run_headless(session, http);
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -338,10 +503,17 @@ fn run_windowed(session: Session, http: Option<HttpServerHandle>) {
         gfx: Gfx::headless(),
         period,
         next_frame: Instant::now(),
+        last_monitor_poll: Instant::now(),
+        exit_code: EXIT_OK,
         _http: http,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         warn!(target: "app", error = %e, "boucle d'événements terminée sur erreur");
+        if app.exit_code == EXIT_OK {
+            app.exit_code = EXIT_GENERIC;
+        }
     }
-    info!(target: "app", "arrêt de Conduite");
+    // L'anti-veille est relâché avant la sortie.
+    platform::keep_awake(false);
+    app.exit_code
 }

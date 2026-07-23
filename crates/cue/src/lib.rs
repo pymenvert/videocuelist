@@ -172,14 +172,15 @@ impl CueEngine {
     }
 
     /// Charge la conduite : trie par numéro, résout toutes les scènes,
-    /// réinitialise l'état (standby = première cue, rien au programme).
+    /// réinitialise l'état (standby = première cue ARMÉE, rien au
+    /// programme — les cues désarmées sont sautées par GO/BACK/follow).
     pub fn load(&mut self, cues: &[Cue]) {
         let mut sorted = cues.to_vec();
         sorted.sort_by_key(|c| c.number);
         self.targets = sorted.iter().map(resolve_scene).collect();
         self.cues = sorted;
         self.active = None;
-        self.standby = if self.cues.is_empty() { None } else { Some(0) };
+        self.standby = self.cues.iter().position(|c| c.armed);
         self.transition = None;
         self.cue_start_s = 0.0;
         self.follow_fired = false;
@@ -228,15 +229,21 @@ impl CueEngine {
                 self.cue_start_s = keep_cue_start;
                 self.media_start_s = keep_media_start;
                 self.follow_fired = keep_follow_fired;
+                // Standby conservée par numéro, sauf si l'édition l'a
+                // désarmée : repli sur la prochaine cue armée.
                 self.standby = standby_n
                     .and_then(|n| self.index_of(n))
+                    .filter(|&i| self.cues[i].armed)
                     .or_else(|| self.standby_after(i));
             }
             None => {
-                if let Some(i) = standby_n.and_then(|n| self.index_of(n)) {
+                if let Some(i) = standby_n
+                    .and_then(|n| self.index_of(n))
+                    .filter(|&i| self.cues[i].armed)
+                {
                     self.standby = Some(i);
                 }
-                // Sinon : `load` a déjà posé standby = première cue.
+                // Sinon : `load` a déjà posé standby = première cue armée.
             }
         }
         debug!(target: "cue", count = self.cues.len(),
@@ -429,20 +436,31 @@ impl CueEngine {
                 }
                 Pending::Back => {
                     // Même principe : valider sur l'état post-snap sans
-                    // snapper si la commande est un no-op.
+                    // snapper si la commande est un no-op. Les cues
+                    // désarmées sont sautées vers l'arrière aussi.
                     let ai = match &self.transition {
                         Some(tr) => Some(tr.to),
                         None => self.active,
                     };
                     match ai {
-                        Some(ai) if ai > 0 => {
-                            self.snap_transition(now);
-                            self.panic = None;
-                            // Transition de la cue active, pas de la cible.
-                            let tr = self.cues[ai].transition.clone();
-                            self.start_go(ai - 1, tr, now);
+                        Some(ai) => {
+                            let prev = (0..ai).rev().find(|&i| self.cues[i].armed);
+                            match prev {
+                                Some(prev) => {
+                                    self.snap_transition(now);
+                                    self.panic = None;
+                                    // Transition de la cue active, pas de la cible.
+                                    let tr = self.cues[ai].transition.clone();
+                                    self.start_go(prev, tr, now);
+                                }
+                                None if ai == 0 => {
+                                    self.warn_event("BACK sur la première cue".into())
+                                }
+                                None => self.warn_event(
+                                    "BACK : aucune cue armée avant la cue active".into(),
+                                ),
+                            }
                         }
-                        Some(_) => self.warn_event("BACK sur la première cue".into()),
                         None => self.warn_event("BACK sans cue active".into()),
                     }
                 }
@@ -531,7 +549,9 @@ impl CueEngine {
     }
 
     /// Standby après activation de `idx` : la cible de boucle `goto_after`
-    /// si elle existe (préchargée et visible), sinon la cue suivante.
+    /// si elle existe (préchargée et visible — cible EXPLICITE, jouée même
+    /// désarmée, comme un GOTO), sinon la prochaine cue ARMÉE (les cues
+    /// désarmées sont sautées par GO/follow).
     fn standby_after(&self, idx: usize) -> Option<usize> {
         if let Some(n) = self.cues[idx].goto_after {
             if let Some(i) = self.index_of(n) {
@@ -540,11 +560,7 @@ impl CueEngine {
             warn!(target: "cue", cue = %self.cues[idx].number, target_cue = %n,
                 "goto_after vers une cue inexistante — cue suivante utilisée");
         }
-        if idx + 1 < self.cues.len() {
-            Some(idx + 1)
-        } else {
-            None
-        }
+        (idx + 1..self.cues.len()).find(|&i| self.cues[i].armed)
     }
 
     /// La transition en cours saute à sa fin (jamais d'état corrompu).
@@ -717,6 +733,7 @@ mod tests {
             name: format!("cue {}", CueNumber(n)),
             color: None,
             notes: String::new(),
+            armed: true,
             transition: transition(kind, dur_s, Curve::Linear),
             follow: FollowMode::Manual,
             goto_after: None,
@@ -1980,5 +1997,156 @@ mod tests {
         tk(&mut e, 110.0);
         let s = e.status();
         assert!((s.remaining_s.unwrap_or(0.0) - 50.0).abs() < 1e-3);
+    }
+
+    // -------------------------------------------------- armement (Cue.armed)
+
+    fn disarmed(mut c: Cue) -> Cue {
+        c.armed = false;
+        c
+    }
+
+    /// La première cue désarmée n'est pas mise en standby au chargement.
+    #[test]
+    fn load_arms_first_armed_cue_as_standby() {
+        let e = engine(vec![
+            disarmed(cue(1000, TransitionKind::Cut, 0.0)),
+            cue(2000, TransitionKind::Cut, 0.0),
+        ]);
+        assert_eq!(standby_of(&e), Some(2000), "première cue ARMÉE en standby");
+    }
+
+    /// Toutes désarmées : pas de standby, GO = warning no-op.
+    #[test]
+    fn all_disarmed_means_no_standby_and_go_warns() {
+        let mut e = engine(vec![
+            disarmed(cue(1000, TransitionKind::Cut, 0.0)),
+            disarmed(cue(2000, TransitionKind::Cut, 0.0)),
+        ]);
+        assert_eq!(standby_of(&e), None);
+        e.go();
+        let f = tk(&mut e, 0.0);
+        assert!(has_warning(&f));
+        assert_eq!(active(&e), None);
+    }
+
+    /// GO saute les cues désarmées : 1 -> 3 (2 désarmée).
+    #[test]
+    fn go_skips_disarmed_cues() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            disarmed(cue(2000, TransitionKind::Cut, 0.0)),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        assert_eq!(active(&e), Some(1000));
+        assert_eq!(standby_of(&e), Some(3000), "standby saute la 2 désarmée");
+        e.go();
+        tk(&mut e, 1.0);
+        assert_eq!(active(&e), Some(3000), "GO saute la cue désarmée");
+    }
+
+    /// Le follow saute lui aussi les cues désarmées.
+    #[test]
+    fn follow_skips_disarmed_cues() {
+        let mut e = engine(vec![
+            with_follow(cue(1000, TransitionKind::Cut, 0.0), FollowMode::Wait(1.0)),
+            disarmed(cue(2000, TransitionKind::Cut, 0.0)),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        let f = tk(&mut e, 1.5);
+        assert!(
+            f.events.iter().any(|ev| matches!(
+                ev,
+                CueEvent::FollowFired { target, .. } if *target == CueNumber(3000)
+            )),
+            "follow tire vers la 3 (2 désarmée sautée)"
+        );
+        assert_eq!(active(&e), Some(3000));
+    }
+
+    /// GOTO explicite joue une cue désarmée quand même (contrat).
+    #[test]
+    fn goto_plays_disarmed_cue() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            disarmed(cue(2000, TransitionKind::Cut, 0.0)),
+        ]);
+        e.goto(CueNumber(2000));
+        let f = tk(&mut e, 0.0);
+        assert!(!has_warning(&f));
+        assert_eq!(active(&e), Some(2000), "GOTO joue la cue désarmée");
+    }
+
+    /// BACK saute les cues désarmées vers l'arrière.
+    #[test]
+    fn back_skips_disarmed_cues() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            disarmed(cue(2000, TransitionKind::Cut, 0.0)),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ]);
+        e.goto(CueNumber(3000));
+        tk(&mut e, 0.0);
+        e.back();
+        tk(&mut e, 1.0);
+        assert_eq!(active(&e), Some(1000), "BACK saute la 2 désarmée");
+    }
+
+    /// goto_after est une cible explicite : jouée même désarmée.
+    #[test]
+    fn goto_after_targets_disarmed_cue_explicitly() {
+        let mut e = engine(vec![
+            with_goto_after(cue(1000, TransitionKind::Cut, 0.0), 3000),
+            cue(2000, TransitionKind::Cut, 0.0),
+            disarmed(cue(3000, TransitionKind::Cut, 0.0)),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        assert_eq!(standby_of(&e), Some(3000), "goto_after explicite conservé");
+        e.go();
+        tk(&mut e, 1.0);
+        assert_eq!(active(&e), Some(3000));
+    }
+
+    /// Édition à chaud qui désarme la standby : elle est re-pointée sur la
+    /// prochaine cue armée.
+    #[test]
+    fn load_hot_repoints_standby_when_disarmed() {
+        let cues = vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Cut, 0.0),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ];
+        let mut e = engine(cues.clone());
+        e.go();
+        tk(&mut e, 0.0); // 1000 active, standby 2000
+        let edited = vec![
+            cues[0].clone(),
+            disarmed(cues[1].clone()),
+            cues[2].clone(),
+        ];
+        e.load_hot(&edited);
+        tk(&mut e, 1.0);
+        assert_eq!(active(&e), Some(1000));
+        assert_eq!(standby_of(&e), Some(3000), "standby désarmée re-pointée");
+    }
+
+    /// Le roundtrip serde garde `armed` et les anciens shows (champ absent)
+    /// restent armés.
+    #[test]
+    fn armed_serde_default_is_true() {
+        let c = disarmed(cue(1000, TransitionKind::Cut, 0.0));
+        let json = serde_json::to_string(&c).expect("ser");
+        let back: Cue = serde_json::from_str(&json).expect("de");
+        assert!(!back.armed, "armed=false survit au roundtrip");
+        // Champ absent (show d'avant le champ) : armé par défaut.
+        let mut v: serde_json::Value = serde_json::from_str(&json).expect("value");
+        v.as_object_mut().expect("obj").remove("armed");
+        let legacy: Cue = serde_json::from_value(v).expect("de legacy");
+        assert!(legacy.armed, "défaut serde : true");
     }
 }

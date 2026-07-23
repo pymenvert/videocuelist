@@ -340,6 +340,12 @@ pub struct CueTriggers {
     pub osc: Option<String>,
 }
 
+/// Valeur par défaut du champ `armed` (cue armée) — les shows existants
+/// sans le champ restent tous armés.
+fn default_true() -> bool {
+    true
+}
+
 /// Une cue : snapshot complet d'une scène.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cue {
@@ -350,6 +356,12 @@ pub struct Cue {
     pub color: Option<String>,
     #[serde(default)]
     pub notes: String,
+    /// Cue armée : désarmée = grisée dans l'UI et SAUTÉE par GO/BACK/follow
+    /// (retirer un tableau en répétition sans détruire la conduite).
+    /// Un GOTO explicite la joue quand même. Défaut `true` (contrat serde :
+    /// les shows antérieurs restent tous armés).
+    #[serde(default = "default_true")]
+    pub armed: bool,
     pub transition: Transition,
     pub follow: FollowMode,
     /// Boucles de section : fin de cue → retour à ce numéro.
@@ -370,6 +382,20 @@ pub enum AppMode {
     #[default]
     Edit,
     Show,
+}
+
+/// Gabarits de cue : défauts appliqués à toute nouvelle cue (`CueAdd`)
+/// quand le champ correspondant est resté à sa valeur de type par défaut.
+/// `None` = pas de gabarit pour ce champ. Référence : QLab Cue Templates.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CueDefaults {
+    /// Transition d'entrée par défaut des nouvelles cues.
+    pub transition: Option<Transition>,
+    /// Mode d'enchaînement par défaut.
+    pub follow: Option<FollowMode>,
+    /// Couleur d'étiquette par défaut.
+    pub color: Option<String>,
 }
 
 /// Réglages persistés du show (ports, Art-Net, langue, préview, autosave).
@@ -399,6 +425,12 @@ pub struct ShowSettings {
     /// machine (`config.toml`) ou capture coupée. Modifiable à chaud par
     /// `SettingsUpdate`.
     pub audio_input: Option<String>,
+    /// Anti double-GO : délai minimal entre deux GO, en millisecondes,
+    /// appliqué dans la session à TOUTES les sources (UI/OSC/MIDI/MSC).
+    /// Un GO refusé émet un `StateEvent::Warning` throttlé. 0 = désactivé.
+    pub min_go_interval_ms: u32,
+    /// Gabarits appliqués aux nouvelles cues (`CueAdd`).
+    pub cue_defaults: CueDefaults,
 }
 
 impl Default for ShowSettings {
@@ -415,6 +447,8 @@ impl Default for ShowSettings {
             autosave_debounce_s: 2.0,
             autosave_interval_s: 60.0,
             audio_input: None,
+            min_go_interval_ms: 300,
+            cue_defaults: CueDefaults::default(),
         }
     }
 }

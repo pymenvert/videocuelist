@@ -1,21 +1,58 @@
-//! Undo/redo d'édition : pile de snapshots complets du [`Show`]
-//! (cap 100). Simple, robuste — un show reste petit (JSON de quelques Ko).
+//! Undo/redo d'édition : pile de snapshots complets du [`Show`], bornée en
+//! NOMBRE (cap 100) et en OCTETS (64 Mo, taille estimée par sérialisation
+//! JSON — cible Raspberry Pi : l'historique ne peut pas épuiser la RAM).
+//!
+//! Le coalescing des édits continus (un drag de coin = un seul snapshot)
+//! vit côté session (`Session::apply_edit`), pas ici.
 
 use conduite_core::Show;
 
-/// Capacité maximale de la pile d'annulation.
+/// Capacité maximale de la pile d'annulation (en entrées).
 pub const UNDO_CAP: usize = 100;
+/// Plafond mémoire de l'historique complet (undo + redo), en octets estimés.
+pub const UNDO_BYTE_CAP: usize = 64 * 1024 * 1024;
+
+/// Un snapshot et sa taille estimée (octets JSON).
+#[derive(Debug)]
+struct Entry {
+    show: Show,
+    bytes: usize,
+}
+
+/// Taille JSON estimée d'un show. Échec de sérialisation (jamais observé
+/// pour un Show valide) : estimation forfaitaire prudente.
+fn estimate_bytes(show: &Show) -> usize {
+    match serde_json::to_vec(show) {
+        Ok(v) => v.len(),
+        Err(_) => 64 * 1024,
+    }
+}
 
 /// Pile d'annulation : snapshot pris AVANT chaque édition.
 #[derive(Debug, Default)]
 pub struct UndoStack {
-    undo: Vec<Show>,
-    redo: Vec<Show>,
+    undo: Vec<Entry>,
+    redo: Vec<Entry>,
 }
 
 impl UndoStack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Octets totaux (undo + redo) actuellement retenus.
+    fn total_bytes(&self) -> usize {
+        self.undo.iter().map(|e| e.bytes).sum::<usize>()
+            + self.redo.iter().map(|e| e.bytes).sum::<usize>()
+    }
+
+    /// Évince les entrées les plus anciennes de la pile d'undo tant que le
+    /// plafond en octets est dépassé (au moins l'entrée la plus récente est
+    /// toujours conservée).
+    fn enforce_byte_cap(&mut self) {
+        while self.undo.len() > 1 && self.total_bytes() > UNDO_BYTE_CAP {
+            self.undo.remove(0);
+        }
     }
 
     /// À appeler avant d'appliquer une édition : mémorise l'état courant
@@ -24,22 +61,26 @@ impl UndoStack {
         if self.undo.len() >= UNDO_CAP {
             self.undo.remove(0);
         }
-        self.undo.push(before);
+        let bytes = estimate_bytes(&before);
+        self.undo.push(Entry { show: before, bytes });
         self.redo.clear();
+        self.enforce_byte_cap();
     }
 
     /// Annule : rend l'état précédent, en mémorisant `current` pour redo.
     pub fn undo(&mut self, current: &Show) -> Option<Show> {
         let prev = self.undo.pop()?;
-        self.redo.push(current.clone());
-        Some(prev)
+        let bytes = estimate_bytes(current);
+        self.redo.push(Entry { show: current.clone(), bytes });
+        Some(prev.show)
     }
 
     /// Rétablit : rend l'état annulé, en re-mémorisant `current` pour undo.
     pub fn redo(&mut self, current: &Show) -> Option<Show> {
         let next = self.redo.pop()?;
-        self.undo.push(current.clone());
-        Some(next)
+        let bytes = estimate_bytes(current);
+        self.undo.push(Entry { show: current.clone(), bytes });
+        Some(next.show)
     }
 
     /// Vide les deux piles (chargement d'un autre show).
@@ -87,7 +128,10 @@ mod tests {
         }
         assert_eq!(stack.undo.len(), UNDO_CAP);
         // Le plus récent est bien le dernier poussé.
-        assert_eq!(stack.undo.last().map(|s| s.name.clone()), Some("v149".into()));
+        assert_eq!(
+            stack.undo.last().map(|e| e.show.name.clone()),
+            Some("v149".into())
+        );
     }
 
     #[test]
@@ -96,5 +140,37 @@ mod tests {
         let cur = Show::new("x");
         assert!(stack.undo(&cur).is_none());
         assert!(stack.redo(&cur).is_none());
+    }
+
+    /// Plafond en octets : les entrées les plus anciennes sont évincées, la
+    /// plus récente survit toujours (même si elle dépasse à elle seule).
+    #[test]
+    fn byte_cap_evicts_oldest() {
+        let mut stack = UndoStack::new();
+        // Show artificiellement gros : ~1,4 Mo de notes par cue.
+        let big = |name: &str| {
+            let mut s = demo_show();
+            s.name = name.to_string();
+            for c in &mut s.cues {
+                c.notes = "x".repeat(300_000);
+            }
+            s
+        };
+        // 5 cues * 300 Ko ≈ 1,5 Mo par snapshot ; 64 Mo / 1,5 Mo ≈ 42.
+        for i in 0..60 {
+            stack.push(big(&format!("v{i}")));
+        }
+        assert!(stack.undo.len() < 60, "des snapshots ont été évincés");
+        assert!(
+            stack.total_bytes() <= UNDO_BYTE_CAP,
+            "total {} > cap {}",
+            stack.total_bytes(),
+            UNDO_BYTE_CAP
+        );
+        assert_eq!(
+            stack.undo.last().map(|e| e.show.name.clone()),
+            Some("v59".into()),
+            "le plus récent survit"
+        );
     }
 }

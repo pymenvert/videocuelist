@@ -19,6 +19,7 @@
     runtime: null,      // RuntimeStatus
     health: null,       // HealthSnapshot
     fft: null,          // dernière trame FFT {bins:[0..1 ×64], device} ou null
+    about: null,        // GET /about : version, licence, crédits (peut manquer)
     logs: [],           // {level,target,message,ts}
     logFilter: 'all',
     tab: 'live',
@@ -57,7 +58,12 @@
         if (k === 'class') { n.className = v; }
         else if (k.slice(0, 2) === 'on' && typeof v === 'function') { n.addEventListener(k.slice(2), v); }
         else if (k === 'value') { n.value = v; }
+        /* disabled/checked : PROPRIÉTÉS booléennes — setAttribute('disabled',
+           'false') laisserait le contrôle désactivé (attribut présent =
+           désactivé, quelle que soit sa valeur). Bug historique : tous les
+           boutons conditionnels (« Assigner », « Dupliquer »…) restaient morts. */
         else if (k === 'checked') { n.checked = !!v; }
+        else if (k === 'disabled') { n.disabled = !!v; }
         else { n.setAttribute(k, v); }
       });
     }
@@ -99,11 +105,15 @@
     drift: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M1 8 C3 4 5 11 8 8 C10 6 12 3 15 7 C17 10 20 4 22 7 C23 8.5 24 8 25 7"/></svg>'
   };
 
-  /* État vide sympathique : icône + message. */
-  function emptyState(icon, text) {
+  /* État vide sympathique : icône + message + action directe optionnelle
+     ({ label, onclick } — masquée en mode Show). */
+  function emptyState(icon, text, action) {
     var ic = el('span', { class: 'empty-icon', 'aria-hidden': 'true' });
     ic.innerHTML = ICONS[icon] || '';
-    return el('div', { class: 'empty-state' }, ic, el('span', null, text));
+    return el('div', { class: 'empty-state' }, ic, el('span', null, text),
+      (action && !isShowMode())
+        ? el('button', { class: 'edit-only', onclick: action.onclick }, action.label)
+        : null);
   }
 
   /* ================================================ numéros de cue (millièmes) */
@@ -155,7 +165,7 @@
 
   function newCue(number) {
     return {
-      number: number, name: 'Cue ' + cnStr(number), color: null, notes: '',
+      number: number, name: 'Cue ' + cnStr(number), color: null, notes: '', armed: true,
       transition: { kind: 'crossfade', dur_s: 1.0, curve: 'linear' },
       follow: 'manual', goto_after: null, states: [], mod_routes: [],
       triggers: { midi_note: null, osc: null }
@@ -187,7 +197,7 @@
 
   function sendCmd(cmd) {
     if (!Conduite.ws.send({ type: 'cmd', cmd: cmd })) {
-      pushLog('warn', 'ui', 'Hors ligne — commande perdue : ' + (cmd && cmd.cmd));
+      uiError('Hors ligne — commande perdue : ' + (cmd && cmd.cmd));
       return false;
     }
     return true;
@@ -195,30 +205,94 @@
 
   function sendEdit(op) {
     if (isShowMode()) {
-      pushLog('warn', 'ui', 'Mode Show verrouillé — édition refusée (' + (op && op.op) + ')');
+      uiWarn('Mode Show verrouillé — édition refusée (' + (op && op.op) + ')');
       return false;
     }
     var c = { cmd: 'edit' };
     Object.keys(op).forEach(function (k) { c[k] = op[k]; });
-    return sendCmd(c);
+    var ok = sendCmd(c);
+    if (ok) { trackEdit(op); }
+    return ok;
   }
 
   function sendParam(addr, value, live) {
     return sendCmd({ cmd: 'param_set', addr: addr, value: value, source: 'ui' });
   }
 
-  /* GO : anti-rafale — un GO au plus toutes les 250 ms, quel que soit le
-     chemin (Espace, bouton, double événement). Une touche qui accroche ne
-     fait pas défiler la conduite. */
-  var lastGoTs = 0;
+  /* GO : anti double-GO — reflet UI du verrou de session
+     (show.settings.min_go_interval_ms, défaut 300 ms). Pendant le délai :
+     bouton grisé + jauge d'attente, Espace et clics ignorés, quel que soit
+     le chemin (touche qui accroche, double événement). Le VRAI verrou est
+     dans session (toutes sources : UI/OSC/MIDI/MSC) — ici on évite juste
+     d'envoyer des commandes vouées au refus et on rend le délai visible. */
+  var GO = { lockUntil: 0, timer: null };
+
+  function goIntervalMs() {
+    var v = settings().min_go_interval_ms;
+    return (typeof v === 'number' && isFinite(v) && v >= 0) ? v : 300;
+  }
+
+  function goLocked() { return Date.now() < GO.lockUntil; }
+
+  /* Applique/retire l'état visuel du délai sur le bouton GO (si présent). */
+  function goCooldownVisual() {
+    var btn = byId('go-btn');
+    if (GO.timer) { clearTimeout(GO.timer); GO.timer = null; }
+    var remaining = GO.lockUntil - Date.now();
+    if (remaining <= 0) {
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove('cooldown');
+      }
+      return;
+    }
+    if (btn && !btn.classList.contains('cooldown')) {
+      btn.disabled = true;
+      btn.style.setProperty('--go-wait', remaining + 'ms');
+      btn.classList.add('cooldown');
+    }
+    GO.timer = setTimeout(goCooldownVisual, remaining + 15);
+  }
 
   function go() {
-    var now = Date.now();
-    if (now - lastGoTs < 250) { return; }
-    lastGoTs = now;
+    if (goLocked()) { return; }
+    GO.lockUntil = Date.now() + goIntervalMs();
     sendCmd({ cmd: 'cue_go' });
+    goCooldownVisual();
   }
   function back() { sendCmd({ cmd: 'cue_back' }); }
+
+  /* ============================================== panic universel (Échap)
+     Convention QLab : Échap déclenche TOUJOURS le panic — simple appui =
+     fondu (settings.panic_fade_s, défaut 2 s), double appui < 600 ms =
+     arrêt sec. Jamais désactivé, même en mode Show. Dans un champ de
+     saisie, le premier Échap sort du champ, le deuxième déclenche. */
+  var ESC = { lastTs: 0 };
+
+  function panicFadeS() {
+    var v = settings().panic_fade_s;
+    return (typeof v === 'number' && isFinite(v) && v >= 0) ? v : 2.0;
+  }
+
+  function panicFlash() {
+    /* flash de bordure rouge plein écran — relançable sur double appui */
+    document.body.classList.remove('panic-flash');
+    void document.body.offsetWidth;   /* reflow : redémarre l'animation */
+    document.body.classList.add('panic-flash');
+    setTimeout(function () { document.body.classList.remove('panic-flash'); }, 700);
+  }
+
+  function escPanic() {
+    var now = Date.now();
+    var hard = now - ESC.lastTs < 600;
+    ESC.lastTs = now;
+    var fade = hard ? 0 : panicFadeS();
+    sendCmd({ cmd: 'cue_panic', fade_s: fade });
+    panicFlash();
+    pushLog('warn', 'ui', hard
+      ? 'PANIC — arrêt immédiat (double Échap)'
+      : 'PANIC — fondu ' + fmtF(fade, 1) + ' s (Échap)');
+  }
 
   function dboToggle() {
     if (rt().dbo) { sendCmd({ cmd: 'dbo_release' }); }
@@ -266,6 +340,241 @@
     DBOKEY.fired = false;
   }
 
+  /* ================================================================ toasts
+     Retour transitoire pour TOUTES les erreurs et confirmations (plus
+     d'échec silencieux relégué à l'onglet Journal). Empilés (4 max),
+     4 s à l'écran, minuteur en pause au survol. Jamais bloquant. */
+
+  function toast(msg, level) {
+    var host = byId('toasts');
+    if (!host) {
+      host = el('div', { id: 'toasts', 'aria-live': 'polite' });
+      document.body.appendChild(host);
+    }
+    var t = el('div', { class: 'toast' + (level ? ' ' + level : '') }, msg);
+    host.appendChild(t);
+    while (host.children.length > 4) { host.removeChild(host.firstChild); }
+    var remaining = 4000, shownAt = Date.now(), timer = null;
+    function close() {
+      timer = null;
+      t.classList.add('out');
+      setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 350);
+    }
+    function arm() { shownAt = Date.now(); timer = setTimeout(close, remaining); }
+    t.addEventListener('mouseenter', function () {
+      if (timer) { clearTimeout(timer); timer = null; }
+      remaining = Math.max(800, remaining - (Date.now() - shownAt));
+    });
+    t.addEventListener('mouseleave', function () {
+      if (!timer && !t.classList.contains('out')) { arm(); }
+    });
+    arm();
+  }
+
+  /* Avertissement / erreur / info VISIBLES : journal + toast. */
+  function uiWarn(msg) { pushLog('warn', 'ui', msg); toast(msg, 'warn'); }
+  function uiError(msg) { pushLog('error', 'ui', msg); toast(msg, 'err'); }
+  function uiInfo(msg) { pushLog('info', 'ui', msg); toast(msg); }
+
+  /* ============================== micro-UX des curseurs (façon Resolume)
+     Sur TOUT slider : clic sur la valeur = saisie clavier exacte (Entrée
+     valide, Échap annule), double-clic = valeur par défaut, Maj+glisser =
+     précision fine (course ×10). La nouvelle valeur repasse par les
+     événements natifs input/change : chaque site garde sa plomberie. */
+
+  var SLIDER_TIP = 'Clic sur la valeur : saisie exacte · Double-clic : valeur par défaut · Maj+glisser : précision fine';
+
+  function sliderSet(input, v, fireChange) {
+    var min = parseFloat(input.min), max = parseFloat(input.max);
+    if (isFinite(min) && isFinite(max)) { v = clamp(v, min, max); }
+    input.value = v;
+    input.dispatchEvent(new Event('input', { bubbles: false }));
+    if (fireChange !== false) { input.dispatchEvent(new Event('change', { bubbles: false })); }
+    return v;
+  }
+
+  /* input : <input type=range> ; valEl : élément affichant la valeur (peut
+     être null) ; def : valeur par défaut (double-clic) ; xf : conversion
+     optionnelle valeur interne <-> valeur saisie ({ out, in }, ex. master
+     affiché en %). */
+  function enhanceSlider(input, valEl, def, xf) {
+    var toEdit = (xf && xf.out) ? xf.out : function (v) { return v; };
+    var fromEdit = (xf && xf['in']) ? xf['in'] : function (v) { return v; };
+    var tip = input.getAttribute('data-tip');
+    input.setAttribute('data-tip', (tip ? tip + ' — ' : '') + SLIDER_TIP);
+
+    function reset() {
+      if (def === undefined || def === null) { return; }
+      sliderSet(input, def);
+    }
+    input.addEventListener('dblclick', reset);
+
+    /* Maj+glisser : on prend la main sur le drag natif (course ×10) */
+    var fine = null;
+    input.addEventListener('pointerdown', function (e) {
+      if (!e.shiftKey || e.button !== 0) { return; }
+      e.preventDefault();
+      fine = { x: e.clientX, v: parseFloat(input.value) || 0 };
+      try { input.setPointerCapture(e.pointerId); } catch (err) { /* indisponible */ }
+    });
+    input.addEventListener('pointermove', function (e) {
+      if (!fine) { return; }
+      var min = parseFloat(input.min), max = parseFloat(input.max);
+      var span = (isFinite(min) && isFinite(max)) ? (max - min) : 1;
+      var w = Math.max(40, input.getBoundingClientRect().width);
+      sliderSet(input, fine.v + (e.clientX - fine.x) / w * span * 0.1, false);
+    });
+    function fineEnd() {
+      if (!fine) { return; }
+      fine = null;
+      input.dispatchEvent(new Event('change', { bubbles: false }));
+    }
+    input.addEventListener('pointerup', fineEnd);
+    input.addEventListener('pointercancel', fineEnd);
+
+    if (!valEl) { return; }
+    valEl.setAttribute('data-tip', SLIDER_TIP);
+    valEl.addEventListener('dblclick', reset);
+    valEl.addEventListener('click', function () {
+      if (valEl.getAttribute('data-editing')) { return; }
+      valEl.setAttribute('data-editing', '1');
+      var old = valEl.textContent;
+      var cur = toEdit(parseFloat(input.value));
+      var ed = el('input', {
+        class: 'val-edit', type: 'text',
+        value: String(Math.round(cur * 1000) / 1000)
+      });
+      valEl.textContent = '';
+      valEl.appendChild(ed);
+      var done = false;
+      function finish(commit) {
+        if (done) { return; }
+        done = true;
+        var v = parseFloat(String(ed.value).replace(',', '.'));
+        valEl.removeAttribute('data-editing');
+        if (ed.parentNode === valEl) { valEl.removeChild(ed); }
+        valEl.textContent = old;   /* input/change re-mettent à jour derrière */
+        if (commit && isFinite(v)) { sliderSet(input, fromEdit(v)); }
+      }
+      ed.addEventListener('keydown', function (e) {
+        e.stopPropagation();   /* pas de GO/panic global pendant la saisie */
+        if (e.key === 'Enter') { finish(true); }
+        else if (e.key === 'Escape') { finish(false); }
+      });
+      ed.addEventListener('blur', function () { finish(true); });
+      ed.focus();
+      ed.select();
+    });
+  }
+
+  /* ============================================ confirmation destructive
+     Dialogue sobre : Entrée = confirmer, Échap = annuler (l'Échap y est
+     consommé par le dialogue — pas de panic depuis un dialogue). Les
+     actions destructives sont de toute façon refusées en mode Show. */
+
+  var CONFIRM = { el: null, onConfirm: null, onCancel: null };
+
+  function confirmOpen() { return !!CONFIRM.el; }
+
+  function closeConfirm(ok) {
+    var box = CONFIRM.el;
+    if (!box) { return; }
+    var cb = ok ? CONFIRM.onConfirm : CONFIRM.onCancel;
+    CONFIRM.el = null;
+    CONFIRM.onConfirm = null;
+    CONFIRM.onCancel = null;
+    if (box.parentNode) { box.parentNode.removeChild(box); }
+    if (typeof cb === 'function') { cb(); }
+  }
+
+  /* opts : { title, message, confirm, cancel, danger=true, onConfirm, onCancel } */
+  function confirmDialog(opts) {
+    closeConfirm(false);
+    var confirmBtn = el('button', {
+      class: opts.danger === false ? 'primary' : 'danger',
+      onclick: function () { closeConfirm(true); }
+    }, opts.confirm || 'Confirmer', el('kbd', null, 'Entrée'));
+    var cancelBtn = el('button', {
+      onclick: function () { closeConfirm(false); }
+    }, opts.cancel || 'Annuler', el('kbd', null, 'Échap'));
+    var overlay = el('div', { id: 'confirm-overlay' },
+      el('div', { class: 'confirm-box', role: 'dialog', 'aria-modal': 'true' },
+        el('div', { class: 'confirm-title' }, opts.title || 'Confirmer ?'),
+        opts.message ? el('div', { class: 'confirm-msg' }, opts.message) : null,
+        el('div', { class: 'confirm-actions' }, cancelBtn, confirmBtn)));
+    overlay.addEventListener('pointerdown', function (e) {
+      if (e.target === overlay) { closeConfirm(false); }
+    });
+    CONFIRM.el = overlay;
+    CONFIRM.onConfirm = opts.onConfirm || null;
+    CONFIRM.onCancel = opts.onCancel || null;
+    document.body.appendChild(overlay);
+    confirmBtn.focus();
+  }
+
+  /* ============================================== undo/redo (Ctrl+Z/Maj+Z)
+     Les commandes Undo/Redo vivent dans session (pile de snapshots, mode
+     Edit uniquement) ; on garde ici un historique local des LIBELLÉS pour
+     nommer l'action dans le toast (« Annulé : suppression de cue »). */
+
+  var EDITS = { done: [], undone: [] };
+  var EDITS_CAP = 100;   /* même cap que la pile session (UNDO_CAP) */
+
+  var OP_LABELS = {
+    slice_add: 'ajout de slice', slice_remove: 'suppression de slice',
+    slice_update: 'modification de slice', corner_set: 'déplacement de coin',
+    output_add: 'ajout de sortie', output_remove: 'suppression de sortie',
+    output_update: 'modification de sortie',
+    cue_add: 'ajout de cue', cue_remove: 'suppression de cue',
+    cue_update: 'modification de cue', cue_update_state: 'assignation de contenu',
+    media_add: 'ajout de média', media_remove: 'suppression de média',
+    media_update: 'modification de média',
+    material_add: 'ajout de matériau', material_remove: 'suppression de matériau',
+    material_update: 'modification de matériau',
+    modulator_add: 'ajout de modulateur', modulator_remove: 'suppression de modulateur',
+    modulator_update: 'modification de modulateur',
+    route_add: 'ajout d’animation', route_remove: 'suppression d’animation',
+    route_update: 'modification d’animation',
+    patch_artnet_add: 'ajout de patch Art-Net', patch_artnet_remove: 'suppression de patch Art-Net',
+    patch_artnet_update: 'modification de patch Art-Net',
+    patch_midi_add: 'ajout de binding MIDI', patch_midi_remove: 'suppression de binding MIDI',
+    patch_midi_update: 'modification de binding MIDI',
+    patch_osc_out_set: 'réglage OSC sortant',
+    show_rename: 'renommage du show', settings_update: 'modification des réglages'
+  };
+
+  function opLabel(op) {
+    return (op && op.op && OP_LABELS[op.op]) || (op && op.op) || 'édition';
+  }
+
+  function trackEdit(op) {
+    EDITS.done.push(opLabel(op));
+    if (EDITS.done.length > EDITS_CAP) { EDITS.done.shift(); }
+    EDITS.undone.length = 0;   /* toute édition invalide le redo (comme session) */
+  }
+
+  function uiUndo() {
+    if (isShowMode()) {
+      uiWarn('Mode Show verrouillé — annulation désactivée.');
+      return;
+    }
+    if (!sendCmd({ cmd: 'undo' })) { return; }
+    var label = EDITS.done.pop();
+    if (label) { EDITS.undone.push(label); }
+    toast(label ? 'Annulé : ' + label : 'Annulation demandée');
+  }
+
+  function uiRedo() {
+    if (isShowMode()) {
+      uiWarn('Mode Show verrouillé — rétablissement désactivé.');
+      return;
+    }
+    if (!sendCmd({ cmd: 'redo' })) { return; }
+    var label = EDITS.undone.pop();
+    if (label) { EDITS.done.push(label); }
+    toast(label ? 'Rétabli : ' + label : 'Rétablissement demandé');
+  }
+
   /* Cue cible pour les assignations de contenu : standby, sinon active. */
   function targetCueNumber() {
     var r = rt();
@@ -275,16 +584,25 @@
     return list.length ? list[0].number : null;
   }
 
-  function assignContent(sliceId, content, playback) {
+  /* `quiet` : les appels en rafale (mire globale, éteindre, identifier)
+     affichent UN toast récapitulatif côté appelant au lieu d'un par slice. */
+  function assignContent(sliceId, content, playback, quiet) {
     var n = targetCueNumber();
     if (n === null) {
-      pushLog('warn', 'ui', 'Aucune cue cible (standby/active) pour l’assignation.');
-      return;
+      uiWarn('Aucune cue cible (standby/active) pour l’assignation.');
+      return false;
     }
-    sendEdit({
+    var ok = sendEdit({
       op: 'cue_update_state', number: n,
       state: { slice: sliceId, content: content, playback: playback || null, params: {} }
     });
+    if (ok && !quiet) {
+      var slice = slices().find(function (s) { return s.id === sliceId; });
+      var sname = slice ? slice.name : ('slice ' + sliceId);
+      var what = (!content || content === 'none') ? 'Contenu retiré' : contentLabel(content);
+      toast(what + ' → ' + sname + ' (cue ' + cnStr(n) + ')', 'ok');
+    }
+    return ok;
   }
 
   /* ============================================ application locale des EditOp
@@ -401,17 +719,18 @@
 
   /* ======================================================== onglets & rendu */
 
+  /* `short` : libellé condensé pour la nav tablette (≤ 900 px). */
   var TABS = [
-    { id: 'live', label: 'Live', tip: 'Conduite en jeu : cuelist, GO, préviews, master, DBO. Raccourci : 1' },
-    { id: 'cues', label: 'Cues', tip: 'Édition de la cuelist : numéros, transitions, follow, notes. Raccourci : 2' },
-    { id: 'mapping', label: 'Mapping', tip: 'Calage des slices : coins, nudge clavier, mires. Raccourci : 3' },
-    { id: 'medias', label: 'Médias', tip: 'Pool de médias : vignettes, assignation, re-scan. Raccourci : 4' },
-    { id: 'materiaux', label: 'Matériaux', tip: 'Shaders ISF/GLSL : assignation et paramètres. Raccourci : 5' },
-    { id: 'modulation', label: 'Modulation', tip: 'LFO, bandes audio, routes, tap tempo. Raccourci : 6' },
-    { id: 'patch', label: 'Patch', tip: 'OSC, MIDI, Art-Net : bindings et adresses. Raccourci : 7' },
-    { id: 'sorties', label: 'Sorties', tip: 'Écrans / projecteurs : résolution, plein écran, identification. Raccourci : 8' },
-    { id: 'journal', label: 'Journal', tip: 'Logs du moteur en direct. Raccourci : 9' },
-    { id: 'reglages', label: 'Réglages', tip: 'Show, ports, langue, mode Édition/Show. Raccourci : 0' }
+    { id: 'live', label: 'Live', short: 'Live', tip: 'Conduite en jeu : cuelist, GO, préviews, master, DBO. Raccourci : 1' },
+    { id: 'cues', label: 'Cues', short: 'Cues', tip: 'Édition de la cuelist : numéros, transitions, follow, notes. Raccourci : 2' },
+    { id: 'mapping', label: 'Mapping', short: 'Map', tip: 'Calage des slices : coins, nudge clavier, mires. Raccourci : 3' },
+    { id: 'medias', label: 'Médias', short: 'Méd', tip: 'Pool de médias : vignettes, assignation, re-scan. Raccourci : 4' },
+    { id: 'materiaux', label: 'Matériaux', short: 'Mat', tip: 'Shaders ISF/GLSL : assignation et paramètres. Raccourci : 5' },
+    { id: 'modulation', label: 'Modulation', short: 'Mod', tip: 'LFO, bandes audio, routes, tap tempo. Raccourci : 6' },
+    { id: 'patch', label: 'Patch', short: 'Patch', tip: 'OSC, MIDI, Art-Net : bindings et adresses. Raccourci : 7' },
+    { id: 'sorties', label: 'Sorties', short: 'Sort', tip: 'Écrans / projecteurs : résolution, plein écran, identification. Raccourci : 8' },
+    { id: 'journal', label: 'Journal', short: 'Jrnl', tip: 'Logs du moteur en direct. Raccourci : 9' },
+    { id: 'reglages', label: 'Réglages', short: 'Régl', tip: 'Show, ports, langue, mode Édition/Show. Raccourci : 0' }
   ];
 
   function visibleTabs() {
@@ -433,7 +752,9 @@
       nav.appendChild(el('button', {
         class: t.id === S.tab ? 'active' : '', 'data-tip': t.tip,
         onclick: function () { setTab(t.id); }
-      }, el('span', { class: 'tab-key' }, key), t.label));
+      }, el('span', { class: 'tab-key' }, key),
+        el('span', { class: 'tab-label-full' }, t.label),
+        el('span', { class: 'tab-label-short' }, t.short || t.label)));
     });
   }
 
@@ -524,6 +845,14 @@
     right.appendChild(el('div', { class: 'panel' },
       el('h2', null, 'Transport'),
       el('div', { id: 'transport' },
+        /* temps restant de la cue active, en grand : le chiffre que le
+           régisseur surveille avant le prochain GO */
+        el('div', {
+          id: 'live-remaining', class: 'idle',
+          'data-tip': 'Temps restant de la cue active (média ou attente) — ambre sous 10 s, rouge sous 5 s'
+        },
+          el('span', { class: 'lr-label' }, 'RESTE'),
+          el('span', { class: 'lr-val' }, '—')),
         el('button', {
           id: 'go-btn', 'data-tip': 'GO : lance la cue en standby. Raccourci : Espace',
           onclick: go
@@ -538,7 +867,18 @@
         }, 'STANDBY +1'),
         el('div', { id: 'goto-row' },
           gotoInput,
-          el('button', { 'data-tip': 'GOTO : saute directement à ce numéro de cue', onclick: function () { doGoto(gotoInput); } }, 'GOTO')))));
+          el('button', { 'data-tip': 'GOTO : saute directement à ce numéro de cue', onclick: function () { doGoto(gotoInput); } }, 'GOTO'))),
+      /* notes de régie de la cue en standby — l'outil n°1 du régisseur
+         remplaçant (« attendre le noir complet avant GO ») */
+      el('div', {
+        id: 'standby-notes', class: 'standby-notes empty',
+        'data-tip': 'Notes de régie de la cue en standby. Touche O : éditer (mode édition).'
+      })));
+
+    /* panneau replié « Cues actives » : temps écoulé / restant, progression */
+    right.appendChild(el('details', { id: 'active-cues' },
+      el('summary', { 'data-tip': 'Cue(s) en cours de lecture : progression et temps restant' }, 'Cues actives'),
+      el('div', { id: 'active-cues-list' })));
 
     var master = el('input', {
       type: 'range', min: 0, max: 1, step: 0.001, id: 'master-range',
@@ -565,11 +905,18 @@
     }, el('span', { class: 'dbo-label' }, 'DBO'));
     installDbo(dbo);
 
+    var masterVal = el('span', { id: 'master-val' }, Math.round(rt().master * 100) + ' %');
+    /* saisie exacte en % (Entrée), double-clic = 100 %, Maj+glisser fin */
+    enhanceSlider(master, masterVal, 1, {
+      out: function (v) { return Math.round(v * 100); },
+      'in': function (d) { return d / 100; }
+    });
+
     right.appendChild(el('div', { class: 'panel' },
       el('h2', null, 'Master'),
       el('div', { id: 'master-row' },
         master,
-        el('span', { id: 'master-val' }, Math.round(rt().master * 100) + ' %'),
+        masterVal,
         animButton('master/intensity')),
       dbo));
 
@@ -633,7 +980,7 @@
     var n = cnParse(input.value);
     if (n === null) {
       input.classList.add('danger-text');
-      pushLog('warn', 'ui', 'Numéro de cue invalide : ' + input.value);
+      uiWarn('Numéro de cue invalide : ' + input.value);
       return;
     }
     input.classList.remove('danger-text');
@@ -651,24 +998,42 @@
   }
 
   function cuelistDom() {
-    var wrap = el('div', { id: 'cuelist', 'data-tip': 'Clic : met la cue en standby. Double-clic : GOTO immédiat.' });
+    var wrap = el('div', {
+      id: 'cuelist', role: 'list',
+      'data-tip': 'Clic ou Entrée : met la cue en standby. Double-clic : GOTO immédiat.'
+    });
     var list = cues();
     if (!list.length) {
       wrap.appendChild(el('div', { style: 'padding:12px' },
-        emptyState('list', 'Aucune cue — créez la conduite dans l’onglet Cues.')));
+        emptyState('list', 'Aucune cue — créez la conduite dans l’onglet Cues.',
+          { label: 'Ouvrir l’onglet Cues', onclick: function () { setTab('cues'); } })));
       return wrap;
     }
     list.forEach(function (c) {
-      var row = el('div', { class: 'cue-row', 'data-cn': c.number },
+      var disarmed = c.armed === false;
+      var row = el('div', {
+        class: 'cue-row' + (disarmed ? ' disarmed' : ''), 'data-cn': c.number,
+        role: 'button', tabindex: '0',
+        'aria-label': 'Cue ' + cnStr(c.number) + (c.name ? ' — ' + c.name : ''),
+        'data-tip': disarmed ? 'Cue désarmée : sautée par GO/follow (GOTO la joue quand même).' : null
+      },
         el('span', { class: 'cue-num' },
           c.color ? el('span', { class: 'cue-color-dot', style: 'background:' + c.color }) : null,
           cnStr(c.number)),
         el('span', { class: 'cue-name' }, c.name || ''),
-        el('span', { class: 'cue-trans' }, transitionLabel(c.transition), followBadge(c)),
+        el('span', { class: 'cue-trans' }, transitionLabel(c.transition), cueBadges(c),
+          disarmed ? el('span', { class: 'cue-badge off' }, 'désarmée') : null),
         c.notes ? el('span', { class: 'cue-notes' }, c.notes) : null,
         el('div', { class: 'cue-progress' }, el('div')));
       row.addEventListener('click', function () { sendCmd({ cmd: 'cue_standby', cue: c.number }); });
       row.addEventListener('dblclick', function () { sendCmd({ cmd: 'cue_goto', cue: c.number }); });
+      /* Entrée = standby (Espace reste le GO global, jamais intercepté) */
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && !e.repeat) {
+          e.preventDefault();
+          sendCmd({ cmd: 'cue_standby', cue: c.number });
+        }
+      });
       wrap.appendChild(row);
     });
     return wrap;
@@ -680,12 +1045,32 @@
     return t.kind === 'cut' ? k : k + ' ' + fmtF(t.dur_s, 1) + ' s';
   }
 
-  function followBadge(c) {
+  /* Badges compacts d'une cue : follow, boucle de conduite (goto_after),
+     mode de fin des médias posés (boucle / aller-retour). */
+  function cueBadges(c) {
+    var out = [];
     var k = followKind(c.follow);
-    if (k === 'after_media') { return ' • suit le média'; }
-    if (k === 'wait') { return ' • attente ' + fmtF(followWait(c.follow), 1) + ' s'; }
-    if (c.goto_after !== null && c.goto_after !== undefined) { return ' • boucle vers ' + cnStr(c.goto_after); }
-    return '';
+    if (k === 'after_media') {
+      out.push(el('span', { class: 'cue-badge', 'data-tip': 'Follow : enchaîne à la fin du média' }, 'suit média'));
+    }
+    if (k === 'wait') {
+      out.push(el('span', { class: 'cue-badge', 'data-tip': 'Follow : enchaîne après l’attente' },
+        'attente ' + fmtF(followWait(c.follow), 1) + ' s'));
+    }
+    if (c.goto_after !== null && c.goto_after !== undefined) {
+      out.push(el('span', { class: 'cue-badge loop', 'data-tip': 'À la fin, saute à la cue ' + cnStr(c.goto_after) },
+        '⟳ vers ' + cnStr(c.goto_after)));
+    }
+    var states = c.states || [];
+    if (states.some(function (st) { return st.playback && st.playback.end === 'loop'; })) {
+      out.push(el('span', { class: 'cue-badge loop', 'data-tip': 'Au moins un média de cette cue joue en boucle' }, '⟳ boucle'));
+    }
+    if (states.some(function (st) {
+      return st.playback && (st.playback.end === 'ping_pong' || st.playback.end === 'palindrome');
+    })) {
+      out.push(el('span', { class: 'cue-badge loop', 'data-tip': 'Au moins un média joue en aller-retour' }, '⇄ aller-retour'));
+    }
+    return out;
   }
 
   function installDbo(btn) {
@@ -756,7 +1141,10 @@
     if (master && !MASTER.held && Date.now() >= MASTER.until) {
       master.value = r.master;
       var lbl = byId('master-val');
-      if (lbl) { lbl.textContent = Math.round(r.master * 100) + ' %'; }
+      /* pas d'écrasement pendant la saisie exacte (clic sur la valeur) */
+      if (lbl && !lbl.getAttribute('data-editing')) {
+        lbl.textContent = Math.round(r.master * 100) + ' %';
+      }
     }
     var dbo = byId('dbo-btn');
     if (dbo) {
@@ -764,6 +1152,15 @@
       var dlbl = dbo.querySelector('.dbo-label');
       if (dlbl) { dlbl.textContent = r.dbo ? 'DBO ACTIF — relâcher' : 'DBO'; }
     }
+    /* anti double-GO : ré-applique l'état d'attente si le bouton GO vient
+       d'être recréé par un re-render en plein délai */
+    if (goLocked()) { goCooldownVisual(); }
+    updateStandbyNotes(r);
+    updateProtoChips();
+    updateTitle(r);
+    updateRemaining(r);
+    updateActiveCues(r);
+    updateStatusBar(r);
     var bpm = byId('bpm-val');
     if (bpm) { bpm.textContent = fmtF(r.bpm, 1); }
     (r.mod_levels || []).forEach(function (pair) {
@@ -813,6 +1210,281 @@
       'Liaison WebSocket avec le moteur'));
   }
 
+  /* -------------------------------------- notes de régie (cue en standby) */
+
+  function updateStandbyNotes(r) {
+    var sn = byId('standby-notes');
+    if (!sn || sn.classList.contains('editing')) { return; }
+    var n = (r.standby !== null && r.standby !== undefined) ? r.standby : null;
+    var cue = n !== null ? cues().find(function (c) { return c.number === n; }) : null;
+    var txt = (cue && cue.notes) || '';
+    var key = (cue ? cue.number : 'none') + '|' + txt;
+    if (sn.getAttribute('data-key') === key) { return; }
+    sn.setAttribute('data-key', key);
+    sn.textContent = '';
+    if (txt) {
+      sn.classList.remove('empty');
+      sn.appendChild(el('span', { class: 'standby-notes-label' },
+        'NOTES — CUE ' + cnStr(cue.number)));
+      sn.appendChild(el('span', { class: 'standby-notes-text' }, txt));
+    } else {
+      sn.classList.add('empty');
+      sn.textContent = cue
+        ? (isShowMode() ? 'Aucune note de régie.' : 'Aucune note de régie — touche O pour en ajouter.')
+        : '';
+    }
+  }
+
+  /* Touche O : édite les notes de la cue en standby (mode édition). */
+  function editStandbyNotes() {
+    if (isShowMode()) { return; }
+    var r = rt();
+    var n = (r.standby !== null && r.standby !== undefined) ? r.standby : r.active;
+    if (n === null || n === undefined) {
+      uiWarn('Aucune cue en standby — pas de notes à éditer.');
+      return;
+    }
+    var cue = cues().find(function (c) { return c.number === n; });
+    if (!cue) { return; }
+    if (S.tab !== 'live') { setTab('live'); }
+    var sn = byId('standby-notes');
+    if (!sn || sn.classList.contains('editing')) { return; }
+    sn.classList.add('editing');
+    sn.classList.remove('empty');
+    sn.setAttribute('data-key', '');   /* force le rafraîchissement au retour */
+    sn.textContent = '';
+    var ta = el('textarea', { class: 'standby-notes-input', rows: 3 });
+    ta.value = cue.notes || '';
+    var done = false;
+    ta.addEventListener('blur', function () {
+      if (done) { return; }
+      done = true;
+      sn.classList.remove('editing');
+      if (ta.value !== (cue.notes || '')) {
+        var copy = JSON.parse(JSON.stringify(cue));
+        copy.notes = ta.value;
+        sendEdit({ op: 'cue_update', cue: copy });
+      }
+      updateStandbyNotes(rt());
+    });
+    sn.appendChild(el('span', { class: 'standby-notes-label' },
+      'NOTES — CUE ' + cnStr(n) + ' (Échap ou clic ailleurs : terminer)'));
+    sn.appendChild(ta);
+    ta.focus();
+  }
+
+  /* --------------------------- état des protocoles (runtime.protocols) */
+
+  var PROTO_LABELS = { osc_in: 'OSC entrée', osc_out: 'OSC sortie', artnet: 'Art-Net', midi: 'MIDI' };
+
+  function protoChips() {
+    var p = rt().protocols;
+    if (!p || typeof p !== 'object') {
+      return [el('span', { class: 'muted' }, 'Statut des protocoles non publié par le moteur.')];
+    }
+    return Object.keys(PROTO_LABELS)
+      .filter(function (k) { return p[k] !== undefined && p[k] !== null; })
+      .map(function (k) {
+        var v = String(p[k]);
+        var cls = v === 'ok' ? 'ok' : (v === 'inactif' ? '' : 'bad');
+        var text = v === 'ok' ? 'OK' : v;
+        return chip(cls, PROTO_LABELS[k] + ' — ' + text,
+          v.indexOf('erreur') === 0 ? v : ('État du protocole ' + PROTO_LABELS[k]));
+      });
+  }
+
+  function updateProtoChips() {
+    var pl = byId('proto-line');
+    if (!pl) { return; }
+    var sig = JSON.stringify(rt().protocols || null);
+    if (pl.getAttribute('data-sig') === sig) { return; }
+    pl.setAttribute('data-sig', sig);
+    pl.textContent = '';
+    protoChips().forEach(function (c) { pl.appendChild(c); });
+  }
+
+  /* ------------------------------------------------- signature de fenêtre
+     Titre dynamique : « ● Cue 12 — MonShow » en jeu, sinon le show. */
+
+  function updateTitle(r) {
+    var name = show().name || '';
+    var t;
+    if (r.active !== null && r.active !== undefined) {
+      t = '● Cue ' + cnStr(r.active) + (name ? ' — ' + name : ' — Conduite');
+    } else {
+      t = (name ? name + ' — ' : '') + 'Conduite';
+    }
+    if (document.title !== t) { document.title = t; }
+  }
+
+  /* ------------------------------ temps restant en grand (près du GO) */
+
+  function updateRemaining(r) {
+    var lr = byId('live-remaining');
+    if (!lr) { return; }
+    var v = lr.querySelector('.lr-val');
+    if (!v) { return; }
+    var active = r.active !== null && r.active !== undefined;
+    var rem = (typeof r.remaining_s === 'number' && isFinite(r.remaining_s)) ? r.remaining_s : 0;
+    if (!active || rem <= 0) {
+      lr.className = 'idle';
+      var txt = active ? (r.transition_active ? 'transition…' : 'en cours') : '—';
+      if (v.textContent !== txt) { v.textContent = txt; }
+      return;
+    }
+    lr.className = rem < 5 ? 'urgent' : (rem < 10 ? 'soon' : '');
+    v.textContent = fmtF(rem, 1) + ' s';
+  }
+
+  /* --------------------------------------- panneau replié « Cues actives » */
+
+  function updateActiveCues(r) {
+    var det = byId('active-cues');
+    var list = byId('active-cues-list');
+    if (!det || !list || !det.open) { return; }   /* replié : zéro travail DOM */
+    var active = (r.active !== null && r.active !== undefined)
+      ? cues().find(function (c) { return c.number === r.active; })
+      : null;
+    if (!active) {
+      if (list.getAttribute('data-key') !== 'none') {
+        list.setAttribute('data-key', 'none');
+        list.textContent = '';
+        list.appendChild(el('div', { class: 'acue-empty' }, 'Aucune cue en cours.'));
+      }
+      return;
+    }
+    var key = String(active.number);
+    if (list.getAttribute('data-key') !== key) {
+      list.setAttribute('data-key', key);
+      list.textContent = '';
+      list.appendChild(el('div', { class: 'acue-row' },
+        el('span', { class: 'acue-num' }, cnStr(active.number)),
+        el('span', null, active.name || ''),
+        el('span', { class: 'acue-time', id: 'acue-time' }, ''),
+        el('div', { class: 'acue-bar' }, el('div', { id: 'acue-bar' }))));
+    }
+    var t = byId('acue-time');
+    if (t) {
+      t.textContent = r.remaining_s > 0
+        ? ('reste ' + fmtF(r.remaining_s, 1) + ' s')
+        : (r.transition_active ? 'transition…' : 'en cours');
+    }
+    var bar = byId('acue-bar');
+    if (bar) { bar.style.width = Math.round(clamp(r.progress || 0, 0, 1) * 100) + '%'; }
+  }
+
+  /* --------------------------- barre d'état (footer) + « État du show »
+     Protocoles compacts, version, et icône d'avertissements qui n'apparaît
+     que si runtime.warnings est non vide — clic : panneau listant chaque
+     avertissement avec son action (relink / output / midi). */
+
+  var SB = { protoSig: null, warnSig: null, panel: null };
+
+  var WARN_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 22 20H2z"/><path d="M12 10v4M12 17h.01"/></svg>';
+
+  var SB_PROTO_SHORT = { osc_in: 'OSC in', osc_out: 'OSC out', artnet: 'Art-Net', midi: 'MIDI' };
+
+  var WARN_ACTIONS = {
+    relink: { label: 'Voir les médias', tab: 'medias' },
+    output: { label: 'Voir les sorties', tab: 'sorties' },
+    midi: { label: 'Ouvrir le patch', tab: 'patch' }
+  };
+
+  function updateStatusBar(r) {
+    var host = byId('sb-protos');
+    if (host) {
+      var p = r.protocols;
+      var sig = JSON.stringify(p || null);
+      if (sig !== SB.protoSig) {
+        SB.protoSig = sig;
+        host.textContent = '';
+        if (p && typeof p === 'object') {
+          Object.keys(SB_PROTO_SHORT).forEach(function (k) {
+            if (p[k] === undefined || p[k] === null) { return; }
+            var v = String(p[k]);
+            var cls = v === 'ok' ? 'ok' : (v === 'inactif' ? '' : 'bad');
+            host.appendChild(el('span', {
+              class: 'sb-proto' + (cls ? ' ' + cls : ''),
+              'data-tip': PROTO_LABELS[k] + ' — ' + (v === 'ok' ? 'OK' : v)
+            }, SB_PROTO_SHORT[k]));
+          });
+        }
+      }
+    }
+    var chip = byId('warn-chip');
+    if (chip) {
+      var warns = Array.isArray(r.warnings) ? r.warnings : [];
+      var sig2 = JSON.stringify(warns);
+      if (sig2 !== SB.warnSig) {
+        SB.warnSig = sig2;
+        var hasErr = warns.some(function (w) { return w && w.level === 'err'; });
+        chip.classList.toggle('hidden', !warns.length);
+        chip.classList.toggle('err', hasErr);
+        chip.innerHTML = WARN_ICON;
+        chip.appendChild(document.createTextNode(
+          ' ' + warns.length + ' — État du show'));
+        if (SB.panel) { renderStatusPanel(); }   /* panneau ouvert : rafraîchi */
+      }
+    }
+  }
+
+  function toggleStatusPanel() {
+    if (SB.panel) { closeStatusPanel(); return; }
+    SB.panel = el('div', { id: 'status-panel', role: 'dialog', 'aria-label': 'État du show' });
+    document.body.appendChild(SB.panel);
+    renderStatusPanel();
+  }
+
+  function closeStatusPanel() {
+    if (SB.panel && SB.panel.parentNode) { SB.panel.parentNode.removeChild(SB.panel); }
+    SB.panel = null;
+  }
+
+  function renderStatusPanel() {
+    var p = SB.panel;
+    if (!p) { return; }
+    p.textContent = '';
+    p.appendChild(el('h3', null, 'État du show',
+      el('span', { class: 'spacer' }),
+      el('button', { class: 'ghost', 'data-tip': 'Fermer', onclick: closeStatusPanel }, '✕')));
+    var warns = Array.isArray(rt().warnings) ? rt().warnings : [];
+    if (!warns.length) {
+      p.appendChild(el('div', { class: 'warn-empty' }, 'Aucun avertissement — tout est en ordre.'));
+      return;
+    }
+    warns.forEach(function (w) {
+      if (!w || typeof w !== 'object') { return; }
+      var act = WARN_ACTIONS[w.action];
+      p.appendChild(el('div', { class: 'warn-item' + (w.level === 'err' ? ' err' : '') },
+        el('span', { class: 'warn-dot' }),
+        el('span', { class: 'warn-msg' }, String(w.msg || '')),
+        (act && !isShowMode()) ? el('button', {
+          'data-tip': 'Ouvre l’onglet concerné',
+          onclick: function () { setTab(act.tab); closeStatusPanel(); }
+        }, act.label) : null));
+    });
+  }
+
+  /* GET /about : version + crédits pour le footer, l'infobulle du wordmark
+     et le panneau « À propos » des Réglages. Best-effort, jamais bloquant. */
+  function loadAbout() {
+    if (typeof fetch !== 'function') { return; }
+    fetch('/about').then(function (resp) {
+      return resp.ok ? resp.json() : null;
+    }).then(function (a) {
+      if (!a || typeof a !== 'object') { return; }
+      S.about = a;
+      var v = byId('sb-version');
+      if (v) { v.textContent = 'Conduite v' + (a.version || '?'); }
+      var brand = byId('brand');
+      if (brand) {
+        brand.setAttribute('data-tip', 'Conduite v' + (a.version || '?') +
+          (a.git ? ' (' + a.git + ')' : '') + ' — régie vidéo de spectacle');
+      }
+      if (S.tab === 'reglages') { requestRenderMain(); }
+    }).catch(function () { /* hors ligne : pas de version affichée */ });
+  }
+
   /* ================================================================= CUES */
 
   RENDERERS.cues = function () {
@@ -839,7 +1511,7 @@
           copy.number = next === null ? selCue.number + 1000
             : Math.floor((selCue.number + next) / 2);
           if (copy.number === selCue.number) {
-            pushLog('warn', 'ui', 'Pas de place entre ' + cnStr(selCue.number) + ' et la suivante.');
+            uiWarn('Pas de place entre ' + cnStr(selCue.number) + ' et la suivante.');
             return;
           }
           copy.name += ' (copie)';
@@ -847,9 +1519,19 @@
         }
       }, 'Dupliquer'),
       el('button', {
-        class: 'danger', disabled: !selCue, 'data-tip': 'Supprime la cue sélectionnée',
+        class: 'danger', disabled: !selCue, 'data-tip': 'Supprime la cue sélectionnée (confirmation demandée)',
         onclick: function () {
-          if (selCue) { sendEdit({ op: 'cue_remove', number: selCue.number }); S.sel.cue = null; }
+          if (!selCue) { return; }
+          confirmDialog({
+            title: 'Supprimer la cue ' + cnStr(selCue.number) + ' ?',
+            message: (selCue.name ? '« ' + selCue.name + ' »' : 'Cue sans nom') +
+              ' — annulable ensuite avec Ctrl+Z.',
+            confirm: 'Supprimer',
+            onConfirm: function () {
+              sendEdit({ op: 'cue_remove', number: selCue.number });
+              S.sel.cue = null;
+            }
+          });
         }
       }, 'Supprimer'),
       el('span', { class: 'spacer' }),
@@ -860,19 +1542,20 @@
           if (!selCue) { return; }
           var active = cues().find(function (c) { return c.number === rt().active; });
           if (!active || !active.states || !active.states.length) {
-            pushLog('warn', 'ui', 'Aucun état courant à enregistrer (pas de cue active).');
+            uiWarn('Aucun état courant à enregistrer (pas de cue active).');
             return;
           }
           active.states.forEach(function (st) {
             sendEdit({ op: 'cue_update_state', number: selCue.number, state: JSON.parse(JSON.stringify(st)) });
           });
-          pushLog('info', 'ui', 'État courant enregistré dans la cue ' + cnStr(selCue.number));
+          uiInfo('État courant enregistré dans la cue ' + cnStr(selCue.number));
         }
       }, 'Enregistrer l’état courant dans la cue')));
 
     var table = el('table', { class: 'grid' },
       el('tr', null,
         el('th', { 'data-tip': 'Numéro décimal (1, 2, 2.5…) — insertion sans renumérotation' }, 'N°'),
+        el('th', { 'data-tip': 'Cue armée : jouée normalement. Désarmée : grisée, sautée par GO/follow (GOTO la joue quand même). Pour retirer un tableau en répétition sans casser la conduite.' }, 'Armée'),
         el('th', null, 'Nom'),
         el('th', { 'data-tip': 'Type de transition d’entrée' }, 'Transition'),
         el('th', { 'data-tip': 'Durée de la transition (secondes)' }, 'Durée'),
@@ -886,15 +1569,24 @@
     });
     panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
     if (!cues().length) {
-      panel.appendChild(el('div', { style: 'padding:10px 0 0' },
-        emptyState('list', 'Aucune cue — bouton « Ajouter » pour commencer la conduite.')));
+      panel.appendChild(el('div', { style: 'padding:8px 0 0' },
+        emptyState('list', 'Aucune cue — la conduite commence ici.', {
+          label: 'Ajouter une cue',
+          onclick: function () {
+            var c = newCue(nextFreeCueNumber());
+            sendEdit({ op: 'cue_add', cue: c });
+            S.sel.cue = c.number;
+          }
+        })));
     }
     root.appendChild(panel);
     return root;
   };
 
   function cueRow(c) {
-    var tr = el('tr', { class: c.number === S.sel.cue ? 'selected' : '' });
+    var tr = el('tr', {
+      class: (c.number === S.sel.cue ? 'selected' : '') + (c.armed === false ? ' disarmed' : '')
+    });
     tr.addEventListener('click', function (e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON') { return; }
       S.sel.cue = c.number;
@@ -912,7 +1604,7 @@
       var n = cnParse(num.value);
       if (n === null || n === c.number) { num.value = cnStr(c.number); return; }
       if (cues().some(function (x) { return x.number === n; })) {
-        pushLog('warn', 'ui', 'Le numéro ' + cnStr(n) + ' existe déjà.');
+        uiWarn('Le numéro ' + cnStr(n) + ' existe déjà.');
         num.value = cnStr(c.number);
         return;
       }
@@ -923,6 +1615,15 @@
       S.sel.cue = n;
     });
     tr.appendChild(el('td', null, num));
+
+    var armed = el('input', {
+      type: 'checkbox', checked: c.armed !== false,
+      'data-tip': 'Armée = jouée. Désarmée = sautée par GO/follow (GOTO la joue quand même).'
+    });
+    armed.addEventListener('change', function () {
+      commit(function (x) { x.armed = armed.checked; });
+    });
+    tr.appendChild(el('td', null, armed));
 
     var name = el('input', { type: 'text', value: c.name || '', 'data-tip': 'Nom de la cue' });
     name.addEventListener('change', function () { commit(function (x) { x.name = name.value; }); });
@@ -1042,18 +1743,33 @@
         }
       }, '+ Slice'),
       el('button', {
-        class: 'danger', disabled: !selSlice, 'data-tip': 'Supprime le slice sélectionné',
+        class: 'danger', disabled: !selSlice, 'data-tip': 'Supprime le slice sélectionné (confirmation demandée)',
         onclick: function () {
-          if (selSlice) { sendEdit({ op: 'slice_remove', id: selSlice.id }); S.sel.slice = null; renderMain(); }
+          if (!selSlice) { return; }
+          confirmDialog({
+            title: 'Supprimer le slice « ' + (selSlice.name || ('slice ' + selSlice.id)) + ' » ?',
+            message: 'Son calage et ses contenus assignés dans les cues seront perdus — annulable ensuite avec Ctrl+Z.',
+            confirm: 'Supprimer',
+            onConfirm: function () {
+              sendEdit({ op: 'slice_remove', id: selSlice.id });
+              S.sel.slice = null;
+              renderMain();
+            }
+          });
         }
       }, '− Slice')));
 
     slicesOfOutput().forEach(function (s) {
-      slicePanel.appendChild(el('div', {
+      var item = el('div', {
         class: 'slice-item' + (s.id === S.sel.slice ? ' selected' : ''),
-        'data-tip': 'Sélectionne ce slice dans l’éditeur',
+        role: 'button', tabindex: '0',
+        'data-tip': 'Sélectionne ce slice dans l’éditeur (Entrée au clavier)',
         onclick: function () { S.sel.slice = s.id; S.sel.corner = null; renderMain(); }
-      }, s.name + ' (z ' + s.z + (s.enabled ? '' : ', désactivé') + ')'));
+      }, s.name + ' (z ' + s.z + (s.enabled ? '' : ', désactivé') + ')');
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); S.sel.slice = s.id; S.sel.corner = null; renderMain(); }
+      });
+      slicePanel.appendChild(item);
     });
     if (!slicesOfOutput().length) {
       slicePanel.appendChild(emptyState('screen', 'Aucun slice sur cette sortie — « + Slice » pour caler une zone.'));
@@ -1070,11 +1786,19 @@
         }, 'Mire slice'),
         el('button', {
           'data-tip': 'Pose la grille de convergence sur tous les slices de la sortie',
-          onclick: function () { slicesOfOutput().forEach(function (s) { assignContent(s.id, { pattern: 'grid' }); }); }
+          onclick: function () {
+            var ok = 0;
+            slicesOfOutput().forEach(function (s) { if (assignContent(s.id, { pattern: 'grid' }, null, true)) { ok++; } });
+            if (ok) { toast('Mire posée sur ' + ok + ' slice(s) (cue ' + cnStr(targetCueNumber()) + ')', 'ok'); }
+          }
         }, 'Mire globale'),
         el('button', {
           'data-tip': 'Retire les mires : contenu « aucun » sur tous les slices de la sortie',
-          onclick: function () { slicesOfOutput().forEach(function (s) { assignContent(s.id, 'none'); }); }
+          onclick: function () {
+            var ok = 0;
+            slicesOfOutput().forEach(function (s) { if (assignContent(s.id, 'none', null, true)) { ok++; } });
+            if (ok) { toast('Contenu retiré de ' + ok + ' slice(s) (cue ' + cnStr(targetCueNumber()) + ')', 'ok'); }
+          }
         }, 'Éteindre'))));
 
     /* paramètres du slice */
@@ -1104,6 +1828,7 @@
       val.textContent = fmtF(v);
       sendParam(addr, { f: v });
     });
+    enhanceSlider(input, val, def);
     return el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
   }
 
@@ -1153,7 +1878,7 @@
       var cx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4;
       var cy = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4;
       ctx.fillStyle = seld ? '#e8eaed' : '#9aa0a6';
-      ctx.font = '13px system-ui';
+      ctx.font = '12.5px system-ui';
       ctx.textAlign = 'center';
       ctx.fillText(s.name || ('slice ' + s.id), cx, cy);
     });
@@ -1308,6 +2033,7 @@
       });
       var card = el('div', {
         class: 'media-card' + (m.id === S.sel.media ? ' selected' : '') + (m.missing ? ' missing' : ''),
+        role: 'button', tabindex: '0', 'aria-label': m.name || m.path,
         'data-tip': m.path + (m.missing ? ' — FICHIER MANQUANT' : '') + ' — clic : sélectionner, double-clic : assigner au slice'
       },
         img,
@@ -1321,10 +2047,14 @@
         S.sel.media = m.id;
         if (S.sel.slice !== null) { assignContent(S.sel.slice, { media: m.id }, defaultPlayback()); }
       });
+      card.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); S.sel.media = m.id; renderMain(); }
+      });
       grid.appendChild(card);
     });
     if (!medias().length) {
-      grid.appendChild(emptyState('film', 'Aucun média — déposez des fichiers dans media/ puis « Re-scanner ».'));
+      grid.appendChild(emptyState('film', 'Aucun média — déposez des fichiers dans media/ puis re-scannez.',
+        { label: 'Re-scanner media/', onclick: function () { sendCmd({ cmd: 'media_rescan' }); } }));
     }
     panel.appendChild(grid);
     root.appendChild(panel);
@@ -1465,6 +2195,7 @@
       val.textContent = fmtF(v);
       sendParam(addr, { f: v });
     });
+    enhanceSlider(input, val, def);
     return el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
   }
 
@@ -1547,7 +2278,7 @@
     });
 
     /* axe log annoté */
-    ctx.font = '10px ' + 'system-ui, sans-serif';
+    ctx.font = '11px system-ui, sans-serif';
     ctx.textAlign = 'center';
     [[50, '50 Hz'], [200, '200 Hz'], [1000, '1 kHz'], [5000, '5 kHz'], [15000, '15 kHz']]
       .forEach(function (pair) {
@@ -1812,7 +2543,7 @@
           class: 'primary', 'data-tip': 'Tap tempo : taper en rythme pour poser le BPM. Raccourci : touche T',
           onclick: function () { sendCmd({ cmd: 'tap_tempo' }); }
         }, 'TAP ', el('kbd', null, 'T')),
-        el('span', { id: 'bpm-val', style: 'font-size:20px;font-variant-numeric:tabular-nums' }, fmtF(rt().bpm, 1)),
+        el('span', { id: 'bpm-val' }, fmtF(rt().bpm, 1)),
         el('span', { class: 'muted' }, 'BPM'),
         bpmIn,
         el('span', { class: 'muted', 'data-tip': 'Le tap tempo répond aussi à la touche T, depuis n’importe quel onglet.' },
@@ -1896,7 +2627,7 @@
       el('tr', null,
         el('th', null, 'Source'), el('th', null, 'Cible'),
         el('th', { 'data-tip': 'Profondeur par défaut, -1..1 (négatif = inversé ; les cues peuvent la surcharger)' }, 'Profondeur'),
-        el('th', { 'data-tip': 'Add : base + signal. Mul : atténuation. Replace : remplace la base.' }, 'Mode'),
+        el('th', { 'data-tip': 'Ajouter : base + signal. Multiplier : atténuation. Remplacer : remplace la base.' }, 'Mode'),
         el('th', { class: 'edit-only' }, '')));
     routes().forEach(function (r) { rtable.appendChild(routeRow(r)); });
     routePanel.appendChild(el('div', { style: 'overflow-x:auto' }, rtable));
@@ -1955,7 +2686,7 @@
       el('button', {
         class: 'danger edit-only', 'data-tip': 'Supprime ce modulateur (et laisse ses routes orphelines — pensez à les retirer)',
         onclick: function () { sendEdit({ op: 'modulator_remove', id: m.id }); }
-      }, 'X')));
+      }, '✕')));
 
     var body = el('div', { class: 'mod-body' });
     if (isLfo) {
@@ -2108,9 +2839,10 @@
     var dval = el('span', { class: 'val' }, fmtF(r.depth));
     depth.addEventListener('input', function () { dval.textContent = fmtF(parseFloat(depth.value)); });
     depth.addEventListener('change', function () { commit(function (x) { x.depth = parseFloat(depth.value); }); });
+    enhanceSlider(depth, dval, 0.5);
     tr.appendChild(el('td', null, el('span', { class: 'toolbar' }, depth, dval)));
 
-    var mode = sel(['add', 'mul', 'replace'], ['Add', 'Mul', 'Replace'], r.mode,
+    var mode = sel(['add', 'mul', 'replace'], ['Ajouter', 'Multiplier', 'Remplacer'], r.mode,
       function (v) { commit(function (x) { x.mode = v; }); });
     tr.appendChild(el('td', null, mode));
 
@@ -2118,7 +2850,7 @@
       el('button', {
         class: 'danger', 'data-tip': 'Supprime cette route',
         onclick: function () { sendEdit({ op: 'route_remove', id: r.id }); }
-      }, 'X')));
+      }, '✕')));
     return tr;
   }
 
@@ -2208,9 +2940,10 @@
       depth.addEventListener('change', function () {
         commitR(function (x) { x.depth = parseFloat(depth.value) || 0; });
       });
-      var mode = sel(['add', 'mul', 'replace'], ['Add', 'Mul', 'Replace'], r.mode,
+      enhanceSlider(depth, dval, 0.5);
+      var mode = sel(['add', 'mul', 'replace'], ['Ajouter', 'Multiplier', 'Remplacer'], r.mode,
         function (v) { commitR(function (x) { x.mode = v; }); });
-      mode.setAttribute('data-tip', 'Add : base + signal. Mul : atténuation. Replace : remplace la base.');
+      mode.setAttribute('data-tip', 'Ajouter : base + signal. Multiplier : atténuation. Remplacer : remplace la base.');
       pop.appendChild(el('div', { class: 'pop-route' },
         el('span', { class: 'mod-color-dot', style: 'background:' + col + ';color:' + col }),
         el('span', { class: 'pop-route-name' }, m ? m.name : ('mod ' + r.source)),
@@ -2231,7 +2964,8 @@
       });
       var dvalN = el('span', { class: 'val' }, '0.50');
       depthN.addEventListener('input', function () { dvalN.textContent = fmtF(parseFloat(depthN.value)); });
-      var modeN = sel(['add', 'mul', 'replace'], ['Add', 'Mul', 'Replace'], 'add', null);
+      enhanceSlider(depthN, dvalN, 0.5);
+      var modeN = sel(['add', 'mul', 'replace'], ['Ajouter', 'Multiplier', 'Remplacer'], 'add', null);
       modeN.setAttribute('data-tip', 'Mode d’application de la nouvelle animation');
 
       var src = el('select', { 'data-tip': 'Source à brancher : modulateur existant, ou création directe' });
@@ -2314,6 +3048,14 @@
 
   RENDERERS.patch = function () {
     var root = el('section', { class: 'tab-panel' });
+
+    /* --- état réel des protocoles (runtime.protocols) --- */
+    root.appendChild(el('div', { class: 'panel' },
+      el('h2', null, 'État des protocoles'),
+      el('div', {
+        id: 'proto-line', class: 'proto-line',
+        'data-tip': 'État réel au démarrage des services : vert = actif, gris = non configuré, rouge = erreur (port pris, périphérique absent…)'
+      })));
 
     /* --- OSC --- */
     var osc = el('div', { class: 'panel' }, el('h2', null, 'OSC'));
@@ -2463,7 +3205,7 @@
       el('button', {
         class: 'danger', 'data-tip': 'Supprime ce binding',
         onclick: function () { sendEdit({ op: 'patch_midi_remove', index: index }); }
-      }, 'X')));
+      }, '✕')));
     return tr;
   }
 
@@ -2498,7 +3240,7 @@
       el('button', {
         class: 'danger', 'data-tip': 'Supprime cette entrée de patch',
         onclick: function () { sendEdit({ op: 'patch_artnet_remove', index: index }); }
-      }, 'X')));
+      }, '✕')));
     return tr;
   }
 
@@ -2566,23 +3308,45 @@
           class: 'edit-only',
           'data-tip': 'Affiche la mire d’identification (nom + numéro) sur tous les slices de cette sortie',
           onclick: function () {
+            var ok = 0;
             slices().filter(function (s) { return s.output === o.id; })
-              .forEach(function (s) { assignContent(s.id, { pattern: 'ident' }); });
+              .forEach(function (s) { if (assignContent(s.id, { pattern: 'ident' }, null, true)) { ok++; } });
+            if (ok) { toast('Mire d’identification posée sur « ' + (o.name || o.id) + ' » (' + ok + ' slice(s))', 'ok'); }
+            else { uiWarn('Aucun slice sur cette sortie — rien à identifier.'); }
           }
         }, 'Identifier')));
 
       tr.appendChild(el('td', { class: 'edit-only' },
         el('button', {
-          class: 'danger', 'data-tip': 'Supprime cette sortie',
-          onclick: function () { sendEdit({ op: 'output_remove', id: o.id }); }
-        }, 'X')));
+          class: 'danger', 'data-tip': 'Supprime cette sortie (confirmation demandée)',
+          onclick: function () {
+            var nbSlices = slices().filter(function (s) { return s.output === o.id; }).length;
+            confirmDialog({
+              title: 'Supprimer la sortie « ' + (o.name || ('sortie ' + o.id)) + ' » ?',
+              message: (nbSlices
+                ? nbSlices + ' slice(s) calé(s) sur cette sortie deviendront orphelins. '
+                : '') + 'Annulable ensuite avec Ctrl+Z.',
+              confirm: 'Supprimer',
+              onConfirm: function () { sendEdit({ op: 'output_remove', id: o.id }); }
+            });
+          }
+        }, '✕')));
       table.appendChild(tr);
     });
 
     panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
     if (!outputs().length) {
-      panel.appendChild(el('div', { style: 'padding:10px 0 0' },
-        emptyState('screen', 'Aucune sortie — « + Sortie » puis activez-la pour projeter.')));
+      panel.appendChild(el('div', { style: 'padding:8px 0 0' },
+        emptyState('screen', 'Aucune sortie — ajoutez-en une puis activez-la pour projeter.', {
+          label: '+ Sortie',
+          onclick: function () {
+            var id = outputs().reduce(function (m, o) { return Math.max(m, o.id); }, 0) + 1;
+            sendEdit({
+              op: 'output_add',
+              output: { id: id, name: 'Sortie ' + id, monitor_index: null, width: 1920, height: 1080, fullscreen: true, enabled: false }
+            });
+          }
+        })));
     }
     root.appendChild(panel);
     return root;
@@ -2592,7 +3356,9 @@
 
   RENDERERS.journal = function () {
     var root = el('section', { class: 'tab-panel' });
-    var panel = el('div', { class: 'panel' }, el('h2', null, 'Journal'));
+    /* panel-fill : le journal occupe la hauteur restante en flex
+       (plus de calc(100vh - N px) fragile) */
+    var panel = el('div', { class: 'panel panel-fill' }, el('h2', null, 'Journal'));
 
     var filter = sel(['all', 'error', 'warn', 'info', 'debug', 'trace'],
       ['Tous', 'Erreurs', 'Avertissements', 'Info', 'Debug', 'Trace'],
@@ -2673,7 +3439,32 @@
     var showPanel = el('div', { class: 'panel' }, el('h2', null, 'Show'));
     var name = el('input', { type: 'text', value: show().name || '', 'data-tip': 'Nom du show (fichier shows/<nom>)' });
     name.addEventListener('change', function () { sendEdit({ op: 'show_rename', name: name.value }); });
-    var loadName = el('input', { type: 'text', placeholder: 'nom du show à charger' });
+    /* « Charger » : liste réelle des shows du dossier shows/ (runtime.shows)
+       — repli sur un champ texte si le moteur ne la publie pas.
+       Tolère des entrées String ou { name, modified } (date affichée si
+       le moteur la publie un jour). */
+    var showsList = Array.isArray(rt().shows) ? rt().shows.slice() : null;
+    var loadName;
+    if (showsList && showsList.length) {
+      loadName = el('select', { 'data-tip': 'Shows présents dans le dossier shows/ (liste publiée par le moteur)' });
+      loadName.appendChild(el('option', { value: '' }, '— choisir un show —'));
+      showsList
+        .map(function (s) {
+          return (s && typeof s === 'object')
+            ? { name: String(s.name || ''), date: s.modified || s.date || null }
+            : { name: String(s), date: null };
+        })
+        .filter(function (s) { return s.name; })
+        .sort(function (a, b) { return a.name.localeCompare(b.name); })
+        .forEach(function (s) {
+          loadName.appendChild(el('option', { value: s.name },
+            s.name +
+            (s.date ? ' — ' + s.date : '') +
+            (s.name === show().name ? ' (ouvert)' : '')));
+        });
+    } else {
+      loadName = el('input', { type: 'text', placeholder: 'nom du show à charger' });
+    }
     var saveAsName = el('input', { type: 'text', placeholder: 'enregistrer sous…' });
     showPanel.appendChild(el('div', { class: 'settings-grid' },
       el('span', null, 'Nom du show'), name));
@@ -2691,12 +3482,30 @@
       el('span', { class: 'edit-only' },
         loadName,
         el('button', {
-          'data-tip': 'Charge un show existant (le show courant doit être enregistré)',
-          onclick: function () { if (loadName.value.trim()) { sendCmd({ cmd: 'show_load', name: loadName.value.trim() }); } }
+          'data-tip': 'Charge un show du dossier shows/ (le show courant est sauvegardé automatiquement avant)',
+          onclick: function () {
+            var n = (loadName.value || '').trim();
+            if (!n) { uiWarn('Choisissez un show à charger.'); return; }
+            if (n === show().name) { uiInfo('Le show « ' + n + ' » est déjà ouvert.'); return; }
+            confirmDialog({
+              title: 'Charger « ' + n + ' » ?',
+              message: 'Le show courant est sauvegardé automatiquement avant le chargement.',
+              confirm: 'Charger', danger: false,
+              onConfirm: function () { sendCmd({ cmd: 'show_load', name: n }); }
+            });
+          }
         }, 'Charger')),
       el('button', {
-        class: 'edit-only', 'data-tip': 'Nouveau show vide',
-        onclick: function () { sendCmd({ cmd: 'show_new' }); }
+        class: 'edit-only', 'data-tip': 'Nouveau show vide (confirmation demandée)',
+        onclick: function () {
+          confirmDialog({
+            title: 'Nouveau show ?',
+            message: 'Remplace la conduite courante par un show vide. ' +
+              'Le fichier du show actuel reste sur disque (shows/), mais les modifications non enregistrées seront perdues.',
+            confirm: 'Nouveau show',
+            onConfirm: function () { sendCmd({ cmd: 'show_new' }); }
+          });
+        }
       }, 'Nouveau'),
       el('button', {
         class: 'edit-only',
@@ -2734,19 +3543,92 @@
     }
     var lang = sel(['fr', 'en'], ['Français', 'English (à venir)'], st.language || 'fr', function (v) {
       commitSettings(function (x) { x.language = v; });
-      if (v === 'en') { pushLog('info', 'ui', 'Interface anglaise : à venir — le réglage est enregistré.'); }
+      if (v === 'en') { uiInfo('Interface anglaise : à venir — le réglage est enregistré.'); }
     });
     lang.setAttribute('data-tip', 'Langue de l’interface (anglais : à venir)');
     var fps = el('input', { type: 'number', min: 1, max: 30, value: st.mjpeg_fps || 8, 'data-tip': 'Cadence des préviews MJPEG (img/s)' });
     fps.addEventListener('change', function () {
       commitSettings(function (x) { x.mjpeg_fps = clamp(parseInt(fps.value, 10) || 8, 1, 30); });
     });
+    /* garde-fous de conduite : anti double-GO et fondu du panic (Échap) */
+    var goMs = el('input', {
+      type: 'number', min: 0, max: 5000, step: 50,
+      value: (typeof st.min_go_interval_ms === 'number' ? st.min_go_interval_ms : 300),
+      'data-tip': 'Délai minimal entre deux GO (ms) — un GO pendant le délai est refusé, toutes sources (UI, OSC, MIDI, MSC). 0 = désactivé.'
+    });
+    goMs.addEventListener('change', function () {
+      commitSettings(function (x) {
+        x.min_go_interval_ms = clamp(parseInt(goMs.value, 10) || 0, 0, 5000);
+      });
+    });
+    var panicFade = el('input', {
+      type: 'number', min: 0, max: 30, step: 0.1,
+      value: (typeof st.panic_fade_s === 'number' ? st.panic_fade_s : 2),
+      'data-tip': 'Durée du fondu au noir du panic (touche Échap). Double Échap = toujours arrêt sec (0 s).'
+    });
+    panicFade.addEventListener('change', function () {
+      commitSettings(function (x) {
+        x.panic_fade_s = clamp(parseFloat(panicFade.value) || 0, 0, 30);
+      });
+    });
     cfgPanel.appendChild(el('div', { class: 'settings-grid' },
       el('span', null, 'Port OSC entrant'), portInput('osc_in_port', 'Port UDP d’écoute OSC (défaut 9000) — redémarrage du service OSC'),
       el('span', null, 'Port OSC sortant'), portInput('osc_out_port', 'Port de feedback OSC par défaut'),
       el('span', null, 'Langue'), lang,
-      el('span', null, 'Préview (img/s)'), fps));
+      el('span', null, 'Préview (img/s)'), fps,
+      el('span', null, 'Anti double-GO (ms)'), goMs,
+      el('span', null, 'Fondu du panic (s)'), panicFade));
     root.appendChild(cfgPanel);
+
+    /* quitter proprement (sauvegarde si modifié, flush des logs, sorties) */
+    root.appendChild(el('div', { class: 'panel' },
+      el('h2', null, 'Application'),
+      el('div', { class: 'toolbar' },
+        el('button', {
+          class: 'danger',
+          'data-tip': 'Arrêt propre du moteur : sauvegarde du show s’il a été modifié, fermeture des sorties et des ports, purge des logs',
+          onclick: function () {
+            confirmDialog({
+              title: 'Quitter Conduite ?',
+              message: 'Arrêt propre : le show est sauvegardé s’il a été modifié, puis le moteur et les sorties s’éteignent.',
+              confirm: 'Quitter',
+              onConfirm: function () {
+                sendCmd({ cmd: 'quit' });
+                uiInfo('Arrêt demandé — le moteur se ferme.');
+              }
+            });
+          }
+        }, 'Quitter Conduite'),
+        el('span', { class: 'muted' }, 'Ferme le moteur et toutes les sorties (la page web devient inactive).'))));
+
+    /* À propos : version, licence, crédits (GET /about, best-effort) */
+    var about = S.about || {};
+    var ap = el('div', { class: 'panel' }, el('h2', null, 'À propos'));
+    ap.appendChild(el('div', { class: 'about-head' },
+      el('span', { class: 'about-name' }, about.name || 'Conduite'),
+      el('span', { class: 'about-version' },
+        about.version
+          ? ('v' + about.version + (about.git ? ' (' + about.git + ')' : ''))
+          : 'version non publiée par le moteur'),
+      el('span', { class: 'spacer' }),
+      el('span', { class: 'muted' }, 'Licence ' + (about.license || 'MIT'))));
+    ap.appendChild(el('div', { class: 'about-desc' },
+      (about.description || 'Régie vidéo de spectacle — cues, mapping, ISF, MIDI/OSC/Art-Net') +
+      (about.copyright ? ' — ' + about.copyright : '')));
+    (Array.isArray(about.credits) ? about.credits : []).forEach(function (c) {
+      if (!c || typeof c !== 'object') { return; }
+      ap.appendChild(el('div', { class: 'about-credit' },
+        el('span', { class: 'ac-name' }, c.name || ''),
+        el('span', { class: 'ac-role' }, c.role || ''),
+        el('span', { class: 'ac-lic' },
+          (c.license || '') + (c.notice ? ' — ' + c.notice : ''))));
+    });
+    ap.appendChild(el('div', { class: 'about-foot' },
+      'Licences tierces complètes : dossier licenses/ du portable ' +
+      '(THIRD-PARTY-NOTICES.html, FFMPEG.txt) et shaders/CREDITS.txt. ' +
+      'Réutilisation ciblée de Lanterne (MIT, même auteur).' +
+      (about.website ? ' — ' + about.website : '')));
+    root.appendChild(ap);
 
     return root;
   };
@@ -2755,18 +3637,38 @@
 
   function installKeyboard() {
     document.addEventListener('keydown', function (e) {
-      var t = e.target;
-      var editing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
-      if (editing) {
-        if (e.key === 'Escape') { t.blur(); }
+      /* --- dialogue de confirmation ouvert : modal, il capte tout ---
+         (Entrée = confirmer, Échap = annuler ; surtout PAS de GO sur
+         Espace pendant qu'un dialogue est affiché). */
+      if (confirmOpen()) {
+        if (e.key === 'Escape') { e.preventDefault(); closeConfirm(false); }
+        else if (e.key === 'Enter') { e.preventDefault(); closeConfirm(true); }
         return;
       }
-      if (e.key === 'Escape') { closeAnimPopover(); return; }
+      var t = e.target;
+      var editing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+      /* --- Échap = panic universel, JAMAIS désactivé (même mode Show).
+         Dans un champ : le 1er Échap sort du champ, le 2e déclenche. --- */
+      if (e.key === 'Escape') {
+        if (editing) { t.blur(); return; }
+        closeAnimPopover();   /* les popovers se ferment au passage */
+        closeStatusPanel();
+        if (!e.repeat) { escPanic(); }
+        return;
+      }
+      if (editing) { return; }
+      /* --- Ctrl+Z / Ctrl+Maj+Z : annuler / rétablir (mode édition) --- */
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();
+        if (!e.repeat) { if (e.shiftKey) { uiRedo(); } else { uiUndo(); } }
+        return;
+      }
       /* e.repeat : l'auto-repeat clavier ne doit JAMAIS déclencher une
          action de conduite (rafale de GO, strobe DBO, tap tempo faussé). */
       if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) { go(); } return; }
       if (e.key === 'b' || e.key === 'B') { if (!e.repeat) { dboKeyDown(); } return; }
       if (e.key === 't' || e.key === 'T') { if (!e.repeat) { sendCmd({ cmd: 'tap_tempo' }); } return; }
+      if (e.key === 'o' || e.key === 'O') { if (!e.repeat) { editStandbyNotes(); } return; }
       if (/^[1-9]$/.test(e.key)) {
         var tab = visibleTabs()[parseInt(e.key, 10) - 1];
         if (tab) { setTab(tab.id); }
@@ -2789,7 +3691,7 @@
   function copyText(txt) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(txt).then(
-        function () { pushLog('info', 'ui', 'Copié dans le presse-papiers.'); },
+        function () { uiInfo('Copié dans le presse-papiers.'); },
         function () { copyFallback(txt); });
     } else {
       copyFallback(txt);
@@ -2800,8 +3702,8 @@
     ta.value = txt;
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); pushLog('info', 'ui', 'Copié.'); }
-    catch (e) { pushLog('warn', 'ui', 'Copie impossible.'); }
+    try { document.execCommand('copy'); uiInfo('Copié dans le presse-papiers.'); }
+    catch (e) { uiWarn('Copie impossible.'); }
     document.body.removeChild(ta);
   }
 
@@ -2823,10 +3725,37 @@
         break;
       case 'health_tick': S.health = ev.snapshot; updateHealth(); break;
       case 'log_line': pushLog(ev.level, ev.target, ev.message); break;
+      case 'warning':
+        /* avertissement de conduite non bloquant (GO refusé par l'anti
+           double-GO, commande impossible…) — throttlé côté moteur */
+        uiWarn(String(ev.message || 'Avertissement du moteur'));
+        break;
       case 'show_loaded':
         /* re-synchronisation complète via un nouveau hello */
         Conduite.ws.reconnect();
         break;
+      case 'recovery_available': {
+        /* un fichier de récupération plus récent que le show a été trouvé
+           au démarrage (arrêt sale probable) : proposer la restauration */
+        RECOVERY.prompted = ev.path || '';
+        var when = '';
+        if (typeof ev.timestamp === 'number' && isFinite(ev.timestamp)) {
+          var ms = ev.timestamp < 1e12 ? ev.timestamp * 1000 : ev.timestamp;
+          try { when = new Date(ms).toLocaleString('fr-FR'); } catch (e1) { when = String(ev.timestamp); }
+        } else if (ev.timestamp) {
+          when = String(ev.timestamp);
+        }
+        confirmDialog({
+          title: 'Récupération après arrêt inattendu',
+          message: 'Un état de récupération plus récent que le show enregistré a été trouvé'
+            + (when ? ' (' + when + ')' : '') + ' :\n'
+            + (ev.path || '') + '\n\nRestaurer cet état ? « Ignorer » conserve le show tel qu’enregistré.',
+          confirm: 'Restaurer', cancel: 'Ignorer', danger: false,
+          onConfirm: function () { sendCmd({ cmd: 'recovery_load', path: ev.path }); },
+          onCancel: function () { sendCmd({ cmd: 'recovery_dismiss' }); }
+        });
+        break;
+      }
       case 'edit_applied': {
         applyOp(ev.op || {});
         var opn = (ev.op && ev.op.op) || '';
@@ -2851,6 +3780,18 @@
 
   /* ================================================================ boot */
 
+  /* Récupération post-crash proposée UNE fois par chemin — l'événement
+     recovery_available au démarrage, ou runtime.recovery pour un client
+     connecté après coup (le moteur garde l'info tant que rien n'est tranché). */
+  var RECOVERY = { prompted: null };
+
+  function maybePromptRecovery() {
+    var rec = rt().recovery;
+    if (!rec || typeof rec !== 'object' || !rec.path) { return; }
+    if (RECOVERY.prompted === rec.path || confirmOpen()) { return; }
+    onEvent({ type: 'recovery_available', path: rec.path, timestamp: rec.timestamp });
+  }
+
   function onMessage(m) {
     switch (m.type) {
       case 'hello':
@@ -2858,6 +3799,7 @@
         S.show = S.raw.show || null;
         S.runtime = S.raw.runtime || Object.assign({}, RT0);
         renderAll();
+        maybePromptRecovery();
         break;
       case 'dyn':
         /* fft absent = pas d'entrée audio active (contrat WS) */
@@ -2867,6 +3809,7 @@
           var wasShow = document.body.classList.contains('mode-show');
           if (wasShow !== isShowMode()) { renderAll(); }
           else { updateDyn(); }
+          maybePromptRecovery();
         }
         break;
       case 'event':
@@ -2897,8 +3840,17 @@
       badge.addEventListener('dblclick', function () {
         sendCmd({ cmd: 'mode_set', mode: isShowMode() ? 'edit' : 'show' });
       });
+      badge.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          sendCmd({ cmd: 'mode_set', mode: isShowMode() ? 'edit' : 'show' });
+        }
+      });
     }
-    Conduite.ws.on('open', function () { S.connected = true; refreshPreviews(); updateHealth(); });
+    var warnChip = byId('warn-chip');
+    if (warnChip) { warnChip.addEventListener('click', toggleStatusPanel); }
+    loadAbout();
+    Conduite.ws.on('open', function () { S.connected = true; refreshPreviews(); updateHealth(); loadAbout(); });
     Conduite.ws.on('close', function () { S.connected = false; updateHealth(); });
     Conduite.ws.on('message', onMessage);
     Conduite.ws.connect();

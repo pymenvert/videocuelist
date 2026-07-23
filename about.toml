@@ -1,0 +1,28 @@
+# Configuration cargo-about — génération de licenses/THIRD-PARTY-NOTICES.html
+# (obligation d'attribution MIT/BSD/Apache en redistribution binaire).
+# Générer : cargo about generate about.hbs -o licenses/THIRD-PARTY-NOTICES.html
+# La liste est volontairement alignée sur l'allowlist de deny.toml.
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+
+# Les cibles réellement distribuées (les notices couvrent les quatre OS).
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]

@@ -67,6 +67,7 @@ struct ProbeOut {
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
     codec_type: Option<String>,
+    codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     avg_frame_rate: Option<String>,
@@ -91,8 +92,15 @@ fn parse_rate(s: &str) -> Option<f64> {
     Some(num / den)
 }
 
-/// Extrait un [`MediaInfo`] du JSON ffprobe. Pur (testable sans ffprobe).
+/// Extrait un [`MediaInfo`] du JSON ffprobe. Pur (raccourci de test).
+#[cfg(test)]
 pub(crate) fn parse_probe_json(json: &str) -> anyhow::Result<MediaInfo> {
+    parse_probe_json_full(json).map(|(info, _)| info)
+}
+
+/// Comme [`parse_probe_json`], avec le nom du codec vidéo (minuscules,
+/// ex. `h264`, `hevc`, `hap`) — sert à décider du décodage matériel.
+pub(crate) fn parse_probe_json_full(json: &str) -> anyhow::Result<(MediaInfo, Option<String>)> {
     let out: ProbeOut = serde_json::from_str(json).context("JSON ffprobe illisible")?;
     let video = out
         .streams
@@ -125,11 +133,17 @@ pub(crate) fn parse_probe_json(json: &str) -> anyhow::Result<MediaInfo> {
         })
         .filter(|d| d.is_finite() && *d >= 0.0)
         .unwrap_or(0.0); // 0.0 = inconnue (image fixe, flux…)
-    Ok(MediaInfo { duration_s, fps, width, height })
+    let codec = video.codec_name.as_deref().map(|c| c.trim().to_ascii_lowercase());
+    Ok((MediaInfo { duration_s, fps, width, height }, codec))
 }
 
 /// Sonde un média avec `ffprobe -v quiet -print_format json -show_streams -show_format`.
 pub fn probe(path: &Path) -> anyhow::Result<MediaInfo> {
+    probe_with_codec(path).map(|(info, _)| info)
+}
+
+/// Comme [`probe`], avec le nom du codec vidéo (minuscules) s'il est connu.
+pub(crate) fn probe_with_codec(path: &Path) -> anyhow::Result<(MediaInfo, Option<String>)> {
     let ffprobe = resolve_ffprobe();
     let mut cmd = Command::new(&ffprobe);
     cmd.arg("-v")
@@ -147,7 +161,7 @@ pub fn probe(path: &Path) -> anyhow::Result<MediaInfo> {
         bail!("ffprobe a échoué sur {} (code {:?})", path.display(), output.status.code());
     }
     let json = String::from_utf8_lossy(&output.stdout);
-    parse_probe_json(&json).with_context(|| format!("sondage de {}", path.display()))
+    parse_probe_json_full(&json).with_context(|| format!("sondage de {}", path.display()))
 }
 
 #[cfg(test)]
@@ -200,6 +214,24 @@ mod tests {
         }"#;
         let info = parse_probe_json(json).unwrap();
         assert!((info.fps - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn codec_name_extrait_et_normalise() {
+        let json = r#"{
+            "streams": [ { "codec_type": "video", "codec_name": "H264",
+                           "width": 64, "height": 64, "avg_frame_rate": "30/1" } ]
+        }"#;
+        let (_, codec) = parse_probe_json_full(json).unwrap();
+        assert_eq!(codec.as_deref(), Some("h264"));
+
+        // Sans codec_name : None, sans erreur.
+        let json = r#"{
+            "streams": [ { "codec_type": "video", "width": 64, "height": 64,
+                           "avg_frame_rate": "30/1" } ]
+        }"#;
+        let (_, codec) = parse_probe_json_full(json).unwrap();
+        assert!(codec.is_none());
     }
 
     #[test]

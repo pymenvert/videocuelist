@@ -33,9 +33,9 @@ use tracing::{debug, error, warn};
 
 use crate::pacing::Pacer;
 use crate::pool::BufferPool;
-use crate::probe::{no_window, probe, resolve_ffmpeg};
+use crate::probe::{no_window, probe_with_codec, resolve_ffmpeg};
 use crate::ring::{FrameRing, RING_CAPACITY};
-use crate::{FrameRgba, MediaInfo, Player};
+use crate::{FrameRgba, MediaInfo, PixelOrder, Player};
 
 const LOG: &str = "engine::ffmpeg";
 /// Tolérance de fin naturelle : si le flux s'arrête à moins de 4 frames de la
@@ -44,16 +44,40 @@ const EOF_TOLERANCE_FRAMES: f64 = 4.0;
 /// Buffers gardés en réserve par player : ring + frame affichée + marge.
 const POOL_SPARES: usize = RING_CAPACITY + 2;
 
-/// Arguments ffmpeg pour lire `path` en RGBA brut depuis `start_s`.
-/// Pur (testé) : `stream_loop` active `-stream_loop -1`, `stop_s` borne la
-/// lecture (durée de sortie `-t stop_s - start_s`).
-fn build_args(path: &Path, start_s: f64, stop_s: Option<f64>, stream_loop: bool) -> Vec<std::ffi::OsString> {
+/// Options de génération de la ligne de commande ffmpeg (pur, testé).
+#[derive(Debug, Clone, Copy, Default)]
+struct SpawnOpts {
+    /// `-stream_loop -1` (boucle du fichier entier depuis 0).
+    stream_loop: bool,
+    /// Sortie `-pix_fmt bgra` au lieu de `rgba` (upload GL sans swizzle,
+    /// activé par le compositor via [`crate::set_decode_bgra`]).
+    bgra: bool,
+    /// `-hwaccel d3d11va` (décodage matériel Windows, frames redescendues en
+    /// mémoire système — la sortie rawvideo sur pipe reste identique).
+    hwaccel_d3d11va: bool,
+}
+
+/// Arguments ffmpeg pour lire `path` en RGBA/BGRA brut depuis `start_s`.
+/// Pur (testé) : `stop_s` borne la lecture (durée de sortie `-t stop_s - start_s`).
+fn build_args(
+    path: &Path,
+    start_s: f64,
+    stop_s: Option<f64>,
+    opts: SpawnOpts,
+) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let push = |args: &mut Vec<std::ffi::OsString>, s: &str| args.push(s.into());
     push(&mut args, "-v");
     push(&mut args, "error");
     push(&mut args, "-nostdin");
-    if stream_loop {
+    if opts.hwaccel_d3d11va {
+        // Option d'ENTRÉE : avant -i. Pas de -hwaccel_output_format : les
+        // frames décodées redescendent en mémoire système puis swscale
+        // convertit vers rgba/bgra comme au chemin logiciel.
+        push(&mut args, "-hwaccel");
+        push(&mut args, "d3d11va");
+    }
+    if opts.stream_loop {
         push(&mut args, "-stream_loop");
         push(&mut args, "-1");
     }
@@ -75,9 +99,57 @@ fn build_args(path: &Path, start_s: f64, stop_s: Option<f64>, stream_loop: bool)
     push(&mut args, "-f");
     push(&mut args, "rawvideo");
     push(&mut args, "-pix_fmt");
-    push(&mut args, "rgba");
+    push(&mut args, if opts.bgra { "bgra" } else { "rgba" });
     push(&mut args, "pipe:1");
     args
+}
+
+// ---- Décodage matériel D3D11VA (Windows uniquement) ----
+
+/// Codecs pour lesquels le décodage matériel D3D11VA est tenté (pur, testé).
+fn codec_supports_d3d11va(codec: Option<&str>) -> bool {
+    matches!(codec, Some("h264") | Some("hevc"))
+}
+
+/// Surface minimale (pixels) pour que le D3D11VA vaille son coût : la
+/// création du device D3D11 ajoute ~0,1-0,3 s à CHAQUE lancement de process
+/// (donc à chaque seek et à chaque cycle de boucle in/out). Sous ~720p le
+/// décodage logiciel est déjà trivial — on ne paie l'init que là où le gain
+/// CPU (-60-80 % en 4K) est réel.
+const HWACCEL_MIN_PIXELS: u32 = 1280 * 720;
+
+/// Le média justifie-t-il le décodage matériel ? (pur, testé)
+fn hwaccel_worthwhile(width: u32, height: u32) -> bool {
+    width.saturating_mul(height) >= HWACCEL_MIN_PIXELS
+}
+
+/// D3D11VA en échec pour cette session : plus aucune tentative jusqu'au
+/// prochain lancement de l'application.
+#[cfg(windows)]
+static HWACCEL_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// Le décodage matériel est-il encore candidat pour cette session ?
+fn hwaccel_session_available() -> bool {
+    #[cfg(windows)]
+    {
+        !HWACCEL_BROKEN.load(Ordering::Relaxed)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Mémorise l'échec D3D11VA pour toute la session (log une seule fois).
+fn disable_hwaccel_for_session() {
+    #[cfg(windows)]
+    if !HWACCEL_BROKEN.swap(true, Ordering::Relaxed) {
+        warn!(
+            target: LOG,
+            "décodage matériel d3d11va en échec : repli sur le décodage \
+             logiciel pour toute la session"
+        );
+    }
 }
 
 /// Fin de segment sur la ligne de temps média (out, sinon durée, sinon rien).
@@ -161,7 +233,7 @@ impl FfmpegPlayer {
     /// premières frames en buffer, lecture en pause. Bloquant : à appeler
     /// hors du thread de rendu (chargement).
     pub fn open(path: &Path, pb: &Playback) -> anyhow::Result<Self> {
-        let info = probe(path)?;
+        let (info, codec) = probe_with_codec(path)?;
         let shared = Arc::new(Shared {
             ring: FrameRing::new(),
             ended: AtomicBool::new(false),
@@ -169,8 +241,15 @@ impl FfmpegPlayer {
             pending_seeks: AtomicU32::new(0),
         });
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut supervisor =
-            Supervisor::new(path.to_path_buf(), info, pb.clone(), Arc::clone(&shared), tx.clone(), rx);
+        let mut supervisor = Supervisor::new(
+            path.to_path_buf(),
+            info,
+            codec,
+            pb.clone(),
+            Arc::clone(&shared),
+            tx.clone(),
+            rx,
+        );
         // Préchargement synchrone : un échec de lancement est rendu à l'appelant.
         supervisor.spawn_at(pb.in_s).context("préchargement ffmpeg")?;
         let handle = std::thread::Builder::new()
@@ -294,6 +373,8 @@ impl Drop for FfmpegPlayer {
 struct Supervisor {
     path: PathBuf,
     info: MediaInfo,
+    /// Nom du codec vidéo (minuscules, ffprobe) — décide du D3D11VA.
+    codec: Option<String>,
     pb: Playback,
     shared: Arc<Shared>,
     /// Sender partagé avec les threads lecteurs (`ReaderDone`).
@@ -311,12 +392,15 @@ struct Supervisor {
     stream_base_s: f64,
     /// Pts de flux attendu en fin de process courant (INFINITY si sans fin).
     spawn_end_stream_s: f64,
+    /// Le process courant a-t-il été lancé avec `-hwaccel d3d11va` ?
+    spawn_hwaccel: bool,
 }
 
 impl Supervisor {
     fn new(
         path: PathBuf,
         info: MediaInfo,
+        codec: Option<String>,
         pb: Playback,
         shared: Arc<Shared>,
         tx: Sender<Msg>,
@@ -327,6 +411,7 @@ impl Supervisor {
         Supervisor {
             path,
             info,
+            codec,
             pb,
             shared,
             tx,
@@ -339,6 +424,7 @@ impl Supervisor {
             frame_dur_s: 1.0 / fps,
             stream_base_s: 0.0,
             spawn_end_stream_s: f64::INFINITY,
+            spawn_hwaccel: false,
         }
     }
 
@@ -376,8 +462,15 @@ impl Supervisor {
             }
         };
 
+        let bgra = crate::decode_bgra();
+        let hwaccel = hwaccel_session_available()
+            && codec_supports_d3d11va(self.codec.as_deref())
+            && hwaccel_worthwhile(self.info.width, self.info.height);
+        self.spawn_hwaccel = hwaccel;
+        let opts = SpawnOpts { stream_loop, bgra, hwaccel_d3d11va: hwaccel };
+
         let ffmpeg = resolve_ffmpeg();
-        let args = build_args(&self.path, start_s, stop_s, stream_loop);
+        let args = build_args(&self.path, start_s, stop_s, opts);
         let mut cmd = Command::new(&ffmpeg);
         cmd.args(&args)
             .stdin(Stdio::null())
@@ -403,11 +496,12 @@ impl Supervisor {
         let pool = self.pool.clone();
         let (w, h) = (self.info.width, self.info.height);
         let (frame_dur, base) = (self.frame_dur_s, self.stream_base_s);
+        let order = if bgra { PixelOrder::Bgra } else { PixelOrder::Rgba };
         let done = self.tx.clone();
         let reader = std::thread::Builder::new()
             .name("ffmpeg-reader".into())
             .spawn(move || {
-                let last_pts_s = read_frames(stdout, ring, &pool, w, h, frame_dur, base);
+                let last_pts_s = read_frames(stdout, ring, &pool, w, h, frame_dur, base, order);
                 let _ = done.send(Msg::ReaderDone { generation, last_pts_s });
             });
         let reader = match reader {
@@ -419,7 +513,12 @@ impl Supervisor {
             }
         };
 
-        debug!(target: LOG, start_s, stream_loop, path = %self.path.display(), "process ffmpeg lancé");
+        debug!(
+            target: LOG,
+            start_s, stream_loop, bgra, hwaccel,
+            path = %self.path.display(),
+            "process ffmpeg lancé"
+        );
         self.child = Some(child);
         self.reader = Some(reader);
         Ok(())
@@ -474,6 +573,25 @@ impl Supervisor {
                 // noir sur eof() ; FollowNext : le moteur de cues suit sur
                 // eof() — posé par le player une fois le ring vidé.
                 self.shared.ended.store(true, Ordering::SeqCst);
+            }
+            return;
+        }
+
+        // Mort prématurée avec décodage matériel : le suspect n°1 est le
+        // hwaccel lui-même (driver, VRAM, codec refusé). On le coupe pour la
+        // session et on relance en logiciel SANS consommer la relance
+        // « santé » — un vrai crash logiciel garde son propre filet.
+        if self.spawn_hwaccel {
+            disable_hwaccel_for_session();
+            if last_pts_s.is_some() {
+                self.stream_base_s = last + self.frame_dur_s;
+            }
+            let resume = self.resume_position_s(self.stream_base_s);
+            warn!(target: LOG, resume_s = resume, path = %self.path.display(),
+                "process ffmpeg (d3d11va) mort en lecture, relance en décodage logiciel");
+            if let Err(e) = self.spawn_at(resume) {
+                error!(target: LOG, error = %e, "relance impossible");
+                self.shared.healthy.store(false, Ordering::SeqCst);
             }
             return;
         }
@@ -548,10 +666,12 @@ impl Drop for Supervisor {
     }
 }
 
-/// Boucle du thread lecteur : lit des frames RGBA complètes sur le pipe et
-/// les pousse dans le ring (bloquant = backpressure). Sort sur EOF, erreur
-/// de lecture ou fermeture du ring. `pool` fournit des buffers recyclés de
-/// `width * height * 4` octets. Rend le dernier pts poussé.
+/// Boucle du thread lecteur : lit des frames complètes (4 octets/pixel,
+/// ordre `order`) sur le pipe et les pousse dans le ring (bloquant =
+/// backpressure). Sort sur EOF, erreur de lecture ou fermeture du ring.
+/// `pool` fournit des buffers recyclés de `width * height * 4` octets.
+/// Rend le dernier pts poussé.
+#[allow(clippy::too_many_arguments)]
 fn read_frames(
     mut stdout: impl Read,
     ring: FrameRing,
@@ -560,6 +680,7 @@ fn read_frames(
     height: u32,
     frame_dur_s: f64,
     stream_base_s: f64,
+    order: PixelOrder,
 ) -> Option<f64> {
     let frame_size = (width as usize) * (height as usize) * 4;
     if frame_size == 0 {
@@ -570,6 +691,7 @@ fn read_frames(
     let mut last_pts_s = None;
     loop {
         let mut data = pool.take();
+        data.set_pixel_order(order);
         match read_exact_or_eof(&mut stdout, &mut data) {
             Ok(true) => {}
             Ok(false) => break, // pipe fermé proprement (EOF)
@@ -617,7 +739,11 @@ mod tests {
     use super::*;
 
     fn args_str(path: &str, start: f64, stop: Option<f64>, sl: bool) -> Vec<String> {
-        build_args(Path::new(path), start, stop, sl)
+        args_opts(path, start, stop, SpawnOpts { stream_loop: sl, ..Default::default() })
+    }
+
+    fn args_opts(path: &str, start: f64, stop: Option<f64>, opts: SpawnOpts) -> Vec<String> {
+        build_args(Path::new(path), start, stop, opts)
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -663,6 +789,50 @@ mod tests {
     }
 
     #[test]
+    fn args_bgra_change_le_pix_fmt() {
+        let a = args_opts("clip.mp4", 0.0, None, SpawnOpts { bgra: true, ..Default::default() });
+        let p = a.iter().position(|s| s == "-pix_fmt").expect("-pix_fmt attendu");
+        assert_eq!(a[p + 1], "bgra");
+        assert!(!a.contains(&"rgba".to_string()));
+    }
+
+    #[test]
+    fn args_hwaccel_d3d11va_avant_l_entree() {
+        let a = args_opts(
+            "clip.mp4",
+            2.0,
+            None,
+            SpawnOpts { hwaccel_d3d11va: true, ..Default::default() },
+        );
+        let hw = a.iter().position(|s| s == "-hwaccel").expect("-hwaccel attendu");
+        assert_eq!(a[hw + 1], "d3d11va");
+        let i = a.iter().position(|s| s == "-i").expect("-i");
+        assert!(hw < i, "-hwaccel est une option d'entrée : avant -i");
+        // Sans l'option : aucune trace.
+        let a = args_str("clip.mp4", 0.0, None, false);
+        assert!(!a.contains(&"-hwaccel".to_string()));
+    }
+
+    #[test]
+    fn codecs_candidats_au_d3d11va() {
+        assert!(codec_supports_d3d11va(Some("h264")));
+        assert!(codec_supports_d3d11va(Some("hevc")));
+        assert!(!codec_supports_d3d11va(Some("hap")));
+        assert!(!codec_supports_d3d11va(Some("prores")));
+        assert!(!codec_supports_d3d11va(None));
+    }
+
+    #[test]
+    fn d3d11va_reserve_aux_grandes_resolutions() {
+        assert!(hwaccel_worthwhile(1280, 720));
+        assert!(hwaccel_worthwhile(3840, 2160));
+        assert!(hwaccel_worthwhile(1920, 480), "la surface compte, pas le ratio");
+        assert!(!hwaccel_worthwhile(640, 360));
+        assert!(!hwaccel_worthwhile(64, 64));
+        assert!(!hwaccel_worthwhile(0, 0));
+    }
+
+    #[test]
     fn read_exact_or_eof_distingue_eof_propre_et_tronque() {
         let mut buf = [0u8; 4];
         // EOF immédiat → Ok(false).
@@ -684,7 +854,7 @@ mod tests {
         bytes[32] = 9;
         let ring = FrameRing::new();
         let pool = BufferPool::new(16, 4);
-        let last = read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0);
+        let last = read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0, PixelOrder::Rgba);
         assert_eq!(ring.len(), 2);
         assert!(!ring.is_drained());
         assert!((last.unwrap() - 1.0 / 30.0).abs() < 1e-9, "dernier pts poussé");
@@ -697,11 +867,25 @@ mod tests {
     }
 
     #[test]
+    fn read_frames_estampille_l_ordre_des_canaux() {
+        let bytes = [0u8; 16];
+        let ring = FrameRing::new();
+        let pool = BufferPool::new(16, 4);
+        read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0, PixelOrder::Bgra);
+        let mut pacer = Pacer::new(30.0, 0.0, 1.0);
+        let f = ring.poll(&mut pacer, 0.0).expect("une frame");
+        assert_eq!(f.pixel_order(), PixelOrder::Bgra);
+        // Un buffer recyclé repart en RGBA par défaut jusqu'au prochain stamp.
+        drop(f);
+        assert_eq!(pool.take().pixel_order(), PixelOrder::Rgba);
+    }
+
+    #[test]
     fn read_frames_respecte_stream_base() {
         let bytes = [0u8; 16];
         let ring = FrameRing::new();
         let pool = BufferPool::new(16, 4);
-        let last = read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 5.0);
+        let last = read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 5.0, PixelOrder::Rgba);
         assert!((last.unwrap() - 5.0).abs() < 1e-9);
         let mut pacer = Pacer::new(30.0, 0.0, 1.0);
         // stream_time(5.0) = 5.0 (in=0) → la frame pts 5.0 est due.
@@ -714,7 +898,7 @@ mod tests {
         let bytes: &[u8] = &[];
         let ring = FrameRing::new();
         let pool = BufferPool::new(16, 4);
-        assert!(read_frames(bytes, ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0).is_none());
+        assert!(read_frames(bytes, ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0, PixelOrder::Rgba).is_none());
         assert!(ring.is_drained());
     }
 
@@ -725,7 +909,7 @@ mod tests {
         let bytes = [1u8; 48]; // 3 frames de 16 octets
         let ring = FrameRing::new();
         let pool = BufferPool::new(16, 4);
-        read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0);
+        read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0, PixelOrder::Rgba);
         let mut pacer = Pacer::new(30.0, 0.0, 1.0);
         let mut ptrs = Vec::new();
         for i in 0..3 {

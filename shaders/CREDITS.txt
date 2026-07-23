@@ -1,0 +1,21 @@
+Crédits des shaders ISF livrés avec Conduite
+============================================
+
+Dome *.fs — « Pack Sources Dome-Native » (v1.1.0)
+    Dome Aurora Veils, Dome Calibration Grid, Dome Horizon Bands,
+    Dome Kaleido, Dome Media Placer, Dome Meridian Lines,
+    Dome Orbit Particles, Dome Polar Lissajous, Dome Sector Strobe,
+    Dome Zenith Tunnel
+    © Pym — créations originales (projet « Materiaux IFS »), livrées avec
+    Conduite. Redistribution autorisée avec le logiciel ; l'en-tête CREDIT
+    de chaque fichier doit être conservé.
+
+examples\*.fs — exemples Conduite
+    Degrade Anime, Plasma, Strobe
+    © projet Conduite — licence MIT (mêmes termes que le logiciel, voir
+    LICENSE). Librement modifiables : servez-vous-en comme point de départ
+    pour vos propres matériaux.
+
+Vos propres shaders : tout fichier .fs (ISF 2) déposé dans ce dossier est
+détecté par Conduite. Les champs CREDIT / DESCRIPTION de l'en-tête JSON
+apparaissent dans l'onglet Matériaux.
