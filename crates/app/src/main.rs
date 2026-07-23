@@ -3,6 +3,7 @@
 //! OSC, MIDI, Art-Net) autour d'une boucle de session sur le thread
 //! principal (winit) ou d'une boucle simple en `--headless`.
 
+mod audio;
 mod config;
 mod dirs;
 mod gfx;

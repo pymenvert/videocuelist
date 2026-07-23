@@ -22,7 +22,10 @@ use conduite_core::{
 use conduite_cue::{CueEngine, CueEvent, CueFrame, EngineTick, SceneTarget};
 use conduite_isf::{IsfInputKind, IsfSources};
 use conduite_media_library::ProbeInfo;
-use conduite_modulation::{FftFrame, ModEngine};
+use conduite_modulation::{
+    spectrum_bins, ModEngine, SPECTRUM_BINS_DEFAULT, SPECTRUM_HIGH_HZ_DEFAULT,
+    SPECTRUM_LOW_HZ_DEFAULT,
+};
 use conduite_params::{ParamKind, ParamSpec, Registry};
 use conduite_system::{FpsCounter, SamplerThread};
 use crossbeam_channel::{Receiver, Sender};
@@ -30,6 +33,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
+use crate::audio::{AudioInput, SpectrumSmoother};
 use crate::config::AppConfig;
 use crate::dirs::{safe_show_name, Dirs};
 use crate::gfx::Gfx;
@@ -164,7 +168,10 @@ pub struct Session {
     addr_cache: HashMap<SliceId, SliceAddrs>,
     scratch_uniforms: Vec<(String, ParamValue)>,
 
-    fft: FftFrame,
+    /// Entrée audio réelle (cpal + rustfft) — trame FFT pour la modulation.
+    audio: AudioInput,
+    /// Lissage d'affichage du spectre publié à l'UI (attack/release).
+    fft_smoother: SpectrumSmoother,
     placeholder: Bytes,
     outputs_dirty: bool,
     last_active: Option<CueNumber>,
@@ -206,11 +213,7 @@ impl Session {
             warn!(target: "app::session", "avertissement de chargement : {w}");
         }
         notice_recover_files(&dirs.shows, &dirs.show_dir(&show_name));
-        if config.audio_input.is_some() {
-            warn!(target: "app::session",
-                "entrée audio configurée mais non intégrée (stub v1) : \
-                 FFT vide, les LFO fonctionnent — TODO cpal+rustfft");
-        }
+        let audio = AudioInput::new(effective_audio_input(&config, &show.settings));
         let protocols = Protocols::spawn(ch.cmd_tx.clone(), &show.settings, &show.patch);
         let preview = PreviewWorker::spawn(ch.preview_tx.clone(), ch.preview_b_tx.clone());
         let placeholder = placeholder_jpeg(show.settings.mjpeg_width, show.settings.mjpeg_height);
@@ -268,7 +271,8 @@ impl Session {
             material_bound: HashMap::new(),
             addr_cache: HashMap::new(),
             scratch_uniforms: Vec::with_capacity(32),
-            fft: FftFrame::empty(),
+            audio,
+            fft_smoother: SpectrumSmoother::new(SPECTRUM_BINS_DEFAULT),
             placeholder,
             outputs_dirty: true,
             last_active: None,
@@ -391,9 +395,11 @@ impl Session {
         };
         self.process_cue_events(&frame.events);
 
-        // 3. Modulation (FFT vide en v1 — stub audio).
+        // 3. Modulation (trame FFT réelle : cpal + rustfft, vide sans
+        // entrée audio active — lecture lock-free de l'ArcSwap).
         let bpm = self.registry.value_f32("bpm").max(1.0);
-        let offsets = self.modul.tick(now_s, bpm, &self.fft);
+        let fft = self.audio.latest();
+        let offsets = self.modul.tick(now_s, bpm, &fft);
 
         // 4. Paramètres : blend de cue, offsets de modulation, lissage.
         if let Some((target, alpha)) = &frame.params_target {
@@ -475,10 +481,23 @@ impl Session {
         // jamais d'arbre JSON du show entier par période en régime établi.
         self.publish_cue_changes(&status);
         if now - self.last_state >= STATE_PERIOD {
+            let state_dt = (now - self.last_state).as_secs_f32().min(1.0);
             self.last_state = now;
             let rt = self.runtime_status(&status);
             self.protocols.osc_feedback(FeedbackEvent::Status(rt.clone()));
-            let rt_value = serde_json::to_value(&rt).unwrap_or(Value::Null);
+            let mut rt_value = serde_json::to_value(&rt).unwrap_or(Value::Null);
+            // Devices d'entrée audio (onglet Réglages/Modulation) : liste
+            // énumérée par le worker + device réellement ouvert.
+            if let Value::Object(map) = &mut rt_value {
+                map.insert(
+                    "audio_devices".to_string(),
+                    json!({
+                        "available": self.audio.devices(),
+                        "active": self.audio.active_device(),
+                    }),
+                );
+            }
+            let fft_value = self.fft_state_value(&fft, state_dt);
             let show_value = if self.state_show_dirty {
                 self.state_show_dirty = false;
                 Some(serde_json::to_value(&self.show).unwrap_or(Value::Null))
@@ -490,6 +509,16 @@ impl Session {
                     v["show"] = sv;
                 }
                 v["runtime"] = rt_value;
+                // CONTRAT WS : `fft` absent de la trame dyn quand aucune
+                // entrée audio n'est active.
+                match fft_value {
+                    Some(f) => v["fft"] = f,
+                    None => {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.remove("fft");
+                        }
+                    }
+                }
             });
         }
         self.protocols.drain_midi_events(&self.events_tx);
@@ -755,6 +784,9 @@ impl Session {
                 self.protocols
                     .respawn_if_changed(&self.show.settings, &self.show.patch);
                 self.push_patch();
+                // Entrée audio à chaud : re-spawn du thread de capture
+                // uniquement si le device effectif a changé.
+                self.sync_audio_input();
             }
             ShowRename { .. } => {}
         }
@@ -860,6 +892,7 @@ impl Session {
         self.protocols
             .respawn_if_changed(&self.show.settings, &self.show.patch);
         self.push_patch();
+        self.sync_audio_input();
         self.outputs_dirty = true;
         self.last_active = None;
         self.last_standby = None;
@@ -1554,6 +1587,41 @@ impl Session {
         self.publish_event(&StateEvent::HealthTick { snapshot });
     }
 
+    /// Valeur `fft` de la trame d'état (CONTRAT WS) : `Some({bins, device})`
+    /// avec 64 bandes log 20 Hz→16 kHz lissées (attack rapide/release lent)
+    /// si une capture est active, `None` sinon (champ absent de la trame).
+    fn fft_state_value(
+        &mut self,
+        fft: &conduite_modulation::FftFrame,
+        dt_s: f32,
+    ) -> Option<Value> {
+        let Some(device) = self.audio.active_device() else {
+            self.fft_smoother.reset();
+            return None;
+        };
+        let bins = spectrum_bins(
+            fft,
+            SPECTRUM_BINS_DEFAULT,
+            SPECTRUM_LOW_HZ_DEFAULT,
+            SPECTRUM_HIGH_HZ_DEFAULT,
+        );
+        let smoothed = self.fft_smoother.apply(&bins, dt_s);
+        // Arrondi à 3 décimales : la trame dyn part à 10 Hz vers chaque
+        // client WS, inutile d'y embarquer des f32 pleine précision.
+        let rounded: Vec<f32> = smoothed
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect();
+        Some(json!({ "bins": rounded, "device": device }))
+    }
+
+    /// (Re)démarre la capture audio si le device effectif a changé
+    /// (SettingsUpdate, chargement de show, undo/redo). No-op sinon.
+    fn sync_audio_input(&mut self) {
+        self.audio
+            .set_device(effective_audio_input(&self.config, &self.show.settings));
+    }
+
     fn runtime_status(&self, st: &conduite_cue::CueStatus) -> RuntimeStatus {
         RuntimeStatus {
             mode: self.mode,
@@ -1584,6 +1652,15 @@ impl Session {
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// Device d'entrée audio effectif : le réglage du show prime, sinon le
+/// réglage machine (`config.toml`), sinon capture coupée.
+fn effective_audio_input(config: &AppConfig, settings: &ShowSettings) -> Option<String> {
+    settings
+        .audio_input
+        .clone()
+        .or_else(|| config.audio_input.clone())
+}
 
 /// Contenu visé par une scène pour un slice donné.
 fn content_of(scene: Option<&SceneTarget>, slice: SliceId) -> Option<&Content> {

@@ -175,10 +175,13 @@ follow `AfterMedia` s'appuie sur `media_eof` ; `Wait(s)` sur l'horloge moteur.
 
 ```rust
 pub enum Wave { Sine, Tri, Square { pw: f32 }, Saw, RandomSh, Drift }
-pub enum Freq { Hz(f32), BpmSync { mult: f32 } }        // mult 0.25 = 1 mesure sur 4 temps…
+// mult en cycles par temps : 1 = 1 temps, 0.25 = 1 mesure (4/4), 0.0625 = 4 mesures.
+pub enum Freq { Hz(f32), BpmSync { mult: f32 } }
 pub struct ModulatorCfg { pub id: ModId, pub name: String, pub kind: ModKind }
 pub enum ModKind { Lfo { wave: Wave, freq: Freq, phase: f32 },
-    AudioBand { low_hz: f32, high_hz: f32, gain: f32, floor: f32, attack_ms: f32, release_ms: f32 } }
+    AudioBand { low_hz: f32, high_hz: f32, gain: f32, floor: f32, attack_ms: f32,
+        release_ms: f32, normalize: bool /* serde default true : AGC max glissant ~3 s */ },
+    TimecodeChase {} }                                  // réservé v2 : moteur → 0.0, UI grisée
 pub struct ModRoute { pub id: u32, pub source: ModId, pub target_addr: String,
     pub depth: f32, pub mode: RouteMode }               // Add | Mul | Replace
 pub struct ModEngine;
@@ -188,9 +191,14 @@ impl ModEngine {
     pub fn tap(&mut self, now_s: f64) -> Option<f32>;   // tap tempo → BPM
 }
 pub struct FftFrame { pub bins_hz: f32, pub magnitudes: Vec<f32> }  // fourni par app (cpal+rustfft)
+/// Analyseur UI (trame WS `dyn.fft.bins`) : n bins log-échelonnés low→high,
+/// max des magnitudes par intervalle, compression sqrt, sortie 0..1. Pure.
+pub fn spectrum_bins(fft: &FftFrame, n: usize, low_hz: f32, high_hz: f32) -> Vec<f32>;
+pub const SPECTRUM_BINS_DEFAULT: usize = 64;            // 20 Hz → 16 kHz par défaut
 ```
 Qualité : horloge monotone passée par l'appelant, phase continue lors des changements de
-fréquence (pas de saut), enveloppes attack/release exponentielles, `RandomSh`/`Drift` seedés.
+fréquence (pas de saut), enveloppes attack/release exponentielles, `RandomSh`/`Drift` seedés,
+AGC des bandes (division par le max glissant ~3 s, silence jamais amplifié).
 
 ## engine
 

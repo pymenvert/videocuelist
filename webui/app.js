@@ -18,6 +18,7 @@
     show: null,         // Show sérialisé
     runtime: null,      // RuntimeStatus
     health: null,       // HealthSnapshot
+    fft: null,          // dernière trame FFT {bins:[0..1 ×64], device} ou null
     logs: [],           // {level,target,message,ts}
     logFilter: 'all',
     tab: 'live',
@@ -83,7 +84,19 @@
     sparkle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l2 5.5 5.5 2-5.5 2-2 5.5-2-5.5L4.5 11 10 9z"/><path d="M19 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg>',
     wave: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12h4l3-8 5 16 3-8h3.5"/></svg>',
     plug: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7.5V3.5M15 7.5V3.5M7 7.5h10v3.5a5 5 0 0 1-10 0zM12 16v4.5"/></svg>',
-    screen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8M12 17v3.5"/></svg>'
+    screen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8M12 17v3.5"/></svg>',
+    /* icône « animer ce paramètre » (flèche circulaire, façon Resolume) */
+    anim: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>'
+  };
+
+  /* Mini-icônes des formes d'onde LFO (SVG inline, 26×14). */
+  var WAVE_ICONS = {
+    sine: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M1 7 C3 1 5 1 7 7 C9 13 11 13 13 7 C15 1 17 1 19 7 C21 13 23 13 25 7"/></svg>',
+    tri: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 11 L7 3 L13 11 L19 3 L25 11"/></svg>',
+    square: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 11 H5 V3 H13 V11 H21 V3 H25"/></svg>',
+    saw: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 11 L9 3 V11 L17 3 V11 L25 3"/></svg>',
+    random_sh: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8 H6 V4 H11 V12 H16 V6 H21 V9 H25"/></svg>',
+    drift: '<svg viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M1 8 C3 4 5 11 8 8 C10 6 12 3 15 7 C17 10 20 4 22 7 C23 8.5 24 8 25 7"/></svg>'
   };
 
   /* État vide sympathique : icône + message. */
@@ -556,7 +569,8 @@
       el('h2', null, 'Master'),
       el('div', { id: 'master-row' },
         master,
-        el('span', { id: 'master-val' }, Math.round(rt().master * 100) + ' %')),
+        el('span', { id: 'master-val' }, Math.round(rt().master * 100) + ' %'),
+        animButton('master/intensity')),
       dbo));
 
     right.appendChild(el('div', { class: 'panel' },
@@ -756,6 +770,13 @@
       var m = byId('mod-meter-' + pair[0]);
       if (m) { m.style.width = Math.round(clamp(pair[1], 0, 1) * 100) + '%'; }
     });
+    /* liste des périphériques audio : rafraîchie si le moteur en publie de
+       nouveaux (branchement à chaud), sans casser une sélection en cours */
+    var devSel = byId('audio-dev-sel');
+    if (devSel && document.activeElement !== devSel &&
+        devSel.getAttribute('data-count') !== String(audioDevices().length)) {
+      fillDeviceSel(devSel);
+    }
   }
 
   function updateHealth() {
@@ -1083,7 +1104,7 @@
       val.textContent = fmtF(v);
       sendParam(addr, { f: v });
     });
-    return el('div', { class: 'param-row' }, el('span', null, label), input, val);
+    return el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
   }
 
   function currentOutput() {
@@ -1444,13 +1465,338 @@
       val.textContent = fmtF(v);
       sendParam(addr, { f: v });
     });
-    return el('div', { class: 'param-row' }, el('span', null, label), input, val);
+    return el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
   }
 
   /* =========================================================== MODULATION */
 
+  /* Couleur stable par modulateur (surimpression spectre, icônes ⟳, badges). */
+  var MOD_COLORS = ['#4da3ff', '#f0b232', '#43c47f', '#c678dd', '#ff8fab', '#4fd8d0', '#ff9f4d', '#a3e635'];
+
+  function modColor(id) {
+    var n = parseInt(id, 10);
+    return MOD_COLORS[Math.abs(isFinite(n) ? n : 0) % MOD_COLORS.length];
+  }
+
+  function hexToRgba(hex, a) {
+    var r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+  }
+
+  function isLfoMod(m) { return !!(m && m.kind && typeof m.kind === 'object' && 'lfo' in m.kind); }
+  function isBandMod(m) { return !!(m && m.kind && typeof m.kind === 'object' && 'audio_band' in m.kind); }
+  function modById(id) { return modulators().find(function (m) { return m.id === id; }) || null; }
+  function nextModId() { return modulators().reduce(function (mx, x) { return Math.max(mx, x.id); }, 0) + 1; }
+  function nextRouteId() { return routes().reduce(function (mx, r) { return Math.max(mx, r.id); }, 0) + 1; }
+  function routesFor(addr) { return routes().filter(function (r) { return r.target_addr === addr; }); }
+
+  /* Périphériques d'entrée audio publiés par le moteur :
+     runtime.audio_devices = { available: [noms…], active: nom|null }
+     (tolère aussi une liste plate, par prudence). */
+  function audioDevices() {
+    var d = rt().audio_devices;
+    var list = Array.isArray(d) ? d : ((d && Array.isArray(d.available)) ? d.available : []);
+    return list.map(function (x) { return typeof x === 'string' ? x : ((x && x.name) || ''); })
+      .filter(function (n) { return !!n; });
+  }
+
+  function activeAudioDevice() {
+    var d = rt().audio_devices;
+    return (d && !Array.isArray(d) && typeof d.active === 'string') ? d.active : null;
+  }
+
+  function newLfoCfg(id) {
+    return { id: id, name: 'LFO ' + id, kind: { lfo: { wave: 'sine', freq: { hz: 1 }, phase: 0 } } };
+  }
+
+  function newBandCfg(id) {
+    return {
+      id: id, name: 'Bande ' + id,
+      kind: { audio_band: { low_hz: 60, high_hz: 120, gain: 1, floor: 0.05, attack_ms: 10, release_ms: 200 } }
+    };
+  }
+
+  /* ------------------------------------------- analyseur de spectre (canvas)
+     64 barres log 20 Hz → 16 kHz (dyn.fft.bins) + bandes AudioBand dessinées
+     en surimpression avec poignées draggables (pointer capture). */
+
+  var FFT_FMIN = 20, FFT_FMAX = 16000;
+  var SPEC = { disp: null, drag: null, throttleTs: 0, raf: 0, status: null };
+
+  function freqToNorm(f) {
+    return clamp(Math.log(Math.max(f, 1) / FFT_FMIN) / Math.log(FFT_FMAX / FFT_FMIN), 0, 1);
+  }
+  function normToFreq(x) {
+    return FFT_FMIN * Math.pow(FFT_FMAX / FFT_FMIN, clamp(x, 0, 1));
+  }
+
+  function drawSpectrum(cv) {
+    var ctx = cv.getContext('2d');
+    if (!ctx) { return; }
+    var W = cv.width, H = cv.height, AX = 20;   /* AX : bande d'axe en bas */
+    var PH = H - AX;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#05070a';
+    ctx.fillRect(0, 0, W, H);
+
+    /* grille horizontale discrète */
+    ctx.strokeStyle = '#141a23';
+    ctx.lineWidth = 1;
+    [0.25, 0.5, 0.75].forEach(function (fr) {
+      ctx.beginPath(); ctx.moveTo(0, PH * fr); ctx.lineTo(W, PH * fr); ctx.stroke();
+    });
+
+    /* axe log annoté */
+    ctx.font = '10px ' + 'system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    [[50, '50 Hz'], [200, '200 Hz'], [1000, '1 kHz'], [5000, '5 kHz'], [15000, '15 kHz']]
+      .forEach(function (pair) {
+        var x = freqToNorm(pair[0]) * W;
+        ctx.strokeStyle = '#1a2130';
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, PH); ctx.stroke();
+        ctx.fillStyle = '#747e8e';
+        ctx.fillText(pair[1], x, H - 6);
+      });
+
+    /* barres — lissage attaque rapide / retombée douce (lecture agréable) */
+    var bins = (S.fft && Array.isArray(S.fft.bins)) ? S.fft.bins : null;
+    var n = bins ? bins.length : 64;
+    if (!SPEC.disp || SPEC.disp.length !== n) {
+      SPEC.disp = [];
+      for (var k = 0; k < n; k++) { SPEC.disp.push(0); }
+    }
+    var bw = W / n;
+    var grad = ctx.createLinearGradient(0, PH, 0, 0);
+    grad.addColorStop(0, 'rgba(77, 163, 255, 0.30)');
+    grad.addColorStop(0.65, '#4da3ff');
+    grad.addColorStop(1, '#85c2ff');
+    ctx.fillStyle = grad;
+    for (var i = 0; i < n; i++) {
+      var t = bins ? clamp(+bins[i] || 0, 0, 1) : 0;
+      var d = SPEC.disp[i];
+      d += (t - d) * (t > d ? 0.55 : 0.16);
+      SPEC.disp[i] = d;
+      var h = d * (PH - 2);
+      if (h > 0.5) { ctx.fillRect(i * bw + 1, PH - h, Math.max(1, bw - 2), h); }
+    }
+
+    /* bandes AudioBand en surimpression, avec poignées */
+    modulators().filter(isBandMod).forEach(function (m) {
+      var ab = m.kind.audio_band || {};
+      var x1 = freqToNorm(ab.low_hz || FFT_FMIN) * W;
+      var x2 = freqToNorm(ab.high_hz || FFT_FMAX) * W;
+      var col = modColor(m.id);
+      ctx.fillStyle = hexToRgba(col, 0.14);
+      ctx.fillRect(x1, 0, Math.max(1, x2 - x1), PH);
+      ctx.fillStyle = hexToRgba(col, 0.85);
+      ctx.fillRect(x1 - 1, 0, 2, PH);
+      ctx.fillRect(x2 - 1, 0, 2, PH);
+      drawBandHandle(ctx, x1, PH, col, SPEC.drag && SPEC.drag.id === m.id && SPEC.drag.edge === 'lo');
+      drawBandHandle(ctx, x2, PH, col, SPEC.drag && SPEC.drag.id === m.id && SPEC.drag.edge === 'hi');
+      ctx.fillStyle = col;
+      ctx.textAlign = 'left';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillText(
+        (m.name || ('Bande ' + m.id)) + '  ' + Math.round(ab.low_hz || 0) + '–' + Math.round(ab.high_hz || 0) + ' Hz',
+        Math.min(x1 + 6, W - 130), 14);
+    });
+  }
+
+  function drawBandHandle(ctx, x, ph, col, active) {
+    var w = active ? 12 : 9, h = 30, y = ph / 2 - h / 2;
+    ctx.fillStyle = active ? col : hexToRgba(col, 0.9);
+    ctx.beginPath();
+    if (ctx.roundRect) { ctx.roundRect(x - w / 2, y, w, h, 3); ctx.fill(); }
+    else { ctx.fillRect(x - w / 2, y, w, h); }
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.lineWidth = 1;
+    for (var i = -1; i <= 1; i++) {
+      ctx.beginPath();
+      ctx.moveTo(x + i * 2.5, y + 9);
+      ctx.lineTo(x + i * 2.5, y + h - 9);
+      ctx.stroke();
+    }
+  }
+
+  /* Drag des poignées de bande : pointer capture, écart mini 10 Hz,
+     EditOp modulator_update throttlé pendant le geste + commit final. */
+  function installSpectrumPointer(cv) {
+    function pos(e) {
+      var r = cv.getBoundingClientRect();
+      return { x: (e.clientX - r.left) * cv.width / r.width, y: (e.clientY - r.top) * cv.height / r.height };
+    }
+    function hitHandle(p) {
+      var best = null, bestDist = 10;   /* tolérance en px canvas */
+      modulators().filter(isBandMod).forEach(function (m) {
+        var ab = m.kind.audio_band || {};
+        var candidates = [
+          { edge: 'lo', x: freqToNorm(ab.low_hz || FFT_FMIN) * cv.width },
+          { edge: 'hi', x: freqToNorm(ab.high_hz || FFT_FMAX) * cv.width }
+        ];
+        candidates.forEach(function (c) {
+          var d = Math.abs(p.x - c.x);
+          if (d <= bestDist) { bestDist = d; best = { id: m.id, edge: c.edge }; }
+        });
+      });
+      return best;
+    }
+    function sendBand(m) {
+      sendEdit({ op: 'modulator_update', modulator: JSON.parse(JSON.stringify(m)) });
+    }
+    cv.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0 || isShowMode()) { return; }
+      var h = hitHandle(pos(e));
+      if (!h) { return; }
+      SPEC.drag = h;
+      S.dragging = true;
+      try { cv.setPointerCapture(e.pointerId); } catch (err) { /* capture indisponible */ }
+      e.preventDefault();
+    });
+    cv.addEventListener('pointermove', function (e) {
+      var p = pos(e);
+      if (!SPEC.drag) {
+        cv.style.cursor = hitHandle(p) ? 'ew-resize' : 'default';
+        return;
+      }
+      var m = modById(SPEC.drag.id);
+      if (!m || !isBandMod(m)) { return; }
+      var ab = m.kind.audio_band;
+      var f = Math.round(normToFreq(p.x / cv.width));
+      if (SPEC.drag.edge === 'lo') {
+        ab.low_hz = clamp(f, FFT_FMIN, (ab.high_hz || FFT_FMAX) - 10);
+      } else {
+        ab.high_hz = clamp(f, (ab.low_hz || FFT_FMIN) + 10, FFT_FMAX);
+      }
+      syncBandInputs(m);
+      var now = Date.now();
+      if (now - SPEC.throttleTs > 80) {
+        SPEC.throttleTs = now;
+        sendBand(m);
+      }
+    });
+    function endDrag() {
+      if (SPEC.drag) {
+        var m = modById(SPEC.drag.id);
+        if (m && isBandMod(m)) { sendBand(m); }
+      }
+      SPEC.drag = null;
+      S.dragging = false;
+    }
+    cv.addEventListener('pointerup', endDrag);
+    cv.addEventListener('pointercancel', endDrag);
+  }
+
+  function syncBandInputs(m) {
+    var ab = (m.kind && m.kind.audio_band) || {};
+    var lo = byId('band-lo-' + m.id), hi = byId('band-hi-' + m.id);
+    if (lo && document.activeElement !== lo) { lo.value = Math.round(ab.low_hz || 0); }
+    if (hi && document.activeElement !== hi) { hi.value = Math.round(ab.high_hz || 0); }
+  }
+
+  /* Statut d'entrée audio (chip + voile sur le spectre) — mis à jour à chaque
+     frame mais ne touche le DOM que sur changement. */
+  function updateSpectrumStatus() {
+    var key = S.fft ? ('ok:' + (S.fft.device || '')) : 'none';
+    if (key === SPEC.status) { return; }
+    SPEC.status = key;
+    var ov = byId('spectrum-overlay');
+    if (ov) { ov.classList.toggle('hidden', !!S.fft); }
+    var chipEl = byId('spectrum-status');
+    if (chipEl) {
+      chipEl.className = 'chip ' + (S.fft ? 'ok' : 'warn');
+      chipEl.textContent = S.fft
+        ? ('Entrée : ' + (S.fft.device || 'active'))
+        : 'Aucune entrée audio';
+    }
+  }
+
+  /* -------------------------------------------------- aperçu LFO (canvas) */
+
+  function lfoDisplayValue(lfo, u, seed) {
+    var w = lfo.wave;
+    var name = typeof w === 'string' ? w : (Object.keys(w || {})[0] || 'sine');
+    var pw = (w && w.square && typeof w.square.pw === 'number') ? w.square.pw : 0.5;
+    var p = u - Math.floor(u);
+    function rnd(k) {
+      var x = Math.sin((k + seed * 17.23) * 12.9898) * 43758.5453;
+      return x - Math.floor(x);
+    }
+    switch (name) {
+      case 'tri': return p < 0.5 ? p * 2 : 2 - p * 2;
+      case 'square': return p < pw ? 1 : 0;
+      case 'saw': return p;
+      case 'random_sh': return rnd(Math.floor(u));
+      case 'drift': return clamp(0.5 + 0.34 * Math.sin(u * 2 * Math.PI * 0.83 + seed)
+        + 0.16 * Math.sin(u * 2 * Math.PI * 2.31 + seed * 1.7), 0, 1);
+      default: return 0.5 + 0.5 * Math.sin(p * 2 * Math.PI);
+    }
+  }
+
+  function drawLfoPreviewCanvas(cv) {
+    var id = parseInt(cv.getAttribute('data-mod'), 10);
+    var m = modById(id);
+    if (!m || !isLfoMod(m)) { return; }
+    var lfo = m.kind.lfo || {};
+    var freq = lfo.freq || { hz: 1 };
+    var hz = (freq && typeof freq === 'object' && 'bpm_sync' in freq)
+      ? ((freq.bpm_sync && freq.bpm_sync.mult) || 0) * (rt().bpm || 120) / 60
+      : ((freq && typeof freq.hz === 'number') ? freq.hz : 1);
+    var ctx = cv.getContext('2d');
+    if (!ctx) { return; }
+    var W = cv.width, H = cv.height;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#05070a';
+    ctx.fillRect(0, 0, W, H);
+    var col = modColor(id);
+    var span = 2;   /* cycles visibles (oscilloscope défilant) */
+    var u0 = (performance.now() / 1000) * hz + (lfo.phase || 0);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    var N = 84;
+    for (var i = 0; i <= N; i++) {
+      var u = hz > 0 ? (u0 - span + span * i / N) : (span * i / N);
+      var v = lfoDisplayValue(lfo, u, id);
+      var x = i / N * W, y = H - 3 - v * (H - 6);
+      if (i === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+    var vNow = lfoDisplayValue(lfo, hz > 0 ? u0 : 0, id);
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(W - 3, H - 3 - vNow * (H - 6), 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /* Boucle d'animation : tourne tant que l'onglet Modulation affiche un
+     canvas (spectre ou aperçu LFO), s'arrête toute seule sinon. */
+  function ensureModAnim() {
+    if (SPEC.raf) { return; }
+    SPEC.raf = requestAnimationFrame(modAnimTick);
+  }
+
+  function modAnimTick() {
+    SPEC.raf = 0;
+    var cv = byId('spectrum-canvas');
+    var previews = document.querySelectorAll('canvas.lfo-preview');
+    if (!cv && !previews.length) { return; }
+    try {
+      if (cv) {
+        drawSpectrum(cv);
+        updateSpectrumStatus();
+      }
+      previews.forEach(function (p) { drawLfoPreviewCanvas(p); });
+    } catch (e) {
+      console.error('modAnim', e);
+      return;   /* pas de boucle d'erreurs en continu */
+    }
+    SPEC.raf = requestAnimationFrame(modAnimTick);
+  }
+
+  /* ------------------------------------------------------- onglet Modulation */
+
   RENDERERS.modulation = function () {
-    var root = el('section', { class: 'tab-panel' });
+    var root = el('section', { class: 'tab-panel', id: 'modulation' });
 
     /* BPM / tap */
     var bpmIn = el('input', { type: 'number', min: 20, max: 300, step: 0.1, style: 'width:80px', 'data-tip': 'BPM maître — Entrée pour appliquer' });
@@ -1463,47 +1809,70 @@
       el('h2', null, 'Tempo'),
       el('div', { class: 'toolbar' },
         el('button', {
-          class: 'primary', 'data-tip': 'Tap tempo (touche T) : taper en rythme pour poser le BPM',
+          class: 'primary', 'data-tip': 'Tap tempo : taper en rythme pour poser le BPM. Raccourci : touche T',
           onclick: function () { sendCmd({ cmd: 'tap_tempo' }); }
-        }, 'TAP'),
+        }, 'TAP ', el('kbd', null, 'T')),
         el('span', { id: 'bpm-val', style: 'font-size:20px;font-variant-numeric:tabular-nums' }, fmtF(rt().bpm, 1)),
         el('span', { class: 'muted' }, 'BPM'),
-        bpmIn)));
+        bpmIn,
+        el('span', { class: 'muted', 'data-tip': 'Le tap tempo répond aussi à la touche T, depuis n’importe quel onglet.' },
+          el('kbd', null, 'T'), ' = tap tempo'))));
+
+    /* analyseur de spectre */
+    var specPanel = el('div', { class: 'panel' }, el('h2', null, 'Analyseur de spectre — entrée audio'));
+    var devSel = el('select', {
+      id: 'audio-dev-sel',
+      'data-tip': 'Périphérique d’entrée audio analysé (FFT). Enregistré dans les réglages du show.'
+    });
+    fillDeviceSel(devSel);
+    devSel.addEventListener('change', function () {
+      var copy = JSON.parse(JSON.stringify(settings()));
+      copy.audio_input = devSel.value === '' ? null : devSel.value;
+      sendEdit({ op: 'settings_update', settings: copy });
+    });
+    specPanel.appendChild(el('div', { class: 'toolbar' },
+      el('span', { class: 'muted' }, 'Entrée audio'),
+      devSel,
+      el('span', { class: 'chip', id: 'spectrum-status' }, '…'),
+      el('span', { class: 'spacer' }),
+      el('span', { class: 'muted', 'data-tip': 'Chaque bande FFT apparaît en couleur sur le spectre : glissez ses poignées pour régler ses fréquences (10 Hz d’écart minimum).' },
+        'Glissez les poignées pour régler les bandes')));
+
+    var cv = el('canvas', { id: 'spectrum-canvas', width: 1024, height: 264 });
+    installSpectrumPointer(cv);
+    specPanel.appendChild(el('div', { id: 'spectrum-wrap' },
+      cv,
+      el('div', { id: 'spectrum-overlay', class: 'spectrum-overlay' },
+        el('span', { class: 'spectrum-overlay-title' }, 'Aucune entrée audio'),
+        el('span', null, 'Choisir un périphérique dans le sélecteur ci-dessus.'))));
+
+    var bands = modulators().filter(isBandMod);
+    if (bands.length) {
+      var legend = el('div', { class: 'spec-legend' });
+      bands.forEach(function (m) {
+        var ab = m.kind.audio_band || {};
+        legend.appendChild(el('span', {
+          class: 'chip spec-chip', style: 'color:' + modColor(m.id),
+          'data-tip': 'Bande « ' + (m.name || m.id) + ' » : ' + Math.round(ab.low_hz || 0) + ' → ' + Math.round(ab.high_hz || 0) + ' Hz'
+        }, (m.name || ('Bande ' + m.id))));
+      });
+      specPanel.appendChild(legend);
+    }
+    root.appendChild(specPanel);
+    SPEC.status = null;   /* force la mise à jour chip/voile au prochain frame */
 
     /* modulateurs */
     var modPanel = el('div', { class: 'panel' }, el('h2', null, 'Modulateurs'));
     modPanel.appendChild(el('div', { class: 'toolbar edit-only' },
       el('button', {
-        'data-tip': 'Ajoute un LFO sinus 1 Hz',
-        onclick: function () {
-          var id = modulators().reduce(function (m, x) { return Math.max(m, x.id); }, 0) + 1;
-          sendEdit({
-            op: 'modulator_add',
-            modulator: { id: id, name: 'LFO ' + id, kind: { lfo: { wave: 'sine', freq: { hz: 1 }, phase: 0 } } }
-          });
-        }
+        'data-tip': 'Ajoute un LFO (sinus, 1 Hz) — forme, vitesse et synchro BPM réglables ensuite',
+        onclick: function () { sendEdit({ op: 'modulator_add', modulator: newLfoCfg(nextModId()) }); }
       }, '+ LFO'),
       el('button', {
-        'data-tip': 'Ajoute une bande audio (60–120 Hz)',
-        onclick: function () {
-          var id = modulators().reduce(function (m, x) { return Math.max(m, x.id); }, 0) + 1;
-          sendEdit({
-            op: 'modulator_add',
-            modulator: {
-              id: id, name: 'Bande ' + id,
-              kind: { audio_band: { low_hz: 60, high_hz: 120, gain: 1, floor: 0.05, attack_ms: 10, release_ms: 200 } }
-            }
-          });
-        }
+        'data-tip': 'Ajoute une bande d’analyse audio (60–120 Hz) — réglable à la souris sur le spectre',
+        onclick: function () { sendEdit({ op: 'modulator_add', modulator: newBandCfg(nextModId()) }); }
       }, '+ Bande audio')));
-
-    var table = el('table', { class: 'grid' },
-      el('tr', null,
-        el('th', null, 'Nom'), el('th', null, 'Type'), el('th', null, 'Réglages'),
-        el('th', { 'data-tip': 'Niveau instantané du modulateur (vumètre temps réel)' }, 'Niveau'),
-        el('th', { class: 'edit-only' }, '')));
-    modulators().forEach(function (m) { table.appendChild(modulatorRow(m)); });
-    modPanel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
+    modulators().forEach(function (m) { modPanel.appendChild(modulatorCard(m)); });
     if (!modulators().length) {
       modPanel.appendChild(el('div', { style: 'padding:10px 0 0' },
         emptyState('wave', 'Aucun modulateur — « + LFO » ou « + Bande audio » pour animer un paramètre.')));
@@ -1515,95 +1884,198 @@
     routePanel.appendChild(el('div', { class: 'toolbar edit-only' },
       el('button', {
         disabled: !modulators().length,
-        'data-tip': 'Branche le premier modulateur sur le master (à modifier ensuite)',
+        'data-tip': 'Branche le premier modulateur sur le master (à modifier ensuite). Astuce : l’icône ⟳ à côté de chaque curseur fait la même chose, en mieux.',
         onclick: function () {
-          var id = routes().reduce(function (m, r) { return Math.max(m, r.id); }, 0) + 1;
           sendEdit({
             op: 'route_add',
-            route: { id: id, source: modulators()[0].id, target_addr: 'master/intensity', depth: 0.5, mode: 'add' }
+            route: { id: nextRouteId(), source: modulators()[0].id, target_addr: 'master/intensity', depth: 0.5, mode: 'add' }
           });
         }
       }, '+ Route')));
     var rtable = el('table', { class: 'grid' },
       el('tr', null,
         el('th', null, 'Source'), el('th', null, 'Cible'),
-        el('th', { 'data-tip': 'Profondeur par défaut (les cues peuvent la surcharger)' }, 'Profondeur'),
+        el('th', { 'data-tip': 'Profondeur par défaut, -1..1 (négatif = inversé ; les cues peuvent la surcharger)' }, 'Profondeur'),
         el('th', { 'data-tip': 'Add : base + signal. Mul : atténuation. Replace : remplace la base.' }, 'Mode'),
         el('th', { class: 'edit-only' }, '')));
     routes().forEach(function (r) { rtable.appendChild(routeRow(r)); });
     routePanel.appendChild(el('div', { style: 'overflow-x:auto' }, rtable));
     if (!routes().length) {
       routePanel.appendChild(el('div', { style: 'padding:10px 0 0' },
-        emptyState('wave', 'Aucune route — un modulateur n’agit que routé vers un paramètre.')));
+        emptyState('wave', 'Aucune route — un modulateur n’agit que routé vers un paramètre (icône ⟳ des curseurs).')));
     }
     root.appendChild(routePanel);
 
+    setTimeout(ensureModAnim, 0);
     return root;
   };
 
-  function modulatorRow(m) {
-    var tr = el('tr');
+  function fillDeviceSel(devSel) {
+    var devices = audioDevices();
+    var current = settings().audio_input || activeAudioDevice() || (S.fft && S.fft.device) || '';
+    devSel.textContent = '';
+    devSel.appendChild(el('option', { value: '' }, '— aucune —'));
+    if (!devices.length) {
+      devSel.appendChild(el('option', { value: '', disabled: 'disabled' }, 'Aucun périphérique détecté'));
+    }
+    devices.forEach(function (d) {
+      var o = el('option', { value: d }, d);
+      if (d === current) { o.selected = true; }
+      devSel.appendChild(o);
+    });
+    if (current && devices.indexOf(current) < 0) {
+      var ghost = el('option', { value: current }, current + ' (absent)');
+      ghost.selected = true;
+      devSel.appendChild(ghost);
+    }
+    devSel.setAttribute('data-count', String(devices.length));
+  }
+
+  function modulatorCard(m) {
+    var isLfo = isLfoMod(m);
+    var col = modColor(m.id);
+    var card = el('div', { class: 'mod-card' });
+
     function commit(mut) {
       var copy = JSON.parse(JSON.stringify(m));
       mut(copy);
       sendEdit({ op: 'modulator_update', modulator: copy });
     }
-    var name = el('input', { type: 'text', value: m.name || '' });
+
+    var name = el('input', { type: 'text', value: m.name || '', style: 'width:150px', 'data-tip': 'Nom du modulateur' });
     name.addEventListener('change', function () { commit(function (x) { x.name = name.value; }); });
-    tr.appendChild(el('td', null, name));
 
-    var isLfo = m.kind && typeof m.kind === 'object' && 'lfo' in m.kind;
-    tr.appendChild(el('td', { class: 'muted' }, isLfo ? 'LFO' : 'Bande audio'));
+    card.appendChild(el('div', { class: 'mod-head' },
+      el('span', { class: 'mod-color-dot', style: 'background:' + col + ';color:' + col }),
+      name,
+      el('span', { class: 'mod-kind' }, isLfo ? 'LFO' : 'Bande FFT'),
+      el('span', { class: 'spacer' }),
+      el('div', { class: 'mod-meter', 'data-tip': 'Niveau instantané du modulateur (vumètre temps réel)' },
+        el('div', { id: 'mod-meter-' + m.id })),
+      el('button', {
+        class: 'danger edit-only', 'data-tip': 'Supprime ce modulateur (et laisse ses routes orphelines — pensez à les retirer)',
+        onclick: function () { sendEdit({ op: 'modulator_remove', id: m.id }); }
+      }, 'X')));
 
-    var cfg = el('td');
+    var body = el('div', { class: 'mod-body' });
     if (isLfo) {
       var lfo = m.kind.lfo || {};
       var waveVal = typeof lfo.wave === 'string' ? lfo.wave : 'square';
-      var wave = sel(['sine', 'tri', 'square', 'saw', 'random_sh', 'drift'],
-        ['Sinus', 'Triangle', 'Carré', 'Dent de scie', 'Random S&H', 'Drift'],
-        waveVal,
-        function (v) {
-          commit(function (x) { x.kind.lfo.wave = v === 'square' ? { square: { pw: 0.5 } } : v; });
+
+      /* sélecteur de forme : segments avec mini-icônes SVG */
+      var seg = el('div', { class: 'wave-seg', role: 'group' });
+      [['sine', 'Sinus'], ['tri', 'Triangle'], ['square', 'Carré'], ['saw', 'Dent de scie'],
+       ['random_sh', 'Random S&H'], ['drift', 'Drift (dérive douce)']].forEach(function (pair) {
+        var btn = el('button', {
+          class: 'wave-btn' + (pair[0] === waveVal ? ' active' : ''),
+          'data-tip': 'Forme d’onde : ' + pair[1],
+          onclick: function () {
+            commit(function (x) {
+              var old = x.kind.lfo.wave;
+              var pw = (old && old.square && typeof old.square.pw === 'number') ? old.square.pw : 0.5;
+              x.kind.lfo.wave = pair[0] === 'square' ? { square: { pw: pw } } : pair[0];
+            });
+          }
         });
-      wave.setAttribute('data-tip', 'Forme d’onde du LFO');
+        btn.innerHTML = WAVE_ICONS[pair[0]] || '';
+        seg.appendChild(btn);
+      });
+      body.appendChild(seg);
+
+      /* fréquence : Hz fixes OU synchro BPM avec multiplicateurs préréglés */
       var isBpm = lfo.freq && typeof lfo.freq === 'object' && 'bpm_sync' in lfo.freq;
-      var freqVal = isBpm ? lfo.freq.bpm_sync.mult : (lfo.freq && lfo.freq.hz !== undefined ? lfo.freq.hz : 1);
-      var mode = sel(['hz', 'bpm'], ['Hz', 'Sync BPM'], isBpm ? 'bpm' : 'hz', applyFreq);
-      mode.setAttribute('data-tip', 'Fréquence en Hz fixes, ou multiplicateur du BPM (0,25 = 1 cycle sur 4 temps)');
-      var fin = el('input', { type: 'number', step: 0.01, min: 0, value: freqVal, style: 'width:70px' });
-      fin.addEventListener('change', applyFreq);
-      function applyFreq() {
-        var v = parseFloat(fin.value) || 1;
-        commit(function (x) {
-          x.kind.lfo.freq = mode.value === 'bpm' ? { bpm_sync: { mult: v } } : { hz: v };
+      var mult = isBpm ? ((lfo.freq.bpm_sync && lfo.freq.bpm_sync.mult) || 1) : 1;
+      var hzVal = !isBpm && lfo.freq && typeof lfo.freq.hz === 'number' ? lfo.freq.hz : 1;
+
+      var modeSeg = el('div', { class: 'wave-seg' },
+        el('button', {
+          class: 'wave-btn' + (isBpm ? '' : ' active'),
+          'data-tip': 'Fréquence libre, en Hertz',
+          onclick: function () {
+            if (!isBpm) { return; }
+            commit(function (x) {
+              /* continuité : on convertit le multiplicateur en Hz équivalents */
+              var hz = Math.round(mult * (rt().bpm || 120) / 60 * 1000) / 1000;
+              x.kind.lfo.freq = { hz: hz > 0 ? hz : 1 };
+            });
+          }
+        }, 'Hz'),
+        el('button', {
+          class: 'wave-btn' + (isBpm ? ' active' : ''),
+          'data-tip': 'Synchro sur le BPM maître (tap tempo : touche T)',
+          onclick: function () {
+            if (isBpm) { return; }
+            commit(function (x) { x.kind.lfo.freq = { bpm_sync: { mult: 1 } } });
+          }
+        }, 'BPM'));
+      body.appendChild(modeSeg);
+
+      if (isBpm) {
+        var presets = el('div', { class: 'wave-seg bpm-presets' });
+        [[0.125, '1/8'], [0.25, '1/4'], [0.5, '1/2'], [1, '1'], [2, '2'], [4, '4']].forEach(function (p) {
+          presets.appendChild(el('button', {
+            class: 'wave-btn' + (Math.abs(mult - p[0]) < 1e-6 ? ' active' : ''),
+            'data-tip': p[0] < 1
+              ? ('Un cycle sur ' + Math.round(1 / p[0]) + ' temps')
+              : (p[0] === 1 ? 'Un cycle par temps' : (p[0] + ' cycles par temps')),
+            onclick: function () {
+              commit(function (x) { x.kind.lfo.freq = { bpm_sync: { mult: p[0] } }; });
+            }
+          }, '×' + p[1]));
         });
+        body.appendChild(presets);
+        if ([0.125, 0.25, 0.5, 1, 2, 4].every(function (v) { return Math.abs(mult - v) > 1e-6; })) {
+          body.appendChild(el('span', { class: 'muted', 'data-tip': 'Multiplicateur personnalisé (cycles par temps)' },
+            '×' + mult));
+        }
+      } else {
+        var fin = el('input', {
+          type: 'number', step: 0.01, min: 0.01, value: hzVal,
+          style: 'width:76px', 'data-tip': 'Fréquence du LFO en Hertz (cycles par seconde)'
+        });
+        fin.addEventListener('change', function () {
+          var v = parseFloat(fin.value);
+          if (!isFinite(v) || v <= 0) { fin.value = hzVal; return; }
+          commit(function (x) { x.kind.lfo.freq = { hz: v }; });
+        });
+        body.appendChild(el('span', { class: 'toolbar', style: 'margin:0' }, fin, el('span', { class: 'muted' }, 'Hz')));
       }
-      cfg.appendChild(el('span', { class: 'toolbar' }, wave, mode, fin));
+
+      body.appendChild(el('canvas', {
+        class: 'lfo-preview', width: 150, height: 36, 'data-mod': m.id,
+        'data-tip': 'Aperçu du LFO — forme et vitesse réelles (les 2 derniers cycles)'
+      }));
     } else {
       var ab = (m.kind && m.kind.audio_band) || {};
-      var lo = el('input', { type: 'number', value: ab.low_hz || 0, style: 'width:70px', 'data-tip': 'Borne basse (Hz)' });
-      var hi = el('input', { type: 'number', value: ab.high_hz || 0, style: 'width:70px', 'data-tip': 'Borne haute (Hz)' });
+      var lo = el('input', {
+        type: 'number', id: 'band-lo-' + m.id, value: Math.round(ab.low_hz || 0), min: FFT_FMIN, max: FFT_FMAX,
+        style: 'width:80px', 'data-tip': 'Borne basse de la bande (Hz) — aussi réglable en glissant la poignée gauche sur le spectre'
+      });
+      var hi = el('input', {
+        type: 'number', id: 'band-hi-' + m.id, value: Math.round(ab.high_hz || 0), min: FFT_FMIN, max: FFT_FMAX,
+        style: 'width:80px', 'data-tip': 'Borne haute de la bande (Hz) — aussi réglable en glissant la poignée droite sur le spectre'
+      });
       function applyBand() {
+        var l = parseFloat(lo.value), h = parseFloat(hi.value);
+        if (!isFinite(l)) { l = ab.low_hz || 60; }
+        if (!isFinite(h)) { h = ab.high_hz || 120; }
+        l = clamp(l, FFT_FMIN, FFT_FMAX - 10);
+        h = clamp(h, l + 10, FFT_FMAX);
+        lo.value = Math.round(l); hi.value = Math.round(h);
         commit(function (x) {
-          x.kind.audio_band.low_hz = parseFloat(lo.value) || 0;
-          x.kind.audio_band.high_hz = parseFloat(hi.value) || 0;
+          x.kind.audio_band.low_hz = l;
+          x.kind.audio_band.high_hz = h;
         });
       }
       lo.addEventListener('change', applyBand);
       hi.addEventListener('change', applyBand);
-      cfg.appendChild(el('span', { class: 'toolbar' }, lo, el('span', { class: 'muted' }, '→'), hi, el('span', { class: 'muted' }, 'Hz')));
+      body.appendChild(el('span', { class: 'toolbar', style: 'margin:0' },
+        lo, el('span', { class: 'muted' }, '→'), hi, el('span', { class: 'muted' }, 'Hz')));
+      body.appendChild(el('span', { class: 'muted' },
+        'Glissez la bande colorée sur le spectre ci-dessus pour la régler à l’oreille.'));
     }
-    tr.appendChild(cfg);
-
-    tr.appendChild(el('td', null,
-      el('div', { class: 'mod-meter' }, el('div', { id: 'mod-meter-' + m.id }))));
-
-    tr.appendChild(el('td', { class: 'edit-only' },
-      el('button', {
-        class: 'danger', 'data-tip': 'Supprime ce modulateur',
-        onclick: function () { sendEdit({ op: 'modulator_remove', id: m.id }); }
-      }, 'X')));
-    return tr;
+    card.appendChild(body);
+    return card;
   }
 
   function routeRow(r) {
@@ -1619,7 +2091,9 @@
       String(r.source),
       function (v) { commit(function (x) { x.source = parseInt(v, 10); }); });
     src.setAttribute('data-tip', 'Modulateur source');
-    tr.appendChild(el('td', null, src));
+    tr.appendChild(el('td', null, el('span', { class: 'toolbar', style: 'margin:0;flex-wrap:nowrap' },
+      el('span', { class: 'mod-color-dot', style: 'background:' + modColor(r.source) + ';color:' + modColor(r.source) }),
+      src)));
 
     var addrs = paramAddrs();
     if (addrs.indexOf(r.target_addr) < 0) { addrs.unshift(r.target_addr); }
@@ -1627,7 +2101,10 @@
     tgt.setAttribute('data-tip', 'Paramètre cible (adresse stable)');
     tr.appendChild(el('td', null, tgt));
 
-    var depth = el('input', { type: 'range', min: 0, max: 1, step: 0.01, value: r.depth });
+    var depth = el('input', {
+      type: 'range', min: -1, max: 1, step: 0.01, value: r.depth,
+      'data-tip': 'Profondeur -1..1 — négatif = signal inversé'
+    });
     var dval = el('span', { class: 'val' }, fmtF(r.depth));
     depth.addEventListener('input', function () { dval.textContent = fmtF(parseFloat(depth.value)); });
     depth.addEventListener('change', function () { commit(function (x) { x.depth = parseFloat(depth.value); }); });
@@ -1643,6 +2120,194 @@
         onclick: function () { sendEdit({ op: 'route_remove', id: r.id }); }
       }, 'X')));
     return tr;
+  }
+
+  /* ============================================= animation par paramètre
+     Modèle Resolume : chaque curseur porte une icône ⟳ qui ouvre un popover
+     « Animation » — brancher un LFO ou une bande FFT (ModRoute) sur l'adresse
+     du paramètre, régler profondeur/mode, lister/supprimer les routes. */
+
+  var POP = { addr: null, el: null, x: 0, y: 0 };
+
+  function animButton(addr) {
+    var rs = routesFor(addr);
+    var names = rs.map(function (r) {
+      var m = modById(r.source);
+      return m ? m.name : ('mod ' + r.source);
+    });
+    var btn = el('button', {
+      class: 'anim-btn edit-only' + (rs.length ? ' active' : ''),
+      'data-tip': rs.length
+        ? ('Paramètre animé par : ' + names.join(', ') + ' — clic pour éditer l’animation')
+        : 'Animer ce paramètre (LFO, bande FFT…) — clic pour choisir une source',
+      onclick: function (e) {
+        e.stopPropagation();
+        openAnimPopover(addr, btn);
+      }
+    });
+    btn.innerHTML = ICONS.anim;
+    if (rs.length) {
+      btn.style.color = modColor(rs[0].source);
+      if (rs.length > 1) { btn.appendChild(el('span', { class: 'anim-count' }, String(rs.length))); }
+    }
+    return btn;
+  }
+
+  function closeAnimPopover() {
+    if (POP.el && POP.el.parentNode) { POP.el.parentNode.removeChild(POP.el); }
+    POP.addr = null;
+    POP.el = null;
+  }
+
+  function openAnimPopover(addr, anchor) {
+    if (POP.addr === addr) { closeAnimPopover(); return; }
+    closeAnimPopover();
+    POP.addr = addr;
+    POP.el = el('div', { id: 'anim-popover' });
+    document.body.appendChild(POP.el);
+    var r = anchor.getBoundingClientRect();
+    POP.x = r.left;
+    POP.y = r.bottom + 6;
+    renderAnimPopover();
+  }
+
+  /* (Re)construit le contenu du popover depuis S.show — appelé à l'ouverture
+     et à chaque edit_applied de route ou de modulateur tant qu'il est ouvert. */
+  function renderAnimPopover() {
+    var pop = POP.el;
+    if (!pop) { return; }
+    var addr = POP.addr;
+    pop.textContent = '';
+
+    pop.appendChild(el('div', { class: 'pop-head' },
+      el('span', { class: 'pop-title' }, 'Animation'),
+      el('code', { class: 'pop-addr', 'data-tip': 'Adresse stable du paramètre (aussi pilotable en OSC/MIDI/DMX)' }, addr),
+      el('span', { class: 'spacer' }),
+      el('button', { class: 'ghost', 'data-tip': 'Fermer (Échap)', onclick: closeAnimPopover }, '✕')));
+
+    /* routes actives : badges éditables */
+    var rs = routesFor(addr);
+    if (!rs.length) {
+      pop.appendChild(el('div', { class: 'muted', style: 'margin:2px 0 10px' },
+        'Aucune animation sur ce paramètre.'));
+    }
+    rs.forEach(function (r) {
+      var m = modById(r.source);
+      var col = modColor(r.source);
+      function commitR(mut) {
+        var copy = JSON.parse(JSON.stringify(r));
+        mut(copy);
+        sendEdit({ op: 'route_update', route: copy });
+      }
+      var depth = el('input', {
+        type: 'range', min: -1, max: 1, step: 0.01, value: r.depth,
+        'data-tip': 'Profondeur de modulation -1..1 (négatif = inversé)'
+      });
+      var dval = el('span', { class: 'val' }, fmtF(r.depth));
+      depth.addEventListener('input', function () { dval.textContent = fmtF(parseFloat(depth.value)); });
+      depth.addEventListener('change', function () {
+        commitR(function (x) { x.depth = parseFloat(depth.value) || 0; });
+      });
+      var mode = sel(['add', 'mul', 'replace'], ['Add', 'Mul', 'Replace'], r.mode,
+        function (v) { commitR(function (x) { x.mode = v; }); });
+      mode.setAttribute('data-tip', 'Add : base + signal. Mul : atténuation. Replace : remplace la base.');
+      pop.appendChild(el('div', { class: 'pop-route' },
+        el('span', { class: 'mod-color-dot', style: 'background:' + col + ';color:' + col }),
+        el('span', { class: 'pop-route-name' }, m ? m.name : ('mod ' + r.source)),
+        depth, dval, mode,
+        el('button', {
+          class: 'danger', 'data-tip': 'Débranche cette animation (supprime la route)',
+          onclick: function () { sendEdit({ op: 'route_remove', id: r.id }); }
+        }, '✕')));
+    });
+
+    if (isShowMode()) {
+      pop.appendChild(el('div', { class: 'muted' }, 'Mode Show : édition verrouillée.'));
+    } else {
+      /* branchement d'une nouvelle source */
+      var depthN = el('input', {
+        type: 'range', min: -1, max: 1, step: 0.01, value: 0.5,
+        'data-tip': 'Profondeur de la nouvelle animation (-1..1)'
+      });
+      var dvalN = el('span', { class: 'val' }, '0.50');
+      depthN.addEventListener('input', function () { dvalN.textContent = fmtF(parseFloat(depthN.value)); });
+      var modeN = sel(['add', 'mul', 'replace'], ['Add', 'Mul', 'Replace'], 'add', null);
+      modeN.setAttribute('data-tip', 'Mode d’application de la nouvelle animation');
+
+      var src = el('select', { 'data-tip': 'Source à brancher : modulateur existant, ou création directe' });
+      src.appendChild(el('option', { value: '' }, '— Ajouter une source —'));
+      if (rs.length) { src.appendChild(el('option', { value: 'none' }, 'Aucune (tout débrancher)')); }
+      var lfos = modulators().filter(isLfoMod);
+      var bandsM = modulators().filter(isBandMod);
+      if (lfos.length) {
+        var og1 = el('optgroup', { label: 'LFO existants' });
+        lfos.forEach(function (m) { og1.appendChild(el('option', { value: 'mod:' + m.id }, m.name || ('LFO ' + m.id))); });
+        src.appendChild(og1);
+      }
+      if (bandsM.length) {
+        var og2 = el('optgroup', { label: 'Bandes FFT existantes' });
+        bandsM.forEach(function (m) { og2.appendChild(el('option', { value: 'mod:' + m.id }, m.name || ('Bande ' + m.id))); });
+        src.appendChild(og2);
+      }
+      src.appendChild(el('option', { value: 'new_lfo' }, '+ Créer un LFO'));
+      src.appendChild(el('option', { value: 'new_band' }, '+ Créer une bande FFT'));
+      src.appendChild(el('option', {
+        value: 'timecode', disabled: 'disabled',
+        title: 'Chase timecode (MTC/LTC) — prévu en v2'
+      }, 'Timecode (v2)'));
+
+      src.addEventListener('change', function () {
+        var v = src.value;
+        src.value = '';
+        if (!v) { return; }
+        if (v === 'none') {
+          routesFor(addr).forEach(function (r) { sendEdit({ op: 'route_remove', id: r.id }); });
+          return;
+        }
+        var d = parseFloat(depthN.value);
+        if (!isFinite(d)) { d = 0.5; }
+        var srcId = null;
+        if (v === 'new_lfo') {
+          srcId = nextModId();
+          sendEdit({ op: 'modulator_add', modulator: newLfoCfg(srcId) });
+        } else if (v === 'new_band') {
+          srcId = nextModId();
+          sendEdit({ op: 'modulator_add', modulator: newBandCfg(srcId) });
+        } else if (v.indexOf('mod:') === 0) {
+          srcId = parseInt(v.slice(4), 10);
+        }
+        if (srcId === null || !isFinite(srcId)) { return; }
+        sendEdit({
+          op: 'route_add',
+          route: { id: nextRouteId(), source: srcId, target_addr: addr, depth: d, mode: modeN.value }
+        });
+      });
+
+      pop.appendChild(el('div', { class: 'pop-add' },
+        el('div', { class: 'pop-add-row' }, el('span', { class: 'pop-label' }, 'Source'), src),
+        el('div', { class: 'pop-add-row' }, el('span', { class: 'pop-label' }, 'Profondeur'), depthN, dvalN),
+        el('div', { class: 'pop-add-row' }, el('span', { class: 'pop-label' }, 'Mode'), modeN)));
+      pop.appendChild(el('div', { class: 'muted pop-hint' },
+        'La source choisie est branchée immédiatement. Réglez ensuite le LFO ou la bande dans l’onglet Modulation.'));
+    }
+
+    /* positionnement : sous l'ancre, borné à la fenêtre */
+    var pw = pop.offsetWidth, ph = pop.offsetHeight;
+    var x = clamp(POP.x, 8, Math.max(8, window.innerWidth - pw - 8));
+    var y = POP.y;
+    if (y + ph > window.innerHeight - 8) { y = Math.max(8, POP.y - ph - 40); }
+    pop.style.left = x + 'px';
+    pop.style.top = y + 'px';
+  }
+
+  function installAnimPopoverClose() {
+    document.addEventListener('pointerdown', function (e) {
+      if (!POP.el) { return; }
+      var t = e.target;
+      if (POP.el.contains(t)) { return; }
+      if (t && t.closest && t.closest('.anim-btn')) { return; }
+      closeAnimPopover();
+    });
   }
 
   /* ================================================================ PATCH */
@@ -2096,6 +2761,7 @@
         if (e.key === 'Escape') { t.blur(); }
         return;
       }
+      if (e.key === 'Escape') { closeAnimPopover(); return; }
       /* e.repeat : l'auto-repeat clavier ne doit JAMAIS déclencher une
          action de conduite (rafale de GO, strobe DBO, tap tempo faussé). */
       if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) { go(); } return; }
@@ -2161,15 +2827,23 @@
         /* re-synchronisation complète via un nouveau hello */
         Conduite.ws.reconnect();
         break;
-      case 'edit_applied':
+      case 'edit_applied': {
         applyOp(ev.op || {});
-        if (ev.op && ev.op.op === 'corner_set') {
+        var opn = (ev.op && ev.op.op) || '';
+        if (opn === 'corner_set') {
           /* pas de re-render pendant un drag : juste le canvas */
           if (!S.dragging) { drawMapping(); }
+        } else if (opn === 'modulator_update' && S.dragging) {
+          /* drag d'une bande sur le spectre : le canvas se redessine via la
+             boucle d'animation, un re-render casserait le geste */
         } else {
           requestRenderMain();
         }
+        if (POP.el && (opn.indexOf('route_') === 0 || opn.indexOf('modulator_') === 0)) {
+          renderAnimPopover();
+        }
         break;
+      }
       default:
         break;
     }
@@ -2186,6 +2860,8 @@
         renderAll();
         break;
       case 'dyn':
+        /* fft absent = pas d'entrée audio active (contrat WS) */
+        S.fft = (m.fft && typeof m.fft === 'object' && Array.isArray(m.fft.bins)) ? m.fft : null;
         if (m.runtime && typeof m.runtime === 'object') {
           S.runtime = m.runtime;
           var wasShow = document.body.classList.contains('mode-show');
@@ -2214,6 +2890,7 @@
     installTooltips();
     installKeyboard();
     installDeferredRender();
+    installAnimPopoverClose();
     startClock();
     var badge = byId('mode-badge');
     if (badge) {
@@ -2227,5 +2904,19 @@
     Conduite.ws.connect();
     renderAll();
   });
+
+  /* Hooks de dev/test — aucun usage en fonctionnement normal :
+     - debugInject : injecte un message comme s'il arrivait du WS (ex. une
+       trame dyn avec fft factice pour vérifier l'analyseur sans micro) ;
+     - debugRenderModulation : force un dessin synchrone du spectre et des
+       aperçus LFO (la boucle rAF est en pause quand l'onglet est masqué). */
+  Conduite.debugInject = onMessage;
+  Conduite.debugRenderModulation = function () {
+    var cv = byId('spectrum-canvas');
+    if (cv) { drawSpectrum(cv); updateSpectrumStatus(); }
+    document.querySelectorAll('canvas.lfo-preview').forEach(function (p) {
+      drawLfoPreviewCanvas(p);
+    });
+  };
 
 })();

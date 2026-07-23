@@ -10,17 +10,25 @@
 //!   la fréquence ou le BPM change, jamais `phase = t * freq` ;
 //! - `RandomSh`/`Drift` seedés par l'id du modulateur (reproductibles) ;
 //! - enveloppes attack/release exponentielles (constantes de temps en ms) ;
+//! - bandes audio : AGC lent optionnel (`normalize`, max glissant ~3 s) pour
+//!   rester 0..1 quel que soit le niveau d'entrée ;
+//! - [`spectrum_bins`] : réduction pure de la trame FFT en bins
+//!   log-échelonnés 0..1 pour l'analyseur de l'UI (trame WS `dyn.fft.bins`) ;
 //! - aucune IO, aucun panic en runtime.
 
 mod noise;
+mod spectrum;
 mod tap;
 
 use std::f64::consts::TAU;
 
 use conduite_core::{Freq, ModId, ModKind, ModRoute, ModRouteState, ModulatorCfg, RouteMode, Wave};
-use tracing::warn;
+use tracing::{trace, warn};
 
 use noise::{cell_noise, seed_from_id, smoothstep};
+pub use spectrum::{
+    spectrum_bins, SPECTRUM_BINS_DEFAULT, SPECTRUM_HIGH_HZ_DEFAULT, SPECTRUM_LOW_HZ_DEFAULT,
+};
 use tap::TapTempo;
 
 // ------------------------------------------------------------------ FftFrame
@@ -43,6 +51,13 @@ impl FftFrame {
 
 // ----------------------------------------------------------------- ModEngine
 
+/// Constante de temps du maximum glissant de l'AGC des bandes audio (s).
+/// « Lent » : un pic est retenu ~3 s avant que la normalisation ne remonte.
+const AGC_TAU_S: f64 = 3.0;
+/// En-dessous de ce maximum glissant, l'entrée est considérée silencieuse :
+/// la bande sort 0 au lieu d'amplifier le bruit de fond jusqu'à 1.
+const AGC_SILENCE: f32 = 1e-4;
+
 /// État runtime d'un modulateur (la config reste dans `ModulatorCfg`).
 #[derive(Debug)]
 enum ModState {
@@ -54,7 +69,12 @@ enum ModState {
     AudioBand {
         /// Valeur d'enveloppe courante 0..1.
         env: f32,
+        /// Maximum glissant du niveau brut (AGC) : montée instantanée,
+        /// décroissance exponentielle de constante [`AGC_TAU_S`].
+        agc_max: f32,
     },
+    /// Réservé v2 (chase MTC/LTC) : aucun état, sortie 0.
+    Timecode,
 }
 
 #[derive(Debug)]
@@ -110,8 +130,11 @@ impl ModEngine {
                     (Some(ModState::Lfo { phase }), ModKind::Lfo { .. }) => {
                         ModState::Lfo { phase: *phase }
                     }
-                    (Some(ModState::AudioBand { env }), ModKind::AudioBand { .. }) => {
-                        ModState::AudioBand { env: *env }
+                    (Some(ModState::AudioBand { env, agc_max }), ModKind::AudioBand { .. }) => {
+                        ModState::AudioBand {
+                            env: *env,
+                            agc_max: *agc_max,
+                        }
                     }
                     _ => fresh_state(&cfg.kind),
                 };
@@ -227,12 +250,28 @@ impl ModEngine {
                         floor,
                         attack_ms,
                         release_ms,
+                        normalize,
                     },
-                    ModState::AudioBand { env },
+                    ModState::AudioBand { env, agc_max },
                 ) => {
-                    let target = band_level(fft, *low_hz, *high_hz, *gain, *floor);
+                    let raw = band_raw(fft, *low_hz, *high_hz);
+                    let level = if *normalize {
+                        agc_normalize(raw, agc_max, dt_s)
+                    } else {
+                        raw
+                    };
+                    let target = ((level - *floor).max(0.0) * *gain).clamp(0.0, 1.0);
                     *env = envelope_step(*env, target, dt_s, *attack_ms, *release_ms);
                     *env
+                }
+                // Réservé v2 : pas de logique timecode, sortie neutre.
+                (ModKind::TimecodeChase { .. }, ModState::Timecode) => {
+                    trace!(
+                        target: "modulation",
+                        id = slot.cfg.id,
+                        "timecode chase réservé (v2) : sortie 0"
+                    );
+                    0.0
                 }
                 // Genre et état désalignés : impossible après `load`, valeur neutre.
                 _ => 0.0,
@@ -277,7 +316,11 @@ fn fresh_state(kind: &ModKind) -> ModState {
         ModKind::Lfo { phase, .. } => ModState::Lfo {
             phase: f64::from(*phase).rem_euclid(1.0),
         },
-        ModKind::AudioBand { .. } => ModState::AudioBand { env: 0.0 },
+        ModKind::AudioBand { .. } => ModState::AudioBand {
+            env: 0.0,
+            agc_max: 0.0,
+        },
+        ModKind::TimecodeChase { .. } => ModState::Timecode,
     }
 }
 
@@ -323,10 +366,10 @@ fn eval_wave(wave: Wave, phase: f64, seed: u32) -> f32 {
     }
 }
 
-/// Niveau instantané d'une bande : somme des magnitudes des bins dont la
-/// fréquence centrale tombe dans `[low_hz, high_hz]`, plancher soustrait,
-/// gain appliqué, clampé 0..1.
-fn band_level(fft: &FftFrame, low_hz: f32, high_hz: f32, gain: f32, floor: f32) -> f32 {
+/// Niveau brut d'une bande : somme des magnitudes des bins dont la
+/// fréquence centrale tombe dans `[low_hz, high_hz]` (bornes inclusives).
+/// Plancher, gain, AGC et clamp sont appliqués par l'appelant.
+fn band_raw(fft: &FftFrame, low_hz: f32, high_hz: f32) -> f32 {
     if fft.bins_hz <= 0.0 || fft.magnitudes.is_empty() {
         return 0.0;
     }
@@ -337,7 +380,20 @@ fn band_level(fft: &FftFrame, low_hz: f32, high_hz: f32, gain: f32, floor: f32) 
             sum += m;
         }
     }
-    ((sum - floor).max(0.0) * gain).clamp(0.0, 1.0)
+    sum
+}
+
+/// AGC lent : met à jour le maximum glissant (montée instantanée,
+/// décroissance exponentielle de constante [`AGC_TAU_S`]) et retourne
+/// `raw / max` clampé 0..1. Silence (`max ≤` [`AGC_SILENCE`]) ⇒ 0, pour ne
+/// jamais amplifier le bruit de fond jusqu'à pleine échelle.
+fn agc_normalize(raw: f32, agc_max: &mut f32, dt_s: f64) -> f32 {
+    let decay = (-dt_s / AGC_TAU_S).exp() as f32;
+    *agc_max = (*agc_max * decay).max(raw);
+    if *agc_max <= AGC_SILENCE {
+        return 0.0;
+    }
+    (raw / *agc_max).clamp(0.0, 1.0)
 }
 
 /// Un pas d'enveloppe exponentielle : constante de temps `attack_ms` à la
@@ -368,6 +424,8 @@ mod tests {
         }
     }
 
+    /// Bande audio **sans** AGC (`normalize: false`) : niveaux bruts,
+    /// pratiques pour tester plancher/gain/enveloppe à valeurs connues.
     fn band_cfg(
         id: ModId,
         low_hz: f32,
@@ -387,6 +445,25 @@ mod tests {
                 floor,
                 attack_ms,
                 release_ms,
+                normalize: false,
+            },
+        }
+    }
+
+    /// Bande audio avec AGC (`normalize: true`), enveloppe instantanée,
+    /// gain 1 et plancher 0 : la sortie reflète directement l'AGC.
+    fn band_agc_cfg(id: ModId, low_hz: f32, high_hz: f32) -> ModulatorCfg {
+        ModulatorCfg {
+            id,
+            name: format!("band{id}"),
+            kind: ModKind::AudioBand {
+                low_hz,
+                high_hz,
+                gain: 1.0,
+                floor: 0.0,
+                attack_ms: 0.0,
+                release_ms: 0.0,
+                normalize: true,
             },
         }
     }
@@ -518,6 +595,34 @@ mod tests {
         e.tick(0.0, 120.0, &fft);
         let out = e.tick(1.0, 120.0, &fft);
         assert!(offset(&out, "t").abs() < EPS, "phase 0.5 → saw = 0");
+    }
+
+    #[test]
+    fn bpm_sync_expresses_usual_measure_multipliers() {
+        // Convention documentée sur `Freq::BpmSync` : mult = cycles par temps,
+        // donc en 4/4 : N mesures ⇔ mult = 1/(4N), 1 temps ⇔ mult = 1.
+        // Vérification à 120 BPM (1 temps = 0.5 s) pour 1/4, 1/2, 1, 2 et
+        // 4 mesures : un cycle complet dure exactement `beats × 0.5` s.
+        for (mult, cycle_s) in [
+            (1.0f32, 0.5f64),  // 1/4 de mesure (1 temps)
+            (0.5, 1.0),        // 1/2 mesure
+            (0.25, 2.0),       // 1 mesure
+            (0.125, 4.0),      // 2 mesures
+            (0.0625, 8.0),     // 4 mesures
+        ] {
+            let mut e = single_lfo(Wave::Saw, Freq::BpmSync { mult }, 0.0);
+            let fft = FftFrame::empty();
+            e.tick(0.0, 120.0, &fft);
+            // Demi-cycle : saw passe par 0.
+            let out = e.tick(cycle_s / 2.0, 120.0, &fft);
+            assert!(offset(&out, "t").abs() < 1e-4, "demi-cycle, mult {mult}");
+            // Cycle complet : saw revient à −1.
+            let out = e.tick(cycle_s, 120.0, &fft);
+            assert!(
+                (offset(&out, "t") + 1.0).abs() < 1e-4,
+                "cycle complet, mult {mult}"
+            );
+        }
     }
 
     // ------------------------------------------------------ RandomSh & Drift
@@ -667,6 +772,102 @@ mod tests {
         // Silence pendant 200 ms = 1 τ de release : peak × e⁻¹.
         let out = e.tick(0.4, 120.0, &FftFrame::empty());
         assert!((offset(&out, "t") - peak * (-1.0f32).exp()).abs() < 1e-3);
+    }
+
+    // ------------------------------------------------------------------ AGC
+
+    /// Trame constante : un seul bin dans la bande, magnitude `level`.
+    fn flat_frame(level: f32) -> FftFrame {
+        FftFrame {
+            bins_hz: 100.0,
+            magnitudes: vec![0.0, level, 0.0],
+        }
+    }
+
+    fn single_agc_band() -> ModEngine {
+        let mut e = ModEngine::new();
+        e.load(
+            &[band_agc_cfg(1, 50.0, 150.0)],
+            &[route(1, 1, "t", 1.0, RouteMode::Add)],
+        );
+        e
+    }
+
+    #[test]
+    fn agc_normalizes_any_constant_input_level_to_one() {
+        // Quel que soit le niveau d'entrée, un signal constant atteint 1.
+        for level in [0.001f32, 0.5, 500.0] {
+            let mut e = single_agc_band();
+            let out = e.tick(0.0, 120.0, &flat_frame(level));
+            assert!(
+                (offset(&out, "t") - 1.0).abs() < EPS,
+                "niveau {level} : le max glissant vaut le signal ⇒ ratio 1"
+            );
+        }
+    }
+
+    #[test]
+    fn agc_max_decays_with_a_3s_time_constant() {
+        let mut e = single_agc_band();
+        // Pic fort : le max glissant monte instantanément à 1.
+        e.tick(0.0, 120.0, &flat_frame(1.0));
+        // Signal à mi-niveau juste après : normalisé ≈ 0.5.
+        let out = e.tick(0.001, 120.0, &flat_frame(0.5));
+        assert!((offset(&out, "t") - 0.5).abs() < 1e-3);
+        // À t = 1.5 s : max ≈ e^(−1.5/3) = 0.6065 ⇒ 0.5/0.6065 ≈ 0.824.
+        let out = e.tick(1.5, 120.0, &flat_frame(0.5));
+        assert!((offset(&out, "t") - 0.824).abs() < 1e-2);
+        // À t = 3 s le max décru (0.368) est rattrapé par le signal (0.5) : ratio 1.
+        let out = e.tick(3.0, 120.0, &flat_frame(0.5));
+        assert!((offset(&out, "t") - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn agc_does_not_amplify_silence() {
+        let mut e = single_agc_band();
+        e.tick(0.0, 120.0, &flat_frame(1.0));
+        // Longtemps après le pic, en silence total : sortie 0, pas de bruit
+        // amplifié à pleine échelle (garde AGC_SILENCE).
+        for i in 1..=20 {
+            let out = e.tick(f64::from(i), 120.0, &FftFrame::empty());
+            assert!(offset(&out, "t").abs() < EPS, "silence à t={i}");
+        }
+    }
+
+    #[test]
+    fn agc_state_survives_hot_reload() {
+        let mut e = single_agc_band();
+        e.tick(0.0, 120.0, &flat_frame(1.0)); // max glissant = 1
+        // Rechargement à chaud (même id) : le max n'est pas réinitialisé,
+        // sinon le demi-niveau ressortirait à 1.
+        e.load(
+            &[band_agc_cfg(1, 50.0, 150.0)],
+            &[route(1, 1, "t", 1.0, RouteMode::Add)],
+        );
+        let out = e.tick(0.001, 120.0, &flat_frame(0.5));
+        assert!((offset(&out, "t") - 0.5).abs() < 1e-3);
+    }
+
+    // ------------------------------------------------------ Timecode (v2)
+
+    #[test]
+    fn timecode_chase_is_reserved_and_outputs_zero() {
+        let mut e = ModEngine::new();
+        e.load(
+            &[ModulatorCfg {
+                id: 1,
+                name: "tc".into(),
+                kind: ModKind::TimecodeChase {},
+            }],
+            &[route(1, 1, "t", 1.0, RouteMode::Add)],
+        );
+        let out = e.tick(0.0, 120.0, &FftFrame::empty());
+        assert!(offset(&out, "t").abs() < EPS);
+        let out = e.tick(1.0, 120.0, &synth_frame());
+        assert!(offset(&out, "t").abs() < EPS, "0 même avec de l'audio");
+        e.retrigger(); // ne panique pas, n'a aucun effet
+        let levels: Vec<(ModId, f32)> = e.levels().collect();
+        assert_eq!(levels, vec![(1, 0.0)]);
     }
 
     // --------------------------------------------------------------- Routes

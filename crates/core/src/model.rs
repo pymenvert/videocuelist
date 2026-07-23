@@ -394,6 +394,11 @@ pub struct ShowSettings {
     pub autosave_debounce_s: f32,
     /// Autosave périodique si dirty (secondes).
     pub autosave_interval_s: f32,
+    /// Périphérique d'entrée audio pour l'analyse FFT : `"default"` = entrée
+    /// par défaut de l'OS, nom exact sinon, `None` = repli sur le réglage
+    /// machine (`config.toml`) ou capture coupée. Modifiable à chaud par
+    /// `SettingsUpdate`.
+    pub audio_input: Option<String>,
 }
 
 impl Default for ShowSettings {
@@ -409,6 +414,7 @@ impl Default for ShowSettings {
             mjpeg_height: 360,
             autosave_debounce_s: 2.0,
             autosave_interval_s: 60.0,
+            audio_input: None,
         }
     }
 }

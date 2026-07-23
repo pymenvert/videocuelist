@@ -296,6 +296,32 @@ mod tests {
         assert_eq!(msg["type"], "dyn");
         assert_eq!(msg["runtime"]["progress"], 0.5);
         assert!(msg.get("state").is_none(), "dyn ne renvoie pas le show complet");
+        assert!(
+            msg.get("fft").is_none(),
+            "fft absent de la trame dyn sans entrée audio active (contrat WS)"
+        );
+    }
+
+    /// Contrat WS : quand l'état porte un champ `fft` (entrée audio active),
+    /// la trame dyn le relaie tel quel ({bins, device}).
+    #[tokio::test]
+    async fn ws_dyn_carries_fft_when_audio_active() {
+        let h = harness("ws-dyn-fft");
+        let mut ws = ws_connect(&h).await;
+        let _ = next_json(&mut ws).await; // hello
+
+        h.state_tx
+            .send(json!({
+                "show": null,
+                "runtime": { "progress": 0.1 },
+                "fft": { "bins": [0.5, 0.25], "device": "Micro USB" }
+            }))
+            .expect("maj état");
+
+        let msg = next_json(&mut ws).await;
+        assert_eq!(msg["type"], "dyn");
+        assert_eq!(msg["fft"]["device"], "Micro USB");
+        assert_eq!(msg["fft"]["bins"][0], 0.5);
     }
 
     // --------------------------------------------------------------- MJPEG

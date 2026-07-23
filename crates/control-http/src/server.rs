@@ -316,7 +316,9 @@ async fn send_json(tx: &mut WsSink, value: &Value) -> Result<(), axum::Error> {
 /// Protocole par connexion :
 /// 1. à l'ouverture : `{"type":"hello","state":<watch courant>}` ;
 /// 2. relaye chaque événement : `{"type":"event","event":…}` ;
-/// 3. sur changement du watch, throttlé à 10 Hz : `{"type":"dyn","runtime":…}` ;
+/// 3. sur changement du watch, throttlé à 10 Hz :
+///    `{"type":"dyn","runtime":…}` + champ `fft` ({bins, device}) quand une
+///    entrée audio est active (absent sinon — contrat WS) ;
 /// 4. entrant `{"type":"cmd","cmd":{…Command}}` → `cmd_tx` (Source::Ui) ;
 ///    `{"type":"ping"}` → `{"type":"pong"}`.
 async fn handle_ws(socket: WebSocket, st: AppState) {
@@ -344,12 +346,19 @@ async fn handle_ws(socket: WebSocket, st: AppState) {
                 }
                 match state_rx.has_changed() {
                     Ok(true) => {
-                        let runtime = state_rx
-                            .borrow_and_update()
-                            .get("runtime")
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        let msg = json!({ "type": "dyn", "runtime": runtime });
+                        let (runtime, fft) = {
+                            let state = state_rx.borrow_and_update();
+                            (
+                                state.get("runtime").cloned().unwrap_or(Value::Null),
+                                state.get("fft").cloned(),
+                            )
+                        };
+                        let mut msg = json!({ "type": "dyn", "runtime": runtime });
+                        if let Some(fft) = fft {
+                            if !fft.is_null() {
+                                msg["fft"] = fft;
+                            }
+                        }
                         if send_json(&mut tx, &msg).await.is_err() {
                             break;
                         }

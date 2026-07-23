@@ -44,7 +44,7 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 
 ## 5. Sorties
 
-- **Plusieurs slices par sortie, jusqu'à 4 sorties simultanées par show.** Sorties plein écran sans bordure, choix du display, bouton « identifier ». 1080p par défaut, 4K selon machine (bench).
+- **Plusieurs slices par sortie, jusqu'à 4 sorties simultanées par show.** Sorties plein écran sans bordure, choix du display, bouton « identifier ». **4×1080p garanti ; 4×4K = objectif** (chemin : HAP direct en textures GPU compressées, puis décodage matériel — bench par machine).
 - **Preview program** dans l'UI, indépendante des vraies sorties.
 - Plus tard : edge blending multi-projecteurs, NDI in/out, Spout (Windows) / Syphon (macOS).
 
@@ -72,6 +72,13 @@ Ce document décrit **ce que fait** VideoCuelist. Le comment est dans [ARCHITECT
 ## 7. Modulation — LFO & audio-réactif
 
 Remplace toute notion de sortie audio. Un **modulateur** est une source de signal interne qu'on branche sur n'importe quel paramètre (profondeur, offset, lissage par branchement).
+
+**Modèle d'UI (validé 2026-07-24, inspiration Resolume)** : chaque paramètre porte une
+icône d'animation ouvrant un popover — source **Timeline** (LFO), **BPM sync**, **FFT**
+(bande de fréquences choisie visuellement sur l'analyseur de spectre, poignées
+draggables en Hz), **Timecode** (grisé jusqu'à la v2) ; profondeur et mode par
+branchement. Pas d'hébergement VST (voir DECISIONS 2026-07-24) : les besoins de
+synthèse extrême passent par un outil externe en OSC/MIDI (VCV Rack, Max, Chataigne).
 
 - **LFO** : sinus, triangle, carré (avec largeur d'impulsion), dent de scie, random S&H, drift perlin. Fréquence en **Hz définie proprement** (0,01–30 Hz) ou synchronisée BPM (division/multiplication), phase réglable, retrigger sur GO de cue.
 - **BPM maître** : tap-tempo (UI, MIDI, OSC), nudge, resync sur cue.
