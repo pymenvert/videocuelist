@@ -1,0 +1,4 @@
+http_port = 9820
+http_bind = "0.0.0.0"
+last_show = "demo"
+target_fps = 60

@@ -39,8 +39,18 @@ Source de vérité du projet. Format : date — décision — pourquoi.
 - **2026-07-23 — Convention de rangement héritée de Toolbox** : le cadrage vit dans `Programe Cue Video/` (dossier de travail), le code dans le repo `videocuelist/` (GitHub : pymenvert/videocuelist). Docs normatives : DECISIONS / SPEC / ARCHITECTURE / PLAN.
 - **2026-07-23 — Chaque phase du PLAN livre un outil utilisable en l'état** avec un critère de sortie testable. *Pourquoi : de la valeur à chaque étape, correction de cap possible.*
 
+- **2026-07-23 — Nom proposé : « Conduite »** (à valider par Pym). Recherche de collisions menée sur 7 candidats (Filage, Conduite, Servante, Poursuite, Girandole, Luciole, CueLight) : Conduite gagne — c'est littéralement le document de régie que le logiciel incarne, aucun logiciel du spectacle ne porte ce nom, handle GitHub libre, duo cohérent avec Lanterne. Réserves connues : SEO (permis de conduire) → communiquer « Conduite app », lecture anglophone « Conduit ». Dauphins : Filage (très bon mais voisin de « Filmage », apps vidéo Mac), Poursuite. À éviter : CueLight (produit commercial NuDelta du même secteur), Luciole (logiciel vidéo libre français existant).
+
+## Assemblage `app` (binaire conduite)
+
+- **2026-07-23 — Un seul contexte GL, une surface par fenêtre de sortie** (au lieu de contextes partagés via `with_sharing`). *Pourquoi : les VAO et FBO du compositor ne sont PAS partagés entre contextes GL (seuls textures/buffers le sont) — un contexte unique rendu tour à tour sur chaque surface (`make_current` par fenêtre) partage tout sans piège. Vsync posé sur la première surface uniquement, conforme à INTERFACES.*
+- **2026-07-23 — Ajout à `core` des commandes `Undo`/`Redo` et `MidiLearnStart`/`MidiLearnCancel`** (JSON figé par test, retouche core explicitement autorisée par la mission). *Pourquoi : l'undo est une pile de snapshots côté app mais doit être pilotable par l'UI/raccourcis via le vocabulaire commun ; le learn MIDI est déclenché depuis la page Patch.*
+- **2026-07-23 — DBO implémenté comme fondu maître dédié dans la session** (niveau 0..1 poussé dans `OutputView::dbo`), distinct de `CuePanic` (qui reste le noir de conduite du moteur de cues). *Pourquoi : `DboRelease` doit relever le voile sans toucher à la conduite, alors que le panic du moteur n'est relâché que par un GO.*
+- **2026-07-23 — Entrée audio (cpal + rustfft) : stub propre en v1 de l'app** — `FftFrame::empty()` chaque tick, warn au démarrage si `audio_input` est configuré. *Pourquoi : les LFO fonctionnent sans ; l'intégration cpal/FFT (thread dédié, Hann 2048/hop 1024, triple buffer) reste à brancher sans changer l'architecture.*
+- **2026-07-23 — Édition des cues en cours de conduite : `CueEngine::load` puis re-standby de l'ancienne cue active.** *Pourquoi : le moteur repart proprement de zéro au rechargement ; on repositionne la standby pour que le GO suivant reprenne où on en était (l'édition lourde se fait en mode Edit).*
+
 ## En attente / à trancher plus tard
 
-- Nom définitif du produit (recherche de collisions en cours — proposition au réveil de Pym).
+- Validation du nom « Conduite » par Pym (et renommage éventuel du repo).
 - Confirmer l'interprétation du « module de synthétisation du son » (LFO + audio-réactif, sans sortie son).
 - Machine(s) de show réelles pour le bench 4×1080p / 4K.

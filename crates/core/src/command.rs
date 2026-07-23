@@ -68,6 +68,15 @@ pub enum Command {
     },
     /// Toute mutation du modèle (undo-able en mode édition).
     Edit(EditOp),
+    /// Annule la dernière édition (pile de snapshots, mode Edit uniquement).
+    Undo,
+    /// Rétablit la dernière édition annulée (mode Edit uniquement).
+    Redo,
+    /// Arme la capture MIDI learn : le prochain message significatif est
+    /// capturé et publié à l'UI (pré-remplissage d'un binding).
+    MidiLearnStart,
+    /// Désarme la capture MIDI learn.
+    MidiLearnCancel,
     ShowSave,
     ShowSaveAs {
         name: String,

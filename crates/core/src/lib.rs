@@ -266,6 +266,22 @@ mod tests {
         }
     }
 
+    /// Undo/redo et MIDI learn : format JSON figé (contrat public).
+    #[test]
+    fn undo_redo_and_midi_learn_json_stable() {
+        let cases: Vec<(Command, &str)> = vec![
+            (Command::Undo, r#"{"cmd":"undo"}"#),
+            (Command::Redo, r#"{"cmd":"redo"}"#),
+            (Command::MidiLearnStart, r#"{"cmd":"midi_learn_start"}"#),
+            (Command::MidiLearnCancel, r#"{"cmd":"midi_learn_cancel"}"#),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(serde_json::to_string(&cmd).expect("ser"), want);
+            let back: Command = serde_json::from_str(want).expect("de");
+            assert_eq!(back, cmd);
+        }
+    }
+
     #[test]
     fn command_source_artnet_spelling() {
         let json = serde_json::to_string(&Source::ArtNet).expect("ser");
