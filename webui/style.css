@@ -63,9 +63,14 @@ html, body {
 
 body {
   display: grid;
+  /* minmax(0, 1fr) : sans lui, la piste prend la largeur min-content du header
+     (onglets insécables) et toute l'app déborde horizontalement. */
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto 1fr;
   overflow: hidden;
 }
+header, #main { min-width: 0; }
+header nav { min-width: 0; }
 
 ::selection { background: var(--accent-glow); }
 
@@ -907,7 +912,11 @@ table.grid button { min-height: 26px; padding: 3px 9px; font-size: 12.5px; }
 
 @media (max-width: 1100px) {
   #live, #mapping, .two-col { grid-template-columns: 1fr; }
-  #cuelist-panel { grid-row: auto; max-height: 45vh; }
+  /* Une colonne : la cuelist d'abord (c'est elle, la conduite), moniteurs bornés. */
+  #live { display: flex; flex-direction: column; }
+  #cuelist-panel { grid-row: auto; flex: none; max-height: 45vh; min-height: 220px; }
+  #live-right { flex: none; overflow: visible; }
+  .preview-wrap img { max-height: 30vh; width: auto; max-width: 100%; margin: 0 auto; }
 }
 
 /* -------------------------------------------------------------- infobulle */
