@@ -2,11 +2,12 @@
 //! trames de la console lumière, répond aux ArtPoll et publie des
 //! [`Command::ParamSet`] via le canal de commandes du moteur.
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use conduite_core::{Command, PatchTable, Source};
 use crossbeam_channel::{Receiver, Sender};
@@ -19,6 +20,78 @@ use crate::packet::{build_artpoll_reply, parse_artdmx, parse_artpoll};
 const RECV_BUF: usize = 1024;
 /// Timeout de lecture : borne la latence d'arrêt et de mise à jour du patch.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// Au plus une ArtPollReply par source et par seconde : sans limite, le nœud
+/// est un réflecteur/amplificateur UDP (~17×) pour un flood d'ArtPoll à
+/// adresse source usurpée.
+const POLL_REPLY_WINDOW: Duration = Duration::from_secs(1);
+/// Sources suivies au maximum par le limiteur — les adresses source UDP sont
+/// usurpables à volonté : la table doit rester bornée en mémoire.
+const MAX_POLL_SOURCES: usize = 64;
+
+/// Limiteur de débit des ArtPollReply, par adresse source. Logique pure
+/// (horloge injectée), mémoire bornée : table pleine ⇒ purge des entrées
+/// expirées, et refus si tout est encore « chaud ».
+struct PollReplyLimiter {
+    last_reply: HashMap<SocketAddr, Instant>,
+}
+
+impl PollReplyLimiter {
+    fn new() -> Self {
+        PollReplyLimiter {
+            last_reply: HashMap::new(),
+        }
+    }
+
+    /// Peut-on répondre à `from` à l'instant `now` ?
+    fn allow(&mut self, from: SocketAddr, now: Instant) -> bool {
+        if let Some(last) = self.last_reply.get(&from) {
+            if now.duration_since(*last) < POLL_REPLY_WINDOW {
+                return false;
+            }
+        } else if self.last_reply.len() >= MAX_POLL_SOURCES {
+            self.last_reply
+                .retain(|_, t| now.duration_since(*t) < POLL_REPLY_WINDOW);
+            if self.last_reply.len() >= MAX_POLL_SOURCES {
+                // Flood de sources distinctes : on cesse de répondre plutôt
+                // que de grossir — les outils légitimes re-pollent (~2,5 s).
+                return false;
+            }
+        }
+        self.last_reply.insert(from, now);
+        true
+    }
+}
+
+/// Throttle de warn du chemin de réception (état local au thread) : au plus
+/// une émission par [`POLL_REPLY_WINDOW`], les messages tus sont comptés.
+struct WarnThrottle {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarnThrottle {
+    fn new() -> Self {
+        WarnThrottle {
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    /// `Some(n)` = émission autorisée (`n` messages tus depuis la dernière),
+    /// `None` = se taire.
+    fn allow(&mut self, now: Instant) -> Option<u64> {
+        match self.last {
+            Some(last) if now.duration_since(last) < POLL_REPLY_WINDOW => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
 
 /// Poignée du thread nœud Art-Net. L'arrêt est propre au [`Drop`] (ou via
 /// [`ArtnetNode::shutdown`]) : drapeau + join, ≤ ~100 ms.
@@ -94,6 +167,8 @@ fn run(
 ) {
     let mut mapper = DmxMapper::default();
     let mut sequences = SequenceTracker::default();
+    let mut poll_limiter = PollReplyLimiter::new();
+    let mut gap_warns = WarnThrottle::new();
     // IP annoncée dans l'ArtPollReply : celle de la socket (0.0.0.0 si bind
     // générique — suffisant pour être listé, l'outil voit l'IP source UDP).
     let ip = match socket.local_addr() {
@@ -127,10 +202,14 @@ fn run(
                 continue;
             }
             if let Some(gap) = sequences.observe(dmx.universe, dmx.sequence) {
-                warn!(
-                    universe = dmx.universe,
-                    gap, "gros saut de séquence ArtDMX (trames perdues ?)"
-                );
+                // Débit limité : une console hostile à séquence sautante ne
+                // doit pas coûter un warn (formatage + broadcast) par trame.
+                if let Some(suppressed) = gap_warns.allow(Instant::now()) {
+                    warn!(
+                        universe = dmx.universe,
+                        gap, suppressed, "gros saut de séquence ArtDMX (trames perdues ?)"
+                    );
+                }
             }
             for cmd in mapper.apply(dmx.universe, dmx.data) {
                 if tx.send((Source::ArtNet, cmd)).is_err() {
@@ -141,10 +220,16 @@ fn run(
         } else if parse_artpoll(packet).is_some() {
             // Réponse unicast à l'émetteur du poll (les outils type
             // DMX-Workshop l'acceptent ; pas de broadcast nécessaire).
-            let reply = build_artpoll_reply(name, ip, universes);
-            match socket.send_to(&reply, from) {
-                Ok(_) => debug!(%from, "ArtPollReply envoyée"),
-                Err(e) => warn!(%e, %from, "ArtPollReply non envoyée"),
+            // Débit limité par source : sans quoi le nœud sert de
+            // réflecteur/amplificateur à un flood d'ArtPoll usurpés.
+            if poll_limiter.allow(from, Instant::now()) {
+                let reply = build_artpoll_reply(name, ip, universes);
+                match socket.send_to(&reply, from) {
+                    Ok(_) => debug!(%from, "ArtPollReply envoyée"),
+                    Err(e) => warn!(%e, %from, "ArtPollReply non envoyée"),
+                }
+            } else {
+                debug!(%from, "ArtPoll ignoré (limite de débit par source)");
             }
         } else {
             debug!(len, %from, "trame Art-Net ignorée (opcode non géré)");
@@ -300,6 +385,59 @@ mod tests {
         node.shutdown();
     }
 
+    /// Limiteur pur : 1 réponse/s par source, sources indépendantes, purge.
+    #[test]
+    fn poll_reply_limiter_is_one_per_second_per_source() {
+        let mut l = PollReplyLimiter::new();
+        let a: SocketAddr = "10.0.0.1:6454".parse().expect("addr");
+        let b: SocketAddr = "10.0.0.2:6454".parse().expect("addr");
+        let t0 = Instant::now();
+
+        assert!(l.allow(a, t0), "première réponse à A");
+        assert!(!l.allow(a, t0 + Duration::from_millis(10)), "A refloodé : silence");
+        assert!(!l.allow(a, t0 + Duration::from_millis(900)), "toujours dans la fenêtre");
+        assert!(l.allow(b, t0 + Duration::from_millis(20)), "B indépendant de A");
+        assert!(l.allow(a, t0 + Duration::from_millis(1_001)), "fenêtre écoulée : A resservi");
+    }
+
+    /// Table pleine + sources usurpées toutes distinctes : mémoire bornée et
+    /// refus de répondre, puis reprise quand les entrées expirent.
+    #[test]
+    fn poll_reply_limiter_memory_is_bounded_under_spoofed_flood() {
+        let mut l = PollReplyLimiter::new();
+        let t0 = Instant::now();
+        for i in 0..(MAX_POLL_SOURCES * 4) {
+            let from: SocketAddr = format!("10.1.{}.{}:6454", i / 256, i % 256)
+                .parse()
+                .expect("addr");
+            l.allow(from, t0);
+        }
+        assert!(
+            l.last_reply.len() <= MAX_POLL_SOURCES,
+            "table non bornée : {} sources",
+            l.last_reply.len()
+        );
+        // Table saturée d'entrées « chaudes » : nouvelle source refusée.
+        let fresh: SocketAddr = "10.9.9.9:6454".parse().expect("addr");
+        assert!(!l.allow(fresh, t0 + Duration::from_millis(500)));
+        // Après expiration de la fenêtre : purge et reprise du service.
+        assert!(l.allow(fresh, t0 + Duration::from_millis(1_100)));
+        assert!(l.last_reply.len() <= MAX_POLL_SOURCES);
+    }
+
+    /// Throttle de warn : premier passe, flood tu et compté, fenêtre rouverte.
+    #[test]
+    fn warn_throttle_counts_suppressed() {
+        let mut w = WarnThrottle::new();
+        let t0 = Instant::now();
+        assert_eq!(w.allow(t0), Some(0));
+        for i in 1..100u64 {
+            assert_eq!(w.allow(t0 + Duration::from_millis(i)), None);
+        }
+        assert_eq!(w.allow(t0 + Duration::from_millis(1_500)), Some(99));
+        assert_eq!(w.allow(t0 + Duration::from_millis(3_000)), Some(0));
+    }
+
     /// Le nœud répond à un ArtPoll par une ArtPollReply adressée à l'émetteur.
     #[test]
     fn node_replies_to_artpoll() {
@@ -330,6 +468,30 @@ mod tests {
         assert_eq!(u16::from_le_bytes([reply[8], reply[9]]), OP_POLL_REPLY);
         assert_eq!(&reply[26..39], b"Conduite poll");
         assert_eq!(reply[173], 2, "deux univers écoutés = deux ports");
+
+        // Anti-réflecteur : un second poll de la MÊME source dans la seconde
+        // ne reçoit aucune réponse…
+        console
+            .send_to(&build_artpoll(), node.local_addr())
+            .expect("send poll 2");
+        console
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout court");
+        assert!(
+            console.recv_from(&mut buf).is_err(),
+            "poll refloodé : le nœud ne doit pas répondre dans la fenêtre"
+        );
+
+        // … mais une AUTRE source (autre port) est servie immédiatement.
+        let console2 = UdpSocket::bind(localhost_ephemeral()).expect("console 2");
+        console2
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        console2
+            .send_to(&build_artpoll(), node.local_addr())
+            .expect("send poll 3");
+        let (len2, _) = console2.recv_from(&mut buf).expect("reply pour l'autre source");
+        assert_eq!(len2, crate::packet::POLL_REPLY_LEN);
 
         node.shutdown();
     }

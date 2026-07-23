@@ -26,6 +26,7 @@ type GlTexture = <Gl as HasContext>::Texture;
 type GlFramebuffer = <Gl as HasContext>::Framebuffer;
 type GlVertexArray = <Gl as HasContext>::VertexArray;
 type GlUniformLocation = <Gl as HasContext>::UniformLocation;
+type GlBuffer = <Gl as HasContext>::Buffer;
 
 /// Taille par défaut du rendu ISF quand `RENDERSIZE` n'a pas (encore) été
 /// fourni par `app`.
@@ -53,11 +54,38 @@ struct MaterialSlot {
     uniforms: Vec<(String, ParamValue)>,
 }
 
+/// Ring de 2 PBO `GL_PIXEL_UNPACK_BUFFER` : l'upload d'une frame passe par
+/// un buffer orphané puis rempli (`glBufferData(NULL)` + `glBufferSubData`),
+/// et `glTexSubImage2D` lit depuis le PBO — le transfert vers la texture
+/// devient asynchrone côté driver au lieu d'une copie client synchrone.
+/// Disponible en GL 3.3 core ET GLES 3.0.
+struct UploadRing {
+    bufs: [GlBuffer; 2],
+    /// Index du PBO utilisé pour le prochain upload.
+    next: usize,
+}
+
+/// Double PBO `GL_PIXEL_PACK_BUFFER` pour la lecture préview : `glReadPixels`
+/// est lancé vers un PBO (retour immédiat, pas de vidage du pipeline) et on
+/// relit la frame N-1 depuis l'autre PBO — latence d'une frame préview,
+/// zéro stall. Un canal par flux (program / standby).
+struct ReadbackChannel {
+    bufs: [GlBuffer; 2],
+    /// Index du PBO qui recevra la lecture de CETTE frame.
+    write: usize,
+    /// Une lecture a-t-elle déjà été lancée dans ce PBO ?
+    primed: [bool; 2],
+    w: u32,
+    h: u32,
+}
+
 /// Un deck (A ou B) d'un slice : texture vidéo + matériau optionnel.
 #[derive(Default)]
 struct DeckRes {
     video: Option<Tex2d>,
     material: Option<MaterialSlot>,
+    /// PBO d'upload — créés au premier upload, `None` si PBO indisponibles.
+    upload: Option<UploadRing>,
 }
 
 /// Ressources GPU d'un slice.
@@ -107,6 +135,10 @@ pub struct Compositor {
     isf_cache: ProgramCache<IsfProgram>,
     /// FBO de préview (MJPEG) — retaillé à la demande.
     preview: Option<RenderTarget>,
+    /// Canaux de lecture préview asynchrone (double PBO), par flux.
+    readbacks: HashMap<u32, ReadbackChannel>,
+    /// Création de PBO en échec : replis synchrones, loggé une seule fois.
+    pbo_broken: bool,
     /// Framebuffer cible courant (None = framebuffer par défaut).
     current_target: Option<GlFramebuffer>,
     /// Scratch de tri par z, réutilisé chaque frame.
@@ -180,6 +212,8 @@ impl Compositor {
             slices: HashMap::new(),
             isf_cache: ProgramCache::default(),
             preview: None,
+            readbacks: HashMap::new(),
+            pbo_broken: false,
             current_target: None,
             z_indices: Vec::with_capacity(32),
         })
@@ -207,8 +241,10 @@ impl Compositor {
     }
 
     /// Upload d'une frame décodée dans la texture du deck. La texture est
-    /// réutilisée (`glTexSubImage2D`) et réallouée seulement si les
-    /// dimensions changent.
+    /// réutilisée et réallouée seulement si les dimensions changent. Le
+    /// chemin nominal passe par un ring de 2 PBO orphanés (transfert
+    /// asynchrone côté driver, pas de copie client bloquante) ; repli en
+    /// `glTexSubImage2D` direct si les PBO sont indisponibles.
     pub fn upload_frame(&mut self, slice: SliceId, deck: DeckSlot, f: &FrameRgba) {
         let expected = (f.width as usize) * (f.height as usize) * 4;
         if f.width == 0 || f.height == 0 || f.data.len() < expected {
@@ -224,13 +260,14 @@ impl Compositor {
         let Some(res) = self.slices.get_mut(&slice) else {
             return;
         };
-        let deck = &mut res.decks[deck.index()];
-        let Some(tex) = deck.video.as_mut() else {
+        let deck_res = &mut res.decks[deck.index()];
+        let Some(tex) = deck_res.video.as_mut() else {
             return; // création ratée, déjà loggé
         };
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex.id));
             if tex.w != f.width || tex.h != f.height {
+                // Réallocation (dimensions changées) : chemin rare, direct.
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -244,7 +281,37 @@ impl Compositor {
                 );
                 tex.w = f.width;
                 tex.h = f.height;
+            } else if let Some(ring) =
+                ensure_upload_ring(gl, &mut deck_res.upload, &mut self.pbo_broken)
+            {
+                // Chemin nominal : PBO orphané puis rempli, glTexSubImage2D
+                // lit depuis le buffer — le transfert devient asynchrone.
+                let buf = ring.bufs[ring.next];
+                ring.next ^= 1;
+                gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(buf));
+                // Orphaning : stockage neuf sans attendre le transfert du
+                // cycle précédent (le driver recycle en interne).
+                gl.buffer_data_size(
+                    glow::PIXEL_UNPACK_BUFFER,
+                    expected as i32,
+                    glow::STREAM_DRAW,
+                );
+                gl.buffer_sub_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, 0, &f.data[..expected]);
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    f.width as i32,
+                    f.height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::BufferOffset(0),
+                );
+                gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
             } else {
+                // Repli sans PBO : copie client synchrone (comportement
+                // historique, toujours correct).
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -333,6 +400,112 @@ impl Compositor {
         Ok(())
     }
 
+    /// Préchauffe le cache de programmes ISF : compile tous les matériaux
+    /// fournis qui ne sont pas déjà en cache. À appeler au chargement du show
+    /// ou au passage en mode Show, pendant que rien ne joue — en spectacle,
+    /// `set_material` ne fait alors que des hits de cache (jamais de
+    /// `glCompileShader` sur le thread de rendu pendant un GO).
+    ///
+    /// Un matériau en échec n'empêche pas la compilation des suivants : les
+    /// erreurs (log GLSL complet) sont collectées et retournées pour l'UI.
+    pub fn prewarm(
+        &mut self,
+        materials: &[(MaterialId, &IsfSources)],
+    ) -> Vec<(MaterialId, CompositorError)> {
+        let mut errors = Vec::new();
+        let mut compiled = 0u32;
+        for (id, sources) in materials {
+            if self.isf_cache.contains(*id) {
+                continue;
+            }
+            let gl = &self.gl;
+            match self.isf_cache.ensure(*id, || compile_isf_program(gl, sources)) {
+                Ok(_) => compiled += 1,
+                Err(e) => errors.push((*id, e)),
+            }
+        }
+        tracing::info!(
+            target: "compositor",
+            demandes = materials.len(),
+            compiles = compiled,
+            echecs = errors.len(),
+            "préchauffage des programmes ISF"
+        );
+        errors
+    }
+
+    /// Détache le matériau d'un deck sans exiger les sources ISF : le FBO du
+    /// matériau est libéré, la texture vidéo redevient le contenu servi. Le
+    /// programme compilé reste en cache (partagé entre slices). Contrairement
+    /// à `set_material(.., None, ..)`, ne crée pas le slice s'il n'existe pas.
+    pub fn detach_material(&mut self, slice: SliceId, deck: DeckSlot) {
+        let Some(res) = self.slices.get_mut(&slice) else {
+            return;
+        };
+        if let Some(slot) = res.decks[deck.index()].material.take() {
+            if let Some(target) = slot.target {
+                release_target(&self.gl, target);
+            }
+            tracing::debug!(target: "compositor", slice, "matériau détaché");
+        }
+    }
+
+    /// Détache les matériaux de TOUS les decks de TOUS les slices (FBO
+    /// libérés, programmes conservés en cache). À appeler à l'installation
+    /// d'un show / undo / redo, AVANT de vider l'état `material_bound` côté
+    /// app — sinon l'ancien shader reste affiché à la place de la vidéo
+    /// (matériau fantôme) et son FBO fuit.
+    pub fn detach_all_materials(&mut self) {
+        for (&slice, res) in self.slices.iter_mut() {
+            for deck in &mut res.decks {
+                if let Some(slot) = deck.material.take() {
+                    if let Some(target) = slot.target {
+                        release_target(&self.gl, target);
+                    }
+                    tracing::debug!(target: "compositor", slice, "matériau détaché");
+                }
+            }
+        }
+    }
+
+    /// Invalide le programme compilé d'un matériau (suppression GL incluse) :
+    /// le prochain `set_material` recompilera. À appeler sur MaterialRemove.
+    pub fn invalidate_material(&mut self, material: MaterialId) {
+        if let Some(old) = self.isf_cache.invalidate(material) {
+            unsafe { self.gl.delete_program(old.program) };
+            tracing::debug!(target: "compositor", material, "programme ISF invalidé");
+        }
+    }
+
+    /// Ne conserve en cache que les programmes des matériaux listés ; les
+    /// programmes GL des matériaux disparus sont supprimés. À appeler à
+    /// l'installation d'un show pour ne pas accumuler de programmes orphelins
+    /// en VRAM pendant toute la vie du process.
+    pub fn retain_materials(&mut self, keep: &[MaterialId]) {
+        let evicted = self.isf_cache.retain(keep);
+        let count = evicted.len();
+        for old in evicted {
+            unsafe { self.gl.delete_program(old.program) };
+        }
+        if count > 0 {
+            tracing::info!(target: "compositor", evinces = count, "programmes ISF élagués");
+        }
+    }
+
+    /// Élague les slices absents de `keep` : textures vidéo, PBO d'upload et
+    /// FBO matériaux des slices disparus sont libérés. À appeler après
+    /// SliceRemove et à l'installation d'un show — sans cet appel, chaque
+    /// slice supprimé laisse ses textures pleine résolution en VRAM à vie.
+    pub fn prune_slices(&mut self, keep: &[SliceId]) {
+        let dead = crate::keys_not_kept(self.slices.keys().copied(), keep);
+        for id in dead {
+            if let Some(res) = self.slices.remove(&id) {
+                release_slice(&self.gl, res);
+                tracing::debug!(target: "compositor", slice = id, "slice élagué");
+            }
+        }
+    }
+
     /// Pousse des valeurs d'uniforms pour le matériau d'un deck (par nom,
     /// types F/B/I/Color/P2 ; TIME/RENDERSIZE/FRAMEINDEX sont fournis par
     /// `app` par le même canal). Appliquées au prochain rendu.
@@ -359,7 +532,24 @@ impl Compositor {
     pub fn render_output(&mut self, out: &OutputView) -> Result<(), CompositorError> {
         // 1. Passes matériaux offscreen (avant de toucher au framebuffer cible).
         self.render_material_passes(out)?;
+        self.render_composite(out)
+    }
 
+    /// Variante sans passes ISF : compose en réutilisant les FBO matériaux
+    /// déjà remplis dans ce tick par un `render_output` précédent (mêmes
+    /// uniforms pour toutes les vues). Chemin préview : évite de re-payer
+    /// chaque matériau à pleine résolution (RENDERSIZE sortie) pour une cible
+    /// 640×360. Ne l'appeler que si `render_output` a tourné ce tick.
+    pub fn render_output_cached_materials(
+        &mut self,
+        out: &OutputView,
+    ) -> Result<(), CompositorError> {
+        self.render_composite(out)
+    }
+
+    /// Composition des slices dans le framebuffer courant (partie commune de
+    /// `render_output` / `render_output_cached_materials`).
+    fn render_composite(&mut self, out: &OutputView) -> Result<(), CompositorError> {
         let gl = &self.gl;
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, self.current_target);
@@ -512,6 +702,10 @@ impl Compositor {
     /// Lit les pixels RGBA de la préview (FBO dédié, dimensions
     /// paramétrables) pour le flux MJPEG, puis rétablit le framebuffer par
     /// défaut. À appeler après `bind_preview` + `render_output`.
+    ///
+    /// ATTENTION : `glReadPixels` vers la mémoire client vide TOUT le
+    /// pipeline (stall GPU complet). Préférer
+    /// [`Compositor::read_preview_rgba_async`] sur le thread de rendu.
     pub fn read_preview_rgba(&mut self, w: u32, h: u32) -> Vec<u8> {
         let w = w.max(1);
         let h = h.max(1);
@@ -542,6 +736,133 @@ impl Compositor {
         self.current_target = None;
         unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
         pixels
+    }
+
+    /// Lecture asynchrone de la préview via double PBO : `glReadPixels` est
+    /// lancé vers un PBO (retour immédiat, aucun vidage du pipeline) et la
+    /// frame lue au tick préview PRÉCÉDENT du même `channel` est copiée dans
+    /// `out` — latence d'une frame préview, invisible pour un MJPEG 8 fps,
+    /// zéro stall du thread de rendu. Rétablit le framebuffer par défaut.
+    ///
+    /// - un `channel` PAR FLUX (program, standby) : partager un canal entre
+    ///   deux flux mélangerait leurs images ;
+    /// - retourne `false` tant qu'aucune frame N-1 n'est disponible (premier
+    ///   tick, changement de dimensions) : l'appelant saute l'envoi ;
+    /// - `out` est réutilisé entre les appels (aucune allocation en régime
+    ///   établi) ;
+    /// - repli synchrone transparent si les PBO sont indisponibles.
+    ///
+    /// À appeler après `bind_preview` + `render_output` aux mêmes dimensions.
+    pub fn read_preview_rgba_async(
+        &mut self,
+        channel: u32,
+        w: u32,
+        h: u32,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let w = w.max(1);
+        let h = h.max(1);
+        let fbo = match &self.preview {
+            Some(t) if t.tex.w == w && t.tex.h == h => t.fbo,
+            _ => {
+                tracing::warn!(
+                    target: "compositor",
+                    w, h,
+                    "read_preview_rgba_async sans bind_preview préalable aux mêmes dimensions"
+                );
+                self.current_target = None;
+                unsafe { self.gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+                return false;
+            }
+        };
+
+        // Repli synchrone : PBO indisponibles sur ce driver.
+        if self.pbo_broken {
+            let pixels = self.read_preview_rgba(w, h);
+            out.clear();
+            out.extend_from_slice(&pixels);
+            return true;
+        }
+
+        let size = (w as usize) * (h as usize) * 4;
+
+        // (Re)création du canal si absent ou aux mauvaises dimensions.
+        let stale = self
+            .readbacks
+            .get(&channel)
+            .is_some_and(|ch| ch.w != w || ch.h != h);
+        if stale {
+            if let Some(ch) = self.readbacks.remove(&channel) {
+                for buf in ch.bufs {
+                    unsafe { self.gl.delete_buffer(buf) };
+                }
+            }
+        }
+        if !self.readbacks.contains_key(&channel) {
+            match create_readback_channel(&self.gl, w, h, size) {
+                Ok(ch) => {
+                    self.readbacks.insert(channel, ch);
+                }
+                Err(e) => {
+                    self.pbo_broken = true;
+                    tracing::warn!(
+                        target: "compositor",
+                        %e,
+                        "PBO indisponibles, lecture préview synchrone"
+                    );
+                    let pixels = self.read_preview_rgba(w, h);
+                    out.clear();
+                    out.extend_from_slice(&pixels);
+                    return true;
+                }
+            }
+        }
+
+        let gl = &self.gl;
+        let Some(ch) = self.readbacks.get_mut(&channel) else {
+            return false; // inatteignable : inséré juste au-dessus
+        };
+        let mut got = false;
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+
+            // 1. Lecture de CETTE frame vers le PBO d'écriture : non bloquant,
+            //    le transfert se fait en tâche de fond côté driver.
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(ch.bufs[ch.write]));
+            gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::BufferOffset(0),
+            );
+            ch.primed[ch.write] = true;
+
+            // 2. Relecture de la frame N-1 depuis l'autre PBO : le transfert
+            //    a eu un tick préview complet pour se terminer, le map ne
+            //    bloque pas.
+            let read = ch.write ^ 1;
+            if ch.primed[read] {
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(ch.bufs[read]));
+                let ptr =
+                    gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, size as i32, glow::MAP_READ_BIT);
+                if !ptr.is_null() {
+                    out.clear();
+                    out.extend_from_slice(std::slice::from_raw_parts(ptr, size));
+                    got = true;
+                }
+                gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+            }
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            ch.write = read;
+        }
+
+        // Retour au framebuffer par défaut pour les rendus suivants.
+        self.current_target = None;
+        unsafe { self.gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+        got
     }
 
     // ------------------------------------------------------------- interne
@@ -862,4 +1183,83 @@ fn release_target(gl: &Gl, target: RenderTarget) {
         gl.delete_framebuffer(target.fbo);
         gl.delete_texture(target.tex.id);
     }
+}
+
+/// Libère toutes les ressources GL d'un slice élagué (textures vidéo, PBO
+/// d'upload, FBO matériaux).
+fn release_slice(gl: &Gl, res: SliceRes) {
+    for deck in res.decks {
+        if let Some(tex) = deck.video {
+            unsafe { gl.delete_texture(tex.id) };
+        }
+        if let Some(ring) = deck.upload {
+            for buf in ring.bufs {
+                unsafe { gl.delete_buffer(buf) };
+            }
+        }
+        if let Some(slot) = deck.material {
+            if let Some(target) = slot.target {
+                release_target(gl, target);
+            }
+        }
+    }
+}
+
+/// Crée une paire de PBO (upload ou readback, la cible est posée à l'usage).
+fn create_pbo_pair(gl: &Gl) -> Result<[GlBuffer; 2], String> {
+    unsafe {
+        let a = gl.create_buffer()?;
+        match gl.create_buffer() {
+            Ok(b) => Ok([a, b]),
+            Err(e) => {
+                gl.delete_buffer(a);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Garantit le ring de PBO d'upload d'un deck. Retourne `None` si la
+/// création a échoué (repli synchrone) ; l'échec n'est tenté qu'une fois par
+/// process (`broken`), pas de spam de log par frame.
+fn ensure_upload_ring<'a>(
+    gl: &Gl,
+    slot: &'a mut Option<UploadRing>,
+    broken: &mut bool,
+) -> Option<&'a mut UploadRing> {
+    if slot.is_none() && !*broken {
+        match create_pbo_pair(gl) {
+            Ok(bufs) => *slot = Some(UploadRing { bufs, next: 0 }),
+            Err(e) => {
+                *broken = true;
+                tracing::warn!(target: "compositor", %e, "PBO indisponibles, uploads synchrones");
+            }
+        }
+    }
+    slot.as_mut()
+}
+
+/// Crée un canal de lecture préview : deux PBO `GL_PIXEL_PACK_BUFFER`
+/// dimensionnés pour `w`×`h` RGBA (stockage alloué une fois, `STREAM_READ`).
+fn create_readback_channel(
+    gl: &Gl,
+    w: u32,
+    h: u32,
+    size: usize,
+) -> Result<ReadbackChannel, String> {
+    let bufs = create_pbo_pair(gl)?;
+    unsafe {
+        for buf in bufs {
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buf));
+            gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, size as i32, glow::STREAM_READ);
+        }
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+    }
+    Ok(ReadbackChannel {
+        bufs,
+        write: 0,
+        primed: [false, false],
+        w,
+        h,
+    })
 }

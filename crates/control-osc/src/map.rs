@@ -10,12 +10,20 @@ use conduite_core::{Command, CueNumber, ParamValue, Source};
 use rosc::OscType;
 use tracing::warn;
 
+use crate::ratelimit::{now_ms, WarnLimiter};
+
 /// Adresse du paramètre piloté par `/conduite/master`.
 const MASTER_ADDR: &str = "master/intensity";
 
+/// Limiteurs de warn du chemin de réception : un flood UDP d'adresses
+/// inconnues ou d'arguments invalides ne coûte au plus qu'un log par seconde
+/// et par catégorie (le nombre de messages tus est publié au warn suivant).
+static UNKNOWN_ADDR_WARNS: WarnLimiter = WarnLimiter::new();
+static REJECT_WARNS: WarnLimiter = WarnLimiter::new();
+
 /// Traduit une adresse + arguments OSC en [`Command`]. Pure et totale :
-/// un message inconnu ou mal formé retourne `None` (tracé en warn, visible
-/// dans le journal) — l'OSC ne plante jamais la régie.
+/// un message inconnu ou mal formé retourne `None` (tracé en warn, à débit
+/// limité — 1/s max) — l'OSC ne plante jamais la régie.
 pub fn map_message(addr: &str, args: &[OscType]) -> Option<Command> {
     match addr {
         "/conduite/cue/go" => Some(Command::CueGo),
@@ -58,15 +66,19 @@ pub fn map_message(addr: &str, args: &[OscType]) -> Option<Command> {
                     None => reject(addr, "attendu : valeur (float)"),
                 };
             }
-            warn!(%addr, "adresse OSC inconnue : message ignoré");
+            if let Some(suppressed) = UNKNOWN_ADDR_WARNS.allow(now_ms()) {
+                warn!(%addr, suppressed, "adresse OSC inconnue : message ignoré");
+            }
             None
         }
     }
 }
 
-/// Trace le rejet d'un message mal formé et retourne `None`.
+/// Trace le rejet d'un message mal formé (débit limité) et retourne `None`.
 fn reject(addr: &str, detail: &str) -> Option<Command> {
-    warn!(%addr, detail, "message OSC ignoré : arguments invalides");
+    if let Some(suppressed) = REJECT_WARNS.allow(now_ms()) {
+        warn!(%addr, detail, suppressed, "message OSC ignoré : arguments invalides");
+    }
     None
 }
 

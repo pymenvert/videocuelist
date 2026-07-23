@@ -138,8 +138,10 @@ impl Gfx {
     }
 
     /// Rend toutes les sorties : make_current par fenêtre, composition,
-    /// swap (vsync sur la première uniquement). `on_presented` sert aux
-    /// compteurs FPS par sortie.
+    /// swap. Les fenêtres SANS vsync sont rendues et swappées D'ABORD, la
+    /// fenêtre vsync en DERNIER : son `swap_buffers` peut bloquer jusqu'au
+    /// vblank (~16 ms) et ne doit jamais retarder la présentation des
+    /// autres sorties. `on_presented` sert aux compteurs FPS par sortie.
     pub fn render_outputs(
         &mut self,
         plans: &HashMap<OutputId, Vec<SliceDraw>>,
@@ -149,7 +151,12 @@ impl Gfx {
     ) {
         let Some(gl) = self.gl.as_mut() else { return };
         static EMPTY: &[SliceDraw] = &[];
-        for win in &gl.windows {
+        let order: Vec<usize> = (0..gl.windows.len())
+            .filter(|i| !gl.windows[*i].vsync)
+            .chain((0..gl.windows.len()).filter(|i| gl.windows[*i].vsync))
+            .collect();
+        for i in order {
+            let win = &gl.windows[i];
             if let Err(e) = gl.context.make_current(&win.surface) {
                 warn!(target: "app::gfx", output = win.output, error = %e, "make_current");
                 continue;
@@ -169,7 +176,6 @@ impl Gfx {
                 gl.render_err_logged = true;
                 continue;
             }
-            let _ = win.vsync; // l'intervalle de swap est posé à la création
             if let Err(e) = win.surface.swap_buffers(&gl.context) {
                 warn!(target: "app::gfx", output = win.output, error = %e, "swap_buffers");
             }
@@ -177,23 +183,37 @@ impl Gfx {
         }
     }
 
-    /// Rend la vue de préview dans le FBO dédié et lit les pixels RGBA
-    /// (lignes de bas en haut — à retourner à l'encodage JPEG).
-    pub fn render_preview(
+    /// Rend la vue de préview dans le FBO dédié et lit les pixels RGBA dans
+    /// `out` (lignes de bas en haut — à retourner à l'encodage JPEG) via la
+    /// lecture asynchrone double-PBO du compositor : aucun stall du pipeline,
+    /// la frame livrée est celle du tick préview PRÉCÉDENT du même `channel`
+    /// (un canal PAR FLUX : program / standby).
+    ///
+    /// `cached_materials` : composer en réutilisant les FBO matériaux déjà
+    /// remplis ce tick par `render_outputs` (chemin préview normal) au lieu
+    /// de re-payer chaque passe ISF à pleine résolution.
+    ///
+    /// Retourne `false` tant qu'aucune frame n'est disponible (premier tick,
+    /// redimensionnement, échec de rendu) : l'appelant saute l'envoi.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_preview_into(
         &mut self,
+        channel: u32,
         width: u32,
         height: u32,
         slices: &[SliceDraw],
         master: f32,
         dbo: f32,
-    ) -> Option<Vec<u8>> {
+        cached_materials: bool,
+        out: &mut Vec<u8>,
+    ) -> bool {
         if !self.make_root_current() {
-            return None;
+            return false;
         }
-        let gl = self.gl.as_mut()?;
+        let Some(gl) = self.gl.as_mut() else { return false };
         if let Err(e) = gl.compositor.bind_preview(width, height) {
             warn!(target: "app::gfx", error = %e, "FBO de préview impossible");
-            return None;
+            return false;
         }
         let view = OutputView {
             output_size: (width, height),
@@ -201,11 +221,16 @@ impl Gfx {
             dbo,
             slices,
         };
-        if let Err(e) = gl.compositor.render_output(&view) {
+        let rendered = if cached_materials {
+            gl.compositor.render_output_cached_materials(&view)
+        } else {
+            gl.compositor.render_output(&view)
+        };
+        if let Err(e) = rendered {
             warn!(target: "app::gfx", error = %e, "rendu préview en échec");
-            return None;
+            return false;
         }
-        Some(gl.compositor.read_preview_rgba(width, height))
+        gl.compositor.read_preview_rgba_async(channel, width, height, out)
     }
 }
 
@@ -214,13 +239,28 @@ fn init_gl(el: &ActiveEventLoop, first: &OutputCfg) -> anyhow::Result<GlState> {
     let attrs = window_attributes(el, first);
     let template = ConfigTemplateBuilder::new();
     let builder = DisplayBuilder::new().with_window_attributes(Some(attrs));
-    let (window, config) = builder
-        .build(el, template, |mut configs| {
+    // Le picker de `DisplayBuilder::build` DOIT retourner une `Config` : il
+    // ne peut pas échouer proprement quand l'itérateur est vide (session
+    // RDP, EGL headless, driver exotique — glutin ne garantit PAS une
+    // config). On capture donc la panique pour la convertir en erreur : le
+    // chemin « échec d'init GL → bascule headless » promis en tête de module
+    // s'applique au lieu d'un crash au lancement le soir du spectacle.
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        builder.build(el, template, |mut configs| {
             configs
                 .next()
-                .expect("glutin garantit au moins une config compatible")
+                .expect("aucune config GL compatible sur cette machine")
         })
-        .map_err(|e| anyhow::anyhow!("création display/fenêtre GL : {e}"))?;
+    }));
+    let (window, config) = match built {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("création display/fenêtre GL : {e}")),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "aucune config GL compatible (itérateur de configs vide)"
+            ))
+        }
+    };
     let window = window.ok_or_else(|| anyhow::anyhow!("fenêtre GL absente"))?;
     let display = config.display();
 

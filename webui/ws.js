@@ -1,5 +1,8 @@
 /* Conduite — couche WebSocket : reconnexion automatique avec backoff,
-   bandeau "reconnexion…", ping périodique. Aucune dépendance. */
+   bandeau "reconnexion…", ping périodique + watchdog de pong (une socket
+   half-open — Wi-Fi qui décroche, câble débranché côté switch — reste OPEN
+   sans jamais rien recevoir : on la ferme de force pour déclencher la
+   reconnexion et le bandeau). Aucune dépendance. */
 'use strict';
 
 window.Conduite = window.Conduite || {};
@@ -8,8 +11,11 @@ Conduite.ws = (function () {
   var sock = null;
   var backoff = 500;          // ms, doublé à chaque échec, plafonné
   var BACKOFF_MAX = 8000;
+  var PING_PERIOD = 10000;    // ms entre deux pings
+  var PONG_TIMEOUT = 5000;    // ms sans AUCUN message après un ping = liaison morte
   var closedByUs = false;
   var pingTimer = null;
+  var lastRx = 0;             // horodatage du dernier message reçu (pong compris)
   var listeners = { open: [], message: [], close: [] };
 
   function banner(show) {
@@ -35,11 +41,26 @@ Conduite.ws = (function () {
     sock.onopen = function () {
       backoff = 500;
       banner(false);
+      lastRx = Date.now();
       if (pingTimer) { clearInterval(pingTimer); }
-      pingTimer = setInterval(function () { send({ type: 'ping' }); }, 10000);
+      pingTimer = setInterval(function () {
+        var s = sock;
+        var sentAt = Date.now();
+        send({ type: 'ping' });
+        setTimeout(function () {
+          /* Watchdog : rien reçu depuis l'envoi du ping (même pas le pong)
+             sur la MÊME socket -> half-open, on force la fermeture pour
+             déclencher onclose -> bandeau + reconnexion avec backoff. */
+          if (s === sock && sock && sock.readyState === WebSocket.OPEN && lastRx < sentAt) {
+            console.warn('Conduite.ws : pas de pong en ' + (PONG_TIMEOUT / 1000) + ' s — reconnexion forcée');
+            try { sock.close(); } catch (e2) { /* déjà fermée */ }
+          }
+        }, PONG_TIMEOUT);
+      }, PING_PERIOD);
       emit('open');
     };
     sock.onmessage = function (e) {
+      lastRx = Date.now();
       var msg = null;
       try { msg = JSON.parse(e.data); } catch (err) { return; }
       if (msg && typeof msg === 'object') { emit('message', msg); }

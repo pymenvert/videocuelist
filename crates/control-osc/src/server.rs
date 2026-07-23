@@ -16,10 +16,17 @@ use tracing::{debug, info, warn};
 
 use crate::map::map_message;
 use crate::packet::{count_bundles, flatten, MAX_BUNDLES};
+use crate::ratelimit::{now_ms, WarnLimiter};
 
 /// Période de réveil du thread de réception pour vérifier le drapeau
 /// d'arrêt (le recv bloquant est armé de ce timeout).
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Limiteurs de warn par datagramme hostile : un flood de paquets illisibles
+/// ou de bundles forgés ne coûte au plus qu'un log par seconde et par
+/// catégorie (DoS log/CPU sinon — le thread de réception doit rester dispo).
+static FORGED_BUNDLE_WARNS: WarnLimiter = WarnLimiter::new();
+static DECODE_WARNS: WarnLimiter = WarnLimiter::new();
 
 /// Serveur OSC entrant (constructeur uniquement — l'état vit dans le thread).
 pub struct OscServer;
@@ -108,7 +115,9 @@ fn handle_datagram(datagram: &[u8], from: &SocketAddr, tx: &Sender<(Source, Comm
     // Garde anti-débordement de pile : rosc décode les bundles imbriqués par
     // récursion sans limite de profondeur — on borne AVANT le décodage.
     if count_bundles(datagram) > MAX_BUNDLES {
-        warn!(%from, "paquet OSC rejeté : bundles trop imbriqués (possible attaque)");
+        if let Some(suppressed) = FORGED_BUNDLE_WARNS.allow(now_ms()) {
+            warn!(%from, suppressed, "paquet OSC rejeté : bundles trop imbriqués (possible attaque)");
+        }
         return true;
     }
     match rosc::decoder::decode_udp(datagram) {
@@ -125,7 +134,11 @@ fn handle_datagram(datagram: &[u8], from: &SocketAddr, tx: &Sender<(Source, Comm
                 }
             }
         }
-        Err(e) => warn!(%from, error = ?e, "paquet OSC illisible"),
+        Err(e) => {
+            if let Some(suppressed) = DECODE_WARNS.allow(now_ms()) {
+                warn!(%from, error = ?e, suppressed, "paquet OSC illisible");
+            }
+        }
     }
     true
 }

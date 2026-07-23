@@ -10,7 +10,8 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::CoreError;
 use crate::model::{Show, FORMAT_VERSION};
@@ -22,6 +23,8 @@ pub const SHOW_FILE: &str = "show.json";
 pub const BACKUP_DIR: &str = "backups";
 /// Nombre de backups conservés.
 pub const BACKUP_KEEP: usize = 20;
+/// Nom du fichier de verrou mono-instance (dossier portable).
+pub const LOCK_FILE: &str = "conduite.lock";
 
 /// Avertissement non bloquant émis au chargement d'un show.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,21 +58,119 @@ impl std::fmt::Display for LoadWarning {
     }
 }
 
-/// Écriture atomique ET durable d'un fichier : temporaire à côté,
+/// Chemin temporaire UNIQUE à côté du fichier cible : suffixe pid + compteur,
+/// terminé par `.tmp`. Deux instances (ou deux écritures concurrentes) ne se
+/// disputent ainsi jamais le même fichier temporaire — un nom fixe permettait
+/// à l'instance B de tronquer le tmp pendant que A le renommait.
+fn tmp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}-{n}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// `fsync` du répertoire après un rename : sur ext4/FAT (Pi, clé USB), le
+/// rename est une métadonnée non flushée — sans ce sync, une coupure secteur
+/// juste après « show sauvegardé » peut faire revenir le fichier à sa version
+/// précédente au reboot. No-op propre hors Unix (NTFS journalise, et Windows
+/// n'ouvre pas un répertoire comme un fichier).
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), CoreError> {
+    if dir.as_os_str().is_empty() {
+        return Ok(()); // chemin relatif sans parent explicite : rien à ouvrir
+    }
+    let d = fs::File::open(dir).map_err(|e| CoreError::io(dir.display().to_string(), e))?;
+    d.sync_all()
+        .map_err(|e| CoreError::io(dir.display().to_string(), e))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), CoreError> {
+    Ok(())
+}
+
+/// Écriture atomique ET durable d'un fichier : temporaire unique à côté,
 /// `sync_all` (flush disque — un Pi peut perdre le courant à tout instant,
 /// et un rename sans flush peut laisser un fichier VIDE au reboot sur
-/// ext4/FAT), puis rename par-dessus l'ancien.
+/// ext4/FAT), rename par-dessus l'ancien, puis `fsync` du répertoire parent
+/// (durabilité du rename lui-même). En cas d'échec, le temporaire est
+/// nettoyé (best-effort).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file =
-            fs::File::create(&tmp).map_err(|e| CoreError::io(tmp.display().to_string(), e))?;
-        file.write_all(bytes)
-            .map_err(|e| CoreError::io(tmp.display().to_string(), e))?;
-        file.sync_all()
-            .map_err(|e| CoreError::io(tmp.display().to_string(), e))?;
+    let tmp = tmp_path(path);
+    let write = || -> Result<(), CoreError> {
+        {
+            let mut file =
+                fs::File::create(&tmp).map_err(|e| CoreError::io(tmp.display().to_string(), e))?;
+            file.write_all(bytes)
+                .map_err(|e| CoreError::io(tmp.display().to_string(), e))?;
+            file.sync_all()
+                .map_err(|e| CoreError::io(tmp.display().to_string(), e))?;
+        }
+        fs::rename(&tmp, path).map_err(|e| CoreError::io(path.display().to_string(), e))
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp); // pas de .tmp orphelin après un échec
+        return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| CoreError::io(path.display().to_string(), e))
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Verrou mono-instance : tant que la poignée vit, aucune autre instance ne
+/// peut l'acquérir sur le même dossier. Verrou de fichier **OS** (advisory) :
+/// il disparaît automatiquement à la mort du process, crash compris — jamais
+/// de verrou orphelin. Le fichier lui-même reste sur disque (marqueur
+/// inoffensif contenant le pid, pour diagnostic).
+#[derive(Debug)]
+pub struct InstanceLock {
+    /// Tenu pour la durée de vie : fermer le fichier libère le verrou.
+    _file: fs::File,
+    path: PathBuf,
+}
+
+impl InstanceLock {
+    /// Chemin du fichier de verrou.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Tente de prendre le verrou mono-instance dans `dir` (dossier portable de
+/// l'app). À appeler au démarrage, AVANT toute écriture : deux instances qui
+/// sauvent le même show peuvent se corrompre mutuellement (backups, rescan).
+///
+/// `Err(CoreError::InstanceLocked)` si une autre instance vivante le tient —
+/// à l'appelant de refuser net le démarrage (message clair, pas de panic).
+pub fn acquire_instance_lock(dir: &Path) -> Result<InstanceLock, CoreError> {
+    fs::create_dir_all(dir).map_err(|e| CoreError::io(dir.display().to_string(), e))?;
+    let path = dir.join(LOCK_FILE);
+    let display = path.display().to_string();
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // Pas de troncature à l'ouverture : le contenu (pid) n'est réécrit
+        // qu'une fois le verrou OS acquis (set_len ci-dessous).
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| CoreError::io(&*display, e))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(CoreError::InstanceLocked { path: display });
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(CoreError::io(&*display, e)),
+    }
+    // PID écrit pour diagnostic — best-effort : c'est le verrou OS qui fait foi.
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "{}", std::process::id());
+    Ok(InstanceLock { _file: file, path })
 }
 
 /// Sauvegarde atomique du show dans `dir/show.json`, plus une copie de
@@ -226,4 +327,78 @@ pub fn load_show_with_media(
     }
 
     Ok((show, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "conduite-persist-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// Deux écritures ne partagent JAMAIS le même temporaire (pid + compteur),
+    /// et le nom reste repérable : à côté du fichier cible, suffixe `.tmp`.
+    #[test]
+    fn tmp_paths_are_unique_and_recognizable() {
+        let target = Path::new("shows/demo/show.json");
+        let a = tmp_path(target);
+        let b = tmp_path(target);
+        assert_ne!(a, b, "deux écritures = deux temporaires distincts");
+        for t in [&a, &b] {
+            assert_eq!(t.parent(), target.parent(), "tmp à côté de la cible");
+            let name = t.file_name().and_then(|n| n.to_str()).expect("nom utf-8");
+            assert!(name.starts_with("show.json."), "préfixe cible : {name}");
+            assert!(name.ends_with(".tmp"), "suffixe .tmp : {name}");
+            assert!(
+                name.contains(&std::process::id().to_string()),
+                "pid dans le nom : {name}"
+            );
+        }
+    }
+
+    /// write_atomic avec le nouveau nommage : contenu remplacé, aucun .tmp
+    /// restant (succès comme échec de la cible).
+    #[test]
+    fn write_atomic_leaves_no_tmp_behind() {
+        let dir = temp_dir("tmp-clean");
+        let path = dir.join("show.json");
+        write_atomic(&path, b"v1").expect("write 1");
+        write_atomic(&path, b"v2").expect("write 2");
+        assert_eq!(fs::read(&path).expect("read"), b"v2");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporaires restants : {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Le verrou mono-instance refuse une seconde acquisition tant que la
+    /// première poignée vit, puis redevient disponible à sa libération.
+    #[test]
+    fn instance_lock_is_exclusive_then_released() {
+        let dir = temp_dir("lock");
+        let first = acquire_instance_lock(&dir).expect("premier verrou");
+        assert!(first.path().is_file(), "fichier de verrou créé");
+
+        match acquire_instance_lock(&dir) {
+            Err(CoreError::InstanceLocked { path }) => {
+                assert!(path.ends_with(LOCK_FILE), "chemin du verrou : {path}");
+            }
+            other => panic!("attendu InstanceLocked, obtenu {other:?}"),
+        }
+
+        drop(first);
+        let second = acquire_instance_lock(&dir).expect("verrou repris après libération");
+        drop(second);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

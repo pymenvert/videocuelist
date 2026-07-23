@@ -68,9 +68,11 @@ pub fn demo_show() -> Show {
             id: 1,
             name: "Principal".to_string(),
             monitor_index: Some(1),
-            width: 1920,
-            height: 1080,
-            fullscreen: true,
+            width: 1280,
+            height: 720,
+            // Fenêtré au premier lancement : on ne confisque pas l'écran de
+            // l'utilisateur avant qu'il ait configuré ses sorties.
+            fullscreen: false,
             enabled: true,
         },
         OutputCfg {

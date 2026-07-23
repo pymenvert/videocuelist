@@ -10,6 +10,7 @@ mod logsetup;
 mod players;
 mod preview;
 mod protocols;
+mod saver;
 mod session;
 mod undo;
 
@@ -61,8 +62,12 @@ fn main() {
         return;
     }
 
-    // Canaux partagés (session ↔ serveur web ↔ journal).
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    // Canaux partagés (session ↔ serveur web ↔ journal). Bus de commandes
+    // BORNÉ : un flood réseau (OSC/Art-Net/WS non authentifiés) fait
+    // backpressure sur les threads des surfaces au lieu de gonfler la
+    // mémoire sans limite — le drain du tick est de son côté plafonné
+    // (budget par frame, session.rs).
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8192);
     let (state_tx, state_rx) = watch::channel(json!({ "show": null, "runtime": null }));
     let (events_tx, _events_keep) = broadcast::channel(512);
     let (preview_tx, _preview_keep) = broadcast::channel(8);
@@ -73,6 +78,27 @@ fn main() {
     logsetup::install_panic_hook();
     info!(target: "app", version = env!("CARGO_PKG_VERSION"),
         base = %dirs.base.display(), "démarrage de Conduite");
+
+    // Verrou mono-instance (verrou de fichier OS : libéré même après crash).
+    // Deux instances qui sauvent le même show se corrompent mutuellement.
+    let _instance_lock = match conduite_core::acquire_instance_lock(&dirs.base) {
+        Ok(lock) => Some(lock),
+        Err(conduite_core::CoreError::InstanceLocked { path }) => {
+            error!(target: "app", %path,
+                "Conduite est DÉJÀ lancé (verrou tenu par une autre instance) : \
+                 fermez l'autre instance puis relancez — démarrage refusé");
+            eprintln!(
+                "Conduite est déjà lancé (verrou : {path}).\n\
+                 Fermez l'autre instance puis relancez."
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(target: "app", error = %e,
+                "verrou mono-instance indisponible : on continue sans (prudence)");
+            None
+        }
+    };
 
     let mut config = AppConfig::load(&dirs.base);
     if let Some(p) = cli.port {

@@ -32,3 +32,6 @@ desktop.ini
 # IDE
 .vscode/
 .idea/
+
+# Config machine (auto-cree au premier lancement)
+config.toml

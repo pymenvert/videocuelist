@@ -10,14 +10,19 @@
 //! - la **vitesse** de lecture est réalisée par l'horloge média passée à
 //!   [`Player::poll_frame`] (dup/skip, module [`pacing`]) — jamais par ffmpeg ;
 //! - la **pause** = ne plus consommer (backpressure du pipe) ;
-//! - le **seek** = kill + respawn du process à la position ;
-//! - **zéro zombie** : tout process ffmpeg est tué et attendu au drop.
+//! - le **seek** = commande au thread superviseur du player (kill + respawn
+//!   hors du thread appelant : `poll_frame` reste non bloquant) ;
+//! - **zéro zombie** : chaque process ffmpeg est récolté dès la fin de son
+//!   flux, et kill + wait au drop ;
+//! - les buffers de frames sont **recyclés** ([`FrameData`]) : restitution
+//!   automatique au pool au drop de la frame, sur n'importe quel thread.
 
 use std::path::{Path, PathBuf};
 
 use conduite_core::Playback;
 
 pub mod pacing;
+mod pool;
 mod probe;
 mod ring;
 
@@ -25,6 +30,7 @@ mod ffmpeg;
 mod test_player;
 
 pub use ffmpeg::FfmpegPlayer;
+pub use pool::FrameData;
 pub use probe::{probe, resolve_ffmpeg, resolve_ffprobe};
 pub use ring::{FrameRing, RING_CAPACITY};
 pub use test_player::TestPlayer;
@@ -44,8 +50,10 @@ pub struct MediaInfo {
 pub struct FrameRgba {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` octets.
-    pub data: Vec<u8>,
+    /// `width * height * 4` octets. Buffer éventuellement issu d'un pool :
+    /// la restitution est automatique au drop ([`FrameData`] déréférence en
+    /// `[u8]`, et un `Vec<u8>` s'y convertit via `From`/`.into()`).
+    pub data: FrameData,
     /// Position de la frame sur la ligne de temps média (s).
     pub pts_s: f64,
 }

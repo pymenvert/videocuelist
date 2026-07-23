@@ -18,6 +18,26 @@ use tracing::{debug, info, warn};
 /// Port Art-Net standard.
 const ARTNET_PORT: u16 = 6454;
 
+/// Signature de la configuration réseau des surfaces : un respawn (drop +
+/// join de 4 threads, jusqu'à ~100 ms chacun) n'est justifié que si elle
+/// change. Tout le reste (bindings MIDI, patch DMX) se pousse à chaud.
+#[derive(Debug, Clone, PartialEq)]
+struct ProtoSig {
+    osc_in_port: u16,
+    artnet_enabled: bool,
+    artnet_universes: Vec<u16>,
+    osc_out: Option<(String, u16)>,
+}
+
+fn proto_sig(settings: &ShowSettings, patch: &PatchTable) -> ProtoSig {
+    ProtoSig {
+        osc_in_port: settings.osc_in_port,
+        artnet_enabled: settings.artnet_enabled,
+        artnet_universes: settings.artnet_universes.clone(),
+        osc_out: patch.osc_out.as_ref().map(|o| (o.host.clone(), o.port)),
+    }
+}
+
 /// L'ensemble des surfaces actives. Drop = arrêt propre de tous les threads.
 pub struct Protocols {
     cmd_tx: Sender<(Source, Command)>,
@@ -25,6 +45,8 @@ pub struct Protocols {
     feedback: Option<(OscFeedbackHandle, Sender<FeedbackEvent>)>,
     midi: Option<MidiHub>,
     artnet: Option<(ArtnetNode, Sender<PatchTable>)>,
+    /// Configuration réseau des surfaces vivantes (None avant le 1er spawn).
+    sig: Option<ProtoSig>,
 }
 
 impl Protocols {
@@ -40,13 +62,30 @@ impl Protocols {
             feedback: None,
             midi: None,
             artnet: None,
+            sig: None,
         };
         p.respawn(settings, patch);
         p
     }
 
+    /// Respawn uniquement si la configuration réseau a changé — évite de
+    /// joindre les 4 threads (gel cumulé jusqu'à ~400 ms sur le thread de
+    /// session) pour une édition sans rapport, un undo/redo ou le second
+    /// appel du boot. Retourne vrai si un respawn a eu lieu ; sinon, à
+    /// l'appelant de pousser le patch à chaud (`update_patch`).
+    pub fn respawn_if_changed(&mut self, settings: &ShowSettings, patch: &PatchTable) -> bool {
+        let sig = proto_sig(settings, patch);
+        if self.sig.as_ref() == Some(&sig) {
+            debug!(target: "app::protocols", "configuration réseau inchangée : pas de respawn");
+            return false;
+        }
+        self.respawn(settings, patch);
+        true
+    }
+
     /// Arrête puis redémarre les surfaces (changement de réglages / de show).
     pub fn respawn(&mut self, settings: &ShowSettings, patch: &PatchTable) {
+        self.sig = Some(proto_sig(settings, patch));
         // Drop des anciennes poignées = arrêt propre (drapeaux + join).
         self.osc_in = None;
         self.feedback = None;
@@ -195,4 +234,36 @@ impl Protocols {
 /// Résout `host:port` en adresse socket (première trouvée).
 fn resolve_host(host: &str, port: u16) -> Option<SocketAddr> {
     (host, port).to_socket_addrs().ok()?.next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conduite_core::OscOutCfg;
+
+    /// Seuls les réglages RÉSEAU justifient un respawn ; un réglage sans
+    /// rapport (autosave, mjpeg…) laisse la signature inchangée.
+    #[test]
+    fn proto_sig_detects_only_network_changes() {
+        let s = ShowSettings::default();
+        let p = PatchTable::default();
+        assert_eq!(proto_sig(&s, &p), proto_sig(&s, &p));
+
+        let mut s2 = s.clone();
+        s2.autosave_interval_s = 120.0;
+        s2.mjpeg_fps = 4;
+        assert_eq!(proto_sig(&s, &p), proto_sig(&s2, &p), "réglage non réseau");
+
+        let mut s3 = s.clone();
+        s3.osc_in_port = 9100;
+        assert_ne!(proto_sig(&s, &p), proto_sig(&s3, &p), "port OSC");
+
+        let mut s4 = s.clone();
+        s4.artnet_enabled = true;
+        assert_ne!(proto_sig(&s, &p), proto_sig(&s4, &p), "Art-Net");
+
+        let mut p2 = p.clone();
+        p2.osc_out = Some(OscOutCfg { host: "10.0.0.2".into(), port: 9001 });
+        assert_ne!(proto_sig(&s, &p), proto_sig(&s, &p2), "cible de feedback");
+    }
 }

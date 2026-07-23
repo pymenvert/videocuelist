@@ -143,7 +143,7 @@ impl Player for TestPlayer {
         Some(FrameRgba {
             width: self.info.width,
             height: self.info.height,
-            data: self.render(t),
+            data: self.render(t).into(),
             pts_s: t,
         })
     }

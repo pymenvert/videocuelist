@@ -1,12 +1,25 @@
 //! Échantillonneur santé machine (CPU, mémoire, température) via `sysinfo`,
 //! rafraîchi au plus une fois par seconde (cache interne).
+//!
+//! Le rafraîchissement réel est COÛTEUX (sous Windows, la lecture des
+//! capteurs passe par WMI : blocages de plusieurs à dizaines de ms
+//! possibles) : en production, utiliser [`SamplerThread`] — le sysinfo
+//! tourne sur un thread dédié et le thread de rendu ne fait que copier le
+//! dernier échantillon publié.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use sysinfo::{Components, Pid, ProcessesToUpdate, System};
 
 /// Intervalle minimal entre deux rafraîchissements sysinfo (max 1 Hz).
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Période de la boucle du [`SamplerThread`] : courte pour un arrêt réactif
+/// (drop ≤ ~100 ms + rafraîchissement en cours), la cadence réelle des
+/// mesures restant imposée par [`HealthSampler`] (1 Hz max).
+const THREAD_TICK: Duration = Duration::from_millis(100);
 
 /// Échantillon système partiel — complété par les FPS via [`crate::merge`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -119,6 +132,82 @@ impl Default for HealthSampler {
     }
 }
 
+/// Échantillonneur santé sur thread dédié.
+///
+/// Le rafraîchissement `sysinfo` (WMI sous Windows, /proc et hwmon sous
+/// Linux) ne doit JAMAIS tourner sur le thread de rendu : ce thread nommé
+/// `conduite-health` fait les mesures et publie son [`SysSample`] dans un
+/// slot partagé. Le tick de rendu consomme via [`SamplerThread::latest`] —
+/// copie d'un `Copy` sous mutex très court, aucun appel sysinfo, jamais
+/// bloquant plus que la durée d'une copie.
+///
+/// Arrêt propre au [`Drop`] : drapeau + join (≤ ~100 ms hors mesure en cours).
+pub struct SamplerThread {
+    stop: Arc<AtomicBool>,
+    shared: Arc<Mutex<SysSample>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SamplerThread {
+    /// Démarre le thread d'échantillonnage. `Err` si l'OS refuse de créer le
+    /// thread (rarissime) : à l'appelant de tracer et de continuer sans
+    /// santé machine — jamais de panic en régie.
+    pub fn spawn() -> std::io::Result<SamplerThread> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(SysSample::default()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_shared = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("conduite-health".into())
+            .spawn(move || {
+                let mut sampler = HealthSampler::new();
+                while !thread_stop.load(Ordering::Relaxed) {
+                    // Coûteux au plus 1×/s (cadence interne du sampler) ;
+                    // entre deux rafraîchissements, republie le cache.
+                    let sample = sampler.sample();
+                    match thread_shared.lock() {
+                        Ok(mut slot) => *slot = sample,
+                        // Mutex empoisonné (panic d'un lecteur) : on republie
+                        // quand même — la santé machine ne s'arrête pas.
+                        Err(poisoned) => *poisoned.into_inner() = sample,
+                    }
+                    std::thread::sleep(THREAD_TICK);
+                }
+                tracing::debug!(target: "system", "thread santé arrêté");
+            })?;
+        Ok(SamplerThread {
+            stop,
+            shared,
+            handle: Some(handle),
+        })
+    }
+
+    /// Dernier échantillon publié — verrou court, aucun appel sysinfo.
+    /// Vaut [`SysSample::default`] tant que le thread n'a rien publié, et la
+    /// première mesure CPU vaut 0 (voir [`HealthSampler`]).
+    pub fn latest(&self) -> SysSample {
+        match self.shared.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                tracing::warn!(target: "system", "le thread santé a paniqué");
+            }
+        }
+    }
+}
+
+impl Drop for SamplerThread {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +235,34 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(sampler.sample(), first, "le cache doit être renvoyé tel quel");
         }
+    }
+
+    /// Le thread dédié publie un échantillon plausible et s'arrête vite au
+    /// drop (le thread de rendu ne doit jamais attendre longtemps).
+    #[test]
+    fn sampler_thread_publishes_and_stops_quickly() {
+        let thread = SamplerThread::spawn().expect("spawn du thread santé");
+        // latest() ne bloque pas et finit par refléter une vraie mesure
+        // (mem_mb > 0 dès la première publication).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = thread.latest();
+            if s.mem_mb > 0.0 {
+                assert!((0.0..=100.5).contains(&s.cpu_pct), "cpu_pct = {}", s.cpu_pct);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "aucun échantillon publié en 5 s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let started = Instant::now();
+        drop(thread);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "arrêt trop lent : {:?}",
+            started.elapsed()
+        );
     }
 }

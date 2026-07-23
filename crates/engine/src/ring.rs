@@ -69,6 +69,21 @@ impl FrameRing {
         self.inner.not_full.notify_all();
     }
 
+    /// Réouvre le ring après [`FrameRing::close`] pour le producteur suivant
+    /// (cycle de boucle, seek). Les frames en file restent consommables.
+    /// SPSC : à n'appeler qu'une fois l'ancien producteur terminé.
+    pub fn reopen(&self) {
+        let mut st = self.lock();
+        st.closed = false;
+    }
+
+    /// Jette toutes les frames en attente (seek : elles n'ont plus cours).
+    pub fn clear(&self) {
+        let mut st = self.lock();
+        st.frames.clear();
+        self.inner.not_full.notify_all();
+    }
+
     /// `true` si le producteur a terminé ET que tout a été consommé.
     pub fn is_drained(&self) -> bool {
         let st = self.lock();
@@ -118,7 +133,7 @@ mod tests {
     use std::time::Duration;
 
     fn frame(pts: f64) -> FrameRgba {
-        FrameRgba { width: 2, height: 2, data: vec![0; 16], pts_s: pts }
+        FrameRgba { width: 2, height: 2, data: vec![0; 16].into(), pts_s: pts }
     }
 
     #[test]
@@ -183,6 +198,30 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         ring.close();
         assert!(!handle.join().unwrap(), "push doit renvoyer false après close");
+    }
+
+    #[test]
+    fn reopen_permet_un_nouveau_cycle_de_production() {
+        let ring = FrameRing::new();
+        assert!(ring.push(frame(0.0)));
+        ring.close();
+        assert!(!ring.push(frame(1.0)), "fermé : push refusé");
+        ring.reopen();
+        assert!(ring.push(frame(1.0)), "réouvert : push accepté");
+        assert_eq!(ring.len(), 2, "les frames d'avant la fermeture restent");
+        assert!(!ring.is_drained());
+    }
+
+    #[test]
+    fn clear_jette_les_frames_en_attente() {
+        let ring = FrameRing::new();
+        assert!(ring.push(frame(0.0)));
+        assert!(ring.push(frame(1.0)));
+        ring.clear();
+        assert!(ring.is_empty());
+        // Le ring reste utilisable après un clear.
+        assert!(ring.push(frame(2.0)));
+        assert_eq!(ring.len(), 1);
     }
 
     #[test]

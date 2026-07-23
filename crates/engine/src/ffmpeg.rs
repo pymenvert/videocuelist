@@ -1,18 +1,30 @@
 //! Backend ffmpeg : un process `ffmpeg` par média, sortie rawvideo RGBA
 //! sur stdout, thread lecteur → ring buffer borné (backpressure via le pipe).
 //!
+//! Tout le CYCLE DE VIE du process (spawn, respawn de boucle, seek, relance
+//! après crash, kill/wait) vit dans un thread superviseur dédié : le thread
+//! appelant (rendu) ne fait que des opérations non bloquantes — `poll_frame`
+//! lit le ring, `seek`/`set_playback` postent une commande.
+//!
 //! - vitesse = cadence de consommation (dup/skip dans [`Pacer`]) ;
 //! - pause = on ne consomme plus (le pipe se remplit, ffmpeg bloque) ;
-//! - seek = kill + respawn à la position ;
-//! - EOF = pipe fermé → selon [`EndMode`] : Loop relance, Hold/Black/FollowNext
-//!   passent `eof()` à vrai (l'app garde la dernière frame ou affiche noir) ;
+//! - seek = commande au superviseur (kill + respawn hors thread appelant ;
+//!   en attendant, `poll_frame` rend `None` et l'app tient la dernière frame) ;
+//! - EOF = pipe fermé → selon [`EndMode`] : Loop relance (par le superviseur),
+//!   Hold/Black/FollowNext passent `eof()` à vrai une fois le ring vidé ;
 //! - PingPong v1 = traité comme Loop (warn) ;
 //! - mort prématurée du process : 1 relance automatique, puis `healthy() = false` ;
-//! - **zéro zombie** : kill + wait + join dans `Drop`.
+//! - **zéro zombie** : le child est récolté (`wait`) dès la fin de son flux,
+//!   sans attendre le drop — et kill + wait + join au drop ;
+//! - buffers de frames recyclés via [`BufferPool`] (pas d'allocation zérotée
+//!   par frame : restitution automatique au drop de la frame).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::Context;
@@ -20,14 +32,17 @@ use conduite_core::{EndMode, Playback};
 use tracing::{debug, error, warn};
 
 use crate::pacing::Pacer;
+use crate::pool::BufferPool;
 use crate::probe::{no_window, probe, resolve_ffmpeg};
-use crate::ring::FrameRing;
+use crate::ring::{FrameRing, RING_CAPACITY};
 use crate::{FrameRgba, MediaInfo, Player};
 
 const LOG: &str = "engine::ffmpeg";
 /// Tolérance de fin naturelle : si le flux s'arrête à moins de 4 frames de la
 /// fin attendue, on considère l'EOF comme normal.
 const EOF_TOLERANCE_FRAMES: f64 = 4.0;
+/// Buffers gardés en réserve par player : ring + frame affichée + marge.
+const POOL_SPARES: usize = RING_CAPACITY + 2;
 
 /// Arguments ffmpeg pour lire `path` en RGBA brut depuis `start_s`.
 /// Pur (testé) : `stream_loop` active `-stream_loop -1`, `stop_s` borne la
@@ -65,98 +80,117 @@ fn build_args(path: &Path, start_s: f64, stop_s: Option<f64>, stream_loop: bool)
     args
 }
 
-/// Process ffmpeg vivant + son thread lecteur. `Drop` = kill absolu.
-struct Proc {
-    child: Child,
-    ring: FrameRing,
-    reader: Option<JoinHandle<()>>,
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        // Ordre important : fermer le ring débloque un lecteur en attente,
-        // kill ferme le pipe et débloque un lecteur en read, wait évite le
-        // zombie, join termine proprement le thread.
-        self.ring.close();
-        if let Err(e) = self.child.kill() {
-            debug!(target: LOG, error = %e, "kill ffmpeg (probablement déjà terminé)");
-        }
-        if let Err(e) = self.child.wait() {
-            warn!(target: LOG, error = %e, "wait ffmpeg");
-        }
-        if let Some(h) = self.reader.take() {
-            if h.join().is_err() {
-                warn!(target: LOG, "le thread lecteur a paniqué");
-            }
-        }
+/// Fin de segment sur la ligne de temps média (out, sinon durée, sinon rien).
+fn segment_end_s(info: &MediaInfo, pb: &Playback) -> Option<f64> {
+    let dur = (info.duration_s > 0.0).then_some(info.duration_s);
+    match pb.out_s {
+        Some(out) => Some(out.min(dur.unwrap_or(out))),
+        None => dur,
     }
 }
 
-/// Lecteur vidéo adossé à un process ffmpeg.
+/// Longueur du segment lu (0 si inconnue).
+fn segment_len_s(info: &MediaInfo, pb: &Playback) -> f64 {
+    segment_end_s(info, pb).map(|e| (e - pb.in_s).max(0.0)).unwrap_or(0.0)
+}
+
+fn loops(pb: &Playback) -> bool {
+    matches!(pb.end, EndMode::Loop | EndMode::PingPong)
+}
+
+/// Pts média (dans le segment) d'un pts de flux monotone.
+fn media_pts_of(info: &MediaInfo, pb: &Playback, stream_pts: f64) -> f64 {
+    let seg = segment_len_s(info, pb);
+    if seg > 0.0 {
+        pb.in_s + (stream_pts % seg)
+    } else {
+        pb.in_s + stream_pts
+    }
+}
+
+/// Fin naturelle du flux (pur, testé) : le dernier pts poussé arrive à moins
+/// de [`EOF_TOLERANCE_FRAMES`] de la fin attendue, ou — fin attendue inconnue
+/// (INFINITY) — le process s'est terminé avec un code succès.
+fn is_natural_end(
+    last_pts_s: f64,
+    spawn_end_stream_s: f64,
+    frame_dur_s: f64,
+    clean_exit: bool,
+) -> bool {
+    last_pts_s >= spawn_end_stream_s - EOF_TOLERANCE_FRAMES * frame_dur_s
+        || (spawn_end_stream_s.is_infinite() && clean_exit)
+}
+
+/// Messages reçus par le thread superviseur.
+enum Msg {
+    /// Seek/respawn à la position média `pos_s`, avec la playback courante.
+    Seek { pb: Playback, pos_s: f64 },
+    /// Le thread lecteur de la génération donnée a terminé (dernier pts poussé).
+    ReaderDone { generation: u64, last_pts_s: Option<f64> },
+    /// Arrêt du player (drop).
+    Shutdown,
+}
+
+/// État partagé entre le player (thread de rendu) et le superviseur.
+struct Shared {
+    ring: FrameRing,
+    /// Flux terminé (plus aucune frame à venir) — hors boucle.
+    ended: AtomicBool,
+    healthy: AtomicBool,
+    /// Seeks postés non encore réalisés : `poll_frame` rend `None` en
+    /// attendant (les frames du process précédent n'ont plus cours).
+    pending_seeks: AtomicU32,
+}
+
+/// Lecteur vidéo adossé à un process ffmpeg piloté par un thread superviseur.
 pub struct FfmpegPlayer {
     info: MediaInfo,
-    path: PathBuf,
     pb: Playback,
-    proc: Option<Proc>,
     pacer: Pacer,
     playing: bool,
+    /// Cache local : vrai une fois le flux terminé ET le ring vidé.
     eof: bool,
-    healthy: bool,
-    /// Relances après mort prématurée depuis le dernier seek/spawn sain.
-    retries: u32,
-    /// Pts de flux de la première frame du process courant.
-    stream_base_s: f64,
-    /// Pts de flux attendu en fin de process courant (INFINITY si sans fin).
-    spawn_end_stream_s: f64,
-    /// Dernier pts de flux réellement servi (reprise après crash).
-    last_stream_pts_s: f64,
     warned_pingpong: bool,
+    shared: Arc<Shared>,
+    tx: Sender<Msg>,
+    supervisor: Option<JoinHandle<()>>,
 }
 
 impl FfmpegPlayer {
     /// Ouvre `path` (sondé via ffprobe) et précharge : process lancé,
-    /// premières frames en buffer, lecture en pause.
+    /// premières frames en buffer, lecture en pause. Bloquant : à appeler
+    /// hors du thread de rendu (chargement).
     pub fn open(path: &Path, pb: &Playback) -> anyhow::Result<Self> {
         let info = probe(path)?;
+        let shared = Arc::new(Shared {
+            ring: FrameRing::new(),
+            ended: AtomicBool::new(false),
+            healthy: AtomicBool::new(true),
+            pending_seeks: AtomicU32::new(0),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut supervisor =
+            Supervisor::new(path.to_path_buf(), info, pb.clone(), Arc::clone(&shared), tx.clone(), rx);
+        // Préchargement synchrone : un échec de lancement est rendu à l'appelant.
+        supervisor.spawn_at(pb.in_s).context("préchargement ffmpeg")?;
+        let handle = std::thread::Builder::new()
+            .name("ffmpeg-supervisor".into())
+            .spawn(move || supervisor.run())
+            .context("thread superviseur")?;
+
         let mut player = FfmpegPlayer {
             info,
-            path: path.to_path_buf(),
             pb: pb.clone(),
-            proc: None,
             pacer: Pacer::new(info.fps, pb.in_s, 0.0),
             playing: false,
             eof: false,
-            healthy: true,
-            retries: 0,
-            stream_base_s: 0.0,
-            spawn_end_stream_s: f64::INFINITY,
-            last_stream_pts_s: 0.0,
             warned_pingpong: false,
+            shared,
+            tx,
+            supervisor: Some(handle),
         };
         player.apply_playback(pb.clone());
-        player.spawn(player.pb.in_s).context("préchargement ffmpeg")?;
         Ok(player)
-    }
-
-    /// Fin de segment sur la ligne de temps média (out, sinon durée, sinon rien).
-    fn segment_end_s(&self) -> Option<f64> {
-        match self.pb.out_s {
-            Some(out) => Some(out.min(self.effective_duration().unwrap_or(out))),
-            None => self.effective_duration(),
-        }
-    }
-
-    fn effective_duration(&self) -> Option<f64> {
-        (self.info.duration_s > 0.0).then_some(self.info.duration_s)
-    }
-
-    /// Longueur du segment lu (0 si inconnue).
-    fn segment_len_s(&self) -> f64 {
-        self.segment_end_s().map(|e| (e - self.pb.in_s).max(0.0)).unwrap_or(0.0)
-    }
-
-    fn loops(&self) -> bool {
-        matches!(self.pb.end, EndMode::Loop | EndMode::PingPong)
     }
 
     /// Mémorise la playback et recale le pacer (fps/in/segment).
@@ -166,141 +200,7 @@ impl FfmpegPlayer {
             self.warned_pingpong = true;
         }
         self.pb = pb;
-        self.pacer = Pacer::new(self.info.fps, self.pb.in_s, self.segment_len_s());
-    }
-
-    /// (Re)lance le process ffmpeg à la position média `start_s`.
-    /// Le pts de flux de la première frame est `start_s - in_s + loop_offset`
-    /// déjà contenu dans `self.stream_base_s` (à poser AVANT l'appel).
-    fn spawn(&mut self, start_s: f64) -> anyhow::Result<()> {
-        self.proc = None; // Drop : kill de l'ancien process d'abord.
-
-        // stream_loop seulement pour une boucle du fichier entier depuis 0 :
-        // au-delà (in/out), les pts deviendraient faux → on reboucle par respawn.
-        let whole_file = self.pb.in_s <= 0.0 && self.pb.out_s.is_none();
-        let stream_loop = self.loops() && whole_file && start_s <= 0.0;
-        let stop_s = if stream_loop { None } else { self.pb.out_s };
-
-        let seg_end = self.segment_end_s();
-        self.spawn_end_stream_s = if stream_loop {
-            f64::INFINITY
-        } else {
-            match seg_end {
-                Some(end) => self.stream_base_s + (end - start_s).max(0.0),
-                None => f64::INFINITY, // durée inconnue : EOF = fin naturelle
-            }
-        };
-
-        let ffmpeg = resolve_ffmpeg();
-        let args = build_args(&self.path, start_s, stop_s, stream_loop);
-        let mut cmd = Command::new(&ffmpeg);
-        cmd.args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        no_window(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("lancement de ffmpeg impossible ({})", ffmpeg.display()))?;
-        let stdout = child.stdout.take().context("stdout ffmpeg absent")?;
-
-        let ring = FrameRing::new();
-        let ring_prod = ring.clone();
-        let (w, h) = (self.info.width, self.info.height);
-        let frame_dur = self.pacer.frame_dur_s();
-        let base = self.stream_base_s;
-        let reader = std::thread::Builder::new()
-            .name("ffmpeg-reader".into())
-            .spawn(move || read_frames(stdout, ring_prod, w, h, frame_dur, base))
-            .context("thread lecteur")?;
-
-        debug!(target: LOG, start_s, stream_loop, path = %self.path.display(), "process ffmpeg lancé");
-        self.proc = Some(Proc { child, ring, reader: Some(reader) });
-        Ok(())
-    }
-
-    /// Le producteur a terminé : fin naturelle → Loop relance / autres → eof ;
-    /// mort prématurée → 1 relance, puis `healthy = false`.
-    fn handle_stream_end(&mut self) {
-        let natural = self.last_stream_pts_s
-            >= self.spawn_end_stream_s - EOF_TOLERANCE_FRAMES * self.pacer.frame_dur_s()
-            || self.spawn_end_stream_s.is_infinite() && self.stream_ended_cleanly();
-
-        if natural {
-            self.retries = 0;
-            if self.loops() {
-                // Cycle suivant : la base de flux avance d'une longueur de segment.
-                let seg = self.segment_len_s();
-                if seg > 0.0 {
-                    self.stream_base_s = if self.spawn_end_stream_s.is_finite() {
-                        self.spawn_end_stream_s
-                    } else {
-                        self.last_stream_pts_s + self.pacer.frame_dur_s()
-                    };
-                    if let Err(e) = self.spawn(self.pb.in_s) {
-                        error!(target: LOG, error = %e, "relance de boucle impossible");
-                        self.healthy = false;
-                        self.eof = true;
-                    }
-                } else {
-                    // Segment de longueur nulle/inconnue : rien à reboucler.
-                    self.eof = true;
-                }
-            } else {
-                // Hold : l'app garde la dernière frame ; Black : l'app affiche
-                // noir sur eof() ; FollowNext : le moteur de cues suit sur eof().
-                self.eof = true;
-            }
-            return;
-        }
-
-        // Mort prématurée.
-        if self.retries == 0 {
-            self.retries = 1;
-            let resume = self.resume_position_s();
-            error!(target: LOG, resume_s = resume, path = %self.path.display(),
-                "process ffmpeg mort en lecture, relance");
-            self.stream_base_s = self.last_stream_pts_s + self.pacer.frame_dur_s();
-            if let Err(e) = self.spawn(resume) {
-                error!(target: LOG, error = %e, "relance impossible");
-                self.healthy = false;
-            }
-        } else {
-            error!(target: LOG, path = %self.path.display(),
-                "process ffmpeg mort une seconde fois, lecteur déclaré malade");
-            self.healthy = false;
-            self.proc = None;
-        }
-    }
-
-    /// `true` si le process s'est terminé sans code d'erreur (fin naturelle
-    /// quand la durée attendue est inconnue).
-    fn stream_ended_cleanly(&mut self) -> bool {
-        match self.proc.as_mut().map(|p| p.child.try_wait()) {
-            Some(Ok(Some(status))) => status.success(),
-            _ => false,
-        }
-    }
-
-    /// Position média où reprendre après un crash.
-    fn resume_position_s(&self) -> f64 {
-        let seg = self.segment_len_s();
-        let in_stream = if seg > 0.0 {
-            self.last_stream_pts_s % seg
-        } else {
-            self.last_stream_pts_s
-        };
-        self.pb.in_s + in_stream
-    }
-
-    /// Pts média (dans le segment) d'un pts de flux monotone.
-    fn media_pts_of(&self, stream_pts: f64) -> f64 {
-        let seg = self.segment_len_s();
-        if seg > 0.0 {
-            self.pb.in_s + (stream_pts % seg)
-        } else {
-            self.pb.in_s + stream_pts
-        }
+        self.pacer = Pacer::new(self.info.fps, self.pb.in_s, segment_len_s(&self.info, &self.pb));
     }
 }
 
@@ -330,18 +230,18 @@ impl Player for FfmpegPlayer {
     }
 
     fn seek(&mut self, s: f64) {
-        let end = self.segment_end_s().unwrap_or(f64::INFINITY);
+        let end = segment_end_s(&self.info, &self.pb).unwrap_or(f64::INFINITY);
         let s = s.clamp(self.pb.in_s, end);
         self.eof = false;
-        self.retries = 0;
-        self.healthy = true;
-        self.stream_base_s = s - self.pb.in_s;
-        self.last_stream_pts_s = self.stream_base_s;
-        self.pacer = Pacer::new(self.info.fps, self.pb.in_s, self.segment_len_s());
-        self.pacer.reset_to(self.stream_base_s);
-        if let Err(e) = self.spawn(s) {
-            error!(target: LOG, error = %e, seek_s = s, "seek : relance impossible");
-            self.healthy = false;
+        self.pacer = Pacer::new(self.info.fps, self.pb.in_s, segment_len_s(&self.info, &self.pb));
+        self.pacer.reset_to(s - self.pb.in_s);
+        // Kill + respawn sont réalisés par le superviseur ; en attendant,
+        // poll_frame rend None (l'app tient la dernière frame).
+        self.shared.pending_seeks.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(Msg::Seek { pb: self.pb.clone(), pos_s: s }).is_err() {
+            self.shared.pending_seeks.fetch_sub(1, Ordering::SeqCst);
+            self.shared.healthy.store(false, Ordering::SeqCst);
+            error!(target: LOG, seek_s = s, "superviseur arrêté : seek impossible");
         }
     }
 
@@ -349,16 +249,17 @@ impl Player for FfmpegPlayer {
         if !self.playing || self.eof {
             return None;
         }
-        let ring = self.proc.as_ref()?.ring.clone();
-        match ring.poll(&mut self.pacer, media_time_s) {
+        if self.shared.pending_seeks.load(Ordering::SeqCst) > 0 {
+            return None; // seek en cours : frames de l'ancien process sans valeur
+        }
+        match self.shared.ring.poll(&mut self.pacer, media_time_s) {
             Some(mut frame) => {
-                self.last_stream_pts_s = frame.pts_s;
-                frame.pts_s = self.media_pts_of(frame.pts_s);
+                frame.pts_s = media_pts_of(&self.info, &self.pb, frame.pts_s);
                 Some(frame)
             }
             None => {
-                if ring.is_drained() {
-                    self.handle_stream_end();
+                if self.shared.ended.load(Ordering::SeqCst) && self.shared.ring.is_drained() {
+                    self.eof = true;
                 }
                 None
             }
@@ -370,36 +271,305 @@ impl Player for FfmpegPlayer {
     }
 
     fn healthy(&self) -> bool {
-        self.healthy
+        self.shared.healthy.load(Ordering::SeqCst)
     }
 }
 
 impl Drop for FfmpegPlayer {
     fn drop(&mut self) {
-        // Proc::drop fait le kill/wait/join ; on force l'ordre ici pour la clarté.
-        self.proc = None;
+        // Fermer le ring débloque un lecteur en push, puis le superviseur
+        // fait kill + wait + join (Drop de Supervisor).
+        self.shared.ring.close();
+        let _ = self.tx.send(Msg::Shutdown);
+        if let Some(h) = self.supervisor.take() {
+            if h.join().is_err() {
+                warn!(target: LOG, "le thread superviseur a paniqué");
+            }
+        }
+    }
+}
+
+/// Thread superviseur : possède le process ffmpeg et son thread lecteur.
+/// Réalise spawn/respawn de boucle/seek/relance/récolte hors du thread de rendu.
+struct Supervisor {
+    path: PathBuf,
+    info: MediaInfo,
+    pb: Playback,
+    shared: Arc<Shared>,
+    /// Sender partagé avec les threads lecteurs (`ReaderDone`).
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    pool: BufferPool,
+    child: Option<Child>,
+    reader: Option<JoinHandle<()>>,
+    /// Génération de process : les `ReaderDone` d'anciennes générations sont ignorés.
+    generation: u64,
+    /// Relances après mort prématurée depuis le dernier seek/spawn sain.
+    retries: u32,
+    frame_dur_s: f64,
+    /// Pts de flux de la première frame du process courant.
+    stream_base_s: f64,
+    /// Pts de flux attendu en fin de process courant (INFINITY si sans fin).
+    spawn_end_stream_s: f64,
+}
+
+impl Supervisor {
+    fn new(
+        path: PathBuf,
+        info: MediaInfo,
+        pb: Playback,
+        shared: Arc<Shared>,
+        tx: Sender<Msg>,
+        rx: Receiver<Msg>,
+    ) -> Self {
+        let fps = if info.fps.is_finite() && info.fps > 0.0 { info.fps } else { 30.0 };
+        let frame_size = (info.width as usize) * (info.height as usize) * 4;
+        Supervisor {
+            path,
+            info,
+            pb,
+            shared,
+            tx,
+            rx,
+            pool: BufferPool::new(frame_size, POOL_SPARES),
+            child: None,
+            reader: None,
+            generation: 0,
+            retries: 0,
+            frame_dur_s: 1.0 / fps,
+            stream_base_s: 0.0,
+            spawn_end_stream_s: f64::INFINITY,
+        }
+    }
+
+    fn run(mut self) {
+        loop {
+            match self.rx.recv() {
+                Ok(Msg::Seek { pb, pos_s }) => self.handle_seek(pb, pos_s),
+                Ok(Msg::ReaderDone { generation, last_pts_s }) => {
+                    self.handle_reader_done(generation, last_pts_s)
+                }
+                Ok(Msg::Shutdown) | Err(_) => break,
+            }
+        }
+        // Drop de self : kill + wait + join, ring fermé.
+    }
+
+    /// (Re)lance le process ffmpeg à la position média `start_s`.
+    /// `self.stream_base_s` (pts de flux de la première frame) est à poser
+    /// AVANT l'appel.
+    fn spawn_at(&mut self, start_s: f64) -> anyhow::Result<()> {
+        self.stop_child(); // défensif : l'ancien process d'abord
+
+        // stream_loop seulement pour une boucle du fichier entier depuis 0 :
+        // au-delà (in/out), les pts deviendraient faux → on reboucle par respawn.
+        let whole_file = self.pb.in_s <= 0.0 && self.pb.out_s.is_none();
+        let stream_loop = loops(&self.pb) && whole_file && start_s <= 0.0;
+        let stop_s = if stream_loop { None } else { self.pb.out_s };
+
+        self.spawn_end_stream_s = if stream_loop {
+            f64::INFINITY
+        } else {
+            match segment_end_s(&self.info, &self.pb) {
+                Some(end) => self.stream_base_s + (end - start_s).max(0.0),
+                None => f64::INFINITY, // durée inconnue : EOF = fin naturelle
+            }
+        };
+
+        let ffmpeg = resolve_ffmpeg();
+        let args = build_args(&self.path, start_s, stop_s, stream_loop);
+        let mut cmd = Command::new(&ffmpeg);
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        no_window(&mut cmd);
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("lancement de ffmpeg impossible ({})", ffmpeg.display()))?;
+        let stdout = match child.stdout.take() {
+            Some(out) => out,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("stdout ffmpeg absent");
+            }
+        };
+
+        self.generation += 1;
+        let generation = self.generation;
+        let ring = self.shared.ring.clone();
+        ring.reopen(); // le lecteur précédent (terminé) l'avait fermé
+        let pool = self.pool.clone();
+        let (w, h) = (self.info.width, self.info.height);
+        let (frame_dur, base) = (self.frame_dur_s, self.stream_base_s);
+        let done = self.tx.clone();
+        let reader = std::thread::Builder::new()
+            .name("ffmpeg-reader".into())
+            .spawn(move || {
+                let last_pts_s = read_frames(stdout, ring, &pool, w, h, frame_dur, base);
+                let _ = done.send(Msg::ReaderDone { generation, last_pts_s });
+            });
+        let reader = match reader {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("thread lecteur");
+            }
+        };
+
+        debug!(target: LOG, start_s, stream_loop, path = %self.path.display(), "process ffmpeg lancé");
+        self.child = Some(child);
+        self.reader = Some(reader);
+        Ok(())
+    }
+
+    /// Seek demandé par le player : kill + respawn à la position, frames de
+    /// l'ancienne génération jetées.
+    fn handle_seek(&mut self, pb: Playback, pos_s: f64) {
+        self.stop_child();
+        self.shared.ring.clear(); // les buffers retournent au pool
+        self.pb = pb;
+        self.retries = 0;
+        self.stream_base_s = pos_s - self.pb.in_s;
+        self.shared.ended.store(false, Ordering::SeqCst);
+        match self.spawn_at(pos_s) {
+            Ok(()) => self.shared.healthy.store(true, Ordering::SeqCst),
+            Err(e) => {
+                error!(target: LOG, error = %e, seek_s = pos_s, "seek : relance impossible");
+                self.shared.healthy.store(false, Ordering::SeqCst);
+            }
+        }
+        self.shared.pending_seeks.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Le thread lecteur a terminé : le process est récolté IMMÉDIATEMENT
+    /// (zéro zombie, même en Hold/Black), puis fin naturelle → boucle/fin de
+    /// flux ; mort prématurée → 1 relance, puis `healthy = false`.
+    fn handle_reader_done(&mut self, generation: u64, last_pts_s: Option<f64>) {
+        if generation != self.generation {
+            return; // lecteur d'une génération déjà remplacée (seek)
+        }
+        let clean_exit = self.reap_child();
+        let last = last_pts_s.unwrap_or(self.stream_base_s);
+
+        if is_natural_end(last, self.spawn_end_stream_s, self.frame_dur_s, clean_exit) {
+            self.retries = 0;
+            if loops(&self.pb) && segment_len_s(&self.info, &self.pb) > 0.0 {
+                // Cycle suivant : la base de flux avance d'une longueur de
+                // segment ; les frames du cycle fini restent consommables.
+                self.stream_base_s = if self.spawn_end_stream_s.is_finite() {
+                    self.spawn_end_stream_s
+                } else {
+                    last + self.frame_dur_s
+                };
+                if let Err(e) = self.spawn_at(self.pb.in_s) {
+                    error!(target: LOG, error = %e, "relance de boucle impossible");
+                    self.shared.healthy.store(false, Ordering::SeqCst);
+                    self.shared.ended.store(true, Ordering::SeqCst);
+                }
+            } else {
+                // Hold : l'app garde la dernière frame ; Black : l'app affiche
+                // noir sur eof() ; FollowNext : le moteur de cues suit sur
+                // eof() — posé par le player une fois le ring vidé.
+                self.shared.ended.store(true, Ordering::SeqCst);
+            }
+            return;
+        }
+
+        // Mort prématurée.
+        if self.retries == 0 {
+            self.retries = 1;
+            let resume = self.resume_position_s(last);
+            error!(target: LOG, resume_s = resume, path = %self.path.display(),
+                "process ffmpeg mort en lecture, relance");
+            self.stream_base_s = last + self.frame_dur_s;
+            if let Err(e) = self.spawn_at(resume) {
+                error!(target: LOG, error = %e, "relance impossible");
+                self.shared.healthy.store(false, Ordering::SeqCst);
+            }
+        } else {
+            error!(target: LOG, path = %self.path.display(),
+                "process ffmpeg mort une seconde fois, lecteur déclaré malade");
+            self.shared.healthy.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Position média où reprendre après un crash.
+    fn resume_position_s(&self, last_stream_pts_s: f64) -> f64 {
+        let seg = segment_len_s(&self.info, &self.pb);
+        let in_stream = if seg > 0.0 { last_stream_pts_s % seg } else { last_stream_pts_s };
+        self.pb.in_s + in_stream
+    }
+
+    /// Récolte le process (`wait`) et joint le thread lecteur.
+    /// `true` si le process s'est terminé avec un code succès.
+    fn reap_child(&mut self) -> bool {
+        let clean = match self.child.take() {
+            Some(mut child) => match child.wait() {
+                Ok(status) => status.success(),
+                Err(e) => {
+                    warn!(target: LOG, error = %e, "wait ffmpeg");
+                    false
+                }
+            },
+            None => false,
+        };
+        if let Some(h) = self.reader.take() {
+            if h.join().is_err() {
+                warn!(target: LOG, "le thread lecteur a paniqué");
+            }
+        }
+        clean
+    }
+
+    /// Arrêt forcé du process courant. Ordre important : fermer le ring
+    /// débloque un lecteur en push, kill ferme le pipe et débloque un lecteur
+    /// en read, wait évite le zombie, join termine proprement le thread.
+    fn stop_child(&mut self) {
+        if self.child.is_none() && self.reader.is_none() {
+            return;
+        }
+        self.shared.ring.close();
+        if let Some(child) = self.child.as_mut() {
+            if let Err(e) = child.kill() {
+                debug!(target: LOG, error = %e, "kill ffmpeg (probablement déjà terminé)");
+            }
+        }
+        let _ = self.reap_child();
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.stop_child();
+        self.shared.ring.close(); // reste fermé pour le consommateur
     }
 }
 
 /// Boucle du thread lecteur : lit des frames RGBA complètes sur le pipe et
 /// les pousse dans le ring (bloquant = backpressure). Sort sur EOF, erreur
-/// de lecture ou fermeture du ring.
+/// de lecture ou fermeture du ring. `pool` fournit des buffers recyclés de
+/// `width * height * 4` octets. Rend le dernier pts poussé.
 fn read_frames(
     mut stdout: impl Read,
     ring: FrameRing,
+    pool: &BufferPool,
     width: u32,
     height: u32,
     frame_dur_s: f64,
     stream_base_s: f64,
-) {
+) -> Option<f64> {
     let frame_size = (width as usize) * (height as usize) * 4;
     if frame_size == 0 {
         ring.close();
-        return;
+        return None;
     }
     let mut index: u64 = 0;
+    let mut last_pts_s = None;
     loop {
-        let mut data = vec![0u8; frame_size];
+        let mut data = pool.take();
         match read_exact_or_eof(&mut stdout, &mut data) {
             Ok(true) => {}
             Ok(false) => break, // pipe fermé proprement (EOF)
@@ -413,8 +583,10 @@ fn read_frames(
         if !ring.push(FrameRgba { width, height, data, pts_s }) {
             break; // ring fermé (drop/seek) : on s'arrête sans bruit
         }
+        last_pts_s = Some(pts_s);
     }
     ring.close();
+    last_pts_s
 }
 
 /// `read_exact` tolérant : `Ok(false)` si EOF avant le premier octet,
@@ -511,9 +683,11 @@ mod tests {
         let mut bytes = [7u8; 33];
         bytes[32] = 9;
         let ring = FrameRing::new();
-        read_frames(&bytes[..], ring.clone(), 2, 2, 1.0 / 30.0, 0.0);
+        let pool = BufferPool::new(16, 4);
+        let last = read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0);
         assert_eq!(ring.len(), 2);
         assert!(!ring.is_drained());
+        assert!((last.unwrap() - 1.0 / 30.0).abs() < 1e-9, "dernier pts poussé");
         let mut pacer = Pacer::new(30.0, 0.0, 1.0);
         let f0 = ring.poll(&mut pacer, 0.0).unwrap();
         assert_eq!(f0.pts_s, 0.0);
@@ -526,10 +700,78 @@ mod tests {
     fn read_frames_respecte_stream_base() {
         let bytes = [0u8; 16];
         let ring = FrameRing::new();
-        read_frames(&bytes[..], ring.clone(), 2, 2, 1.0 / 30.0, 5.0);
+        let pool = BufferPool::new(16, 4);
+        let last = read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 5.0);
+        assert!((last.unwrap() - 5.0).abs() < 1e-9);
         let mut pacer = Pacer::new(30.0, 0.0, 1.0);
         // stream_time(5.0) = 5.0 (in=0) → la frame pts 5.0 est due.
         let f = ring.poll(&mut pacer, 5.0).unwrap();
         assert!((f.pts_s - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_frames_sans_frame_rend_none() {
+        let bytes: &[u8] = &[];
+        let ring = FrameRing::new();
+        let pool = BufferPool::new(16, 4);
+        assert!(read_frames(bytes, ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0).is_none());
+        assert!(ring.is_drained());
+    }
+
+    #[test]
+    fn read_frames_recycle_les_buffers_via_le_pool() {
+        // 3 frames lues et consommées une à une : au plus 2 buffers vivants
+        // à la fois → la 3e frame doit réutiliser une allocation rendue.
+        let bytes = [1u8; 48]; // 3 frames de 16 octets
+        let ring = FrameRing::new();
+        let pool = BufferPool::new(16, 4);
+        read_frames(&bytes[..], ring.clone(), &pool, 2, 2, 1.0 / 30.0, 0.0);
+        let mut pacer = Pacer::new(30.0, 0.0, 1.0);
+        let mut ptrs = Vec::new();
+        for i in 0..3 {
+            let f = ring.poll(&mut pacer, i as f64 / 30.0).unwrap();
+            ptrs.push(f.data.as_ptr());
+            // f droppée ici → buffer rendu au pool.
+        }
+        // Après consommation, les 3 buffers sont en réserve (≤ POOL_SPARES).
+        let reused = pool.take();
+        assert!(ptrs.contains(&reused.as_ptr()), "take doit recycler un buffer rendu");
+    }
+
+    #[test]
+    fn fin_naturelle_dans_la_tolerance() {
+        let dur = 1.0 / 30.0;
+        // Flux attendu jusqu'à 1.0 s : s'arrête 2 frames avant → naturel.
+        assert!(is_natural_end(1.0 - 2.0 * dur, 1.0, dur, false));
+        // Pile à la fin → naturel.
+        assert!(is_natural_end(1.0, 1.0, dur, false));
+    }
+
+    #[test]
+    fn fin_prematuree_hors_tolerance() {
+        let dur = 1.0 / 30.0;
+        // S'arrête à 0.5 s sur 1.0 s attendue → mort prématurée.
+        assert!(!is_natural_end(0.5, 1.0, dur, false));
+        // Même avec un code succès : la fin attendue est CONNUE et non atteinte.
+        assert!(!is_natural_end(0.5, 1.0, dur, true));
+    }
+
+    #[test]
+    fn fin_inconnue_selon_le_code_de_sortie() {
+        let dur = 1.0 / 30.0;
+        // Durée inconnue (INFINITY) : seul un exit propre fait foi.
+        assert!(is_natural_end(3.0, f64::INFINITY, dur, true));
+        assert!(!is_natural_end(3.0, f64::INFINITY, dur, false));
+    }
+
+    #[test]
+    fn media_pts_reboucle_dans_le_segment() {
+        let info = MediaInfo { duration_s: 10.0, fps: 30.0, width: 2, height: 2 };
+        let pb = Playback { in_s: 2.0, out_s: Some(4.0), speed: 1.0, end: EndMode::Loop };
+        // Segment de 2 s : pts de flux 3.5 (2e cycle) → média 2.0 + 1.5.
+        assert!((media_pts_of(&info, &pb, 3.5) - 3.5).abs() < 1e-9);
+        assert!((media_pts_of(&info, &pb, 2.5) - 2.5).abs() < 1e-9);
+        // 5.0 = 2 cycles + 1.0 → média 3.0.
+        assert!((media_pts_of(&info, &pb, 5.0) - 3.0).abs() < 1e-9);
     }
 }

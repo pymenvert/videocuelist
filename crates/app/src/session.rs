@@ -7,21 +7,24 @@
 //! sorties → préview → santé (ordre normatif, INTERFACES §app).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use conduite_compositor::{BlendMode, SliceDraw};
 use conduite_control_osc::FeedbackEvent;
 use conduite_core::{
-    AppMode, Command, Content, Cue, CueNumber, EditOp, MaterialId, OutputCfg, OutputId,
-    ParamValue, PatternKind, RuntimeStatus, Show, SliceId, Source, StateEvent,
+    AppMode, Command, Content, CoreError, Cue, CueNumber, EditOp, LoadWarning, MaterialId,
+    MaterialRef, MediaRef, OutputCfg, OutputId, ParamValue, PatternKind, RuntimeStatus, Show,
+    ShowSettings, SliceId, Source, StateEvent,
 };
 use conduite_cue::{CueEngine, CueEvent, CueFrame, EngineTick, SceneTarget};
 use conduite_isf::{IsfInputKind, IsfSources};
 use conduite_media_library::ProbeInfo;
 use conduite_modulation::{FftFrame, ModEngine};
 use conduite_params::{ParamKind, ParamSpec, Registry};
-use conduite_system::{FpsCounter, HealthSampler};
+use conduite_system::{FpsCounter, SamplerThread};
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
@@ -30,16 +33,30 @@ use tracing::{debug, error, info, warn};
 use crate::config::AppConfig;
 use crate::dirs::{safe_show_name, Dirs};
 use crate::gfx::Gfx;
-use crate::logsetup;
 use crate::players::{Deck, Players};
 use crate::preview::{placeholder_jpeg, PreviewJob, PreviewWorker};
 use crate::protocols::Protocols;
+use crate::saver::{SaveJob, Saver};
 use crate::undo::UndoStack;
 
 /// Cadence des trames d'état vers l'UI et le feedback OSC.
 const STATE_PERIOD: Duration = Duration::from_millis(100);
 /// Cadence du bandeau santé.
 const HEALTH_PERIOD: Duration = Duration::from_secs(1);
+/// Budget de commandes drainées par tick : un flood réseau (OSC/Art-Net/WS,
+/// bus non authentifié) ne doit JAMAIS monopoliser la boucle de rendu — le
+/// reste attend le tick suivant, la saturation est journalisée (throttlée).
+const CMD_BUDGET_PER_TICK: usize = 256;
+/// Débounce du snapshot de récupération (clone + sérialisation sur worker).
+const RECOVER_PUSH_PERIOD: Duration = Duration::from_secs(1);
+/// Nombre de fichiers `recover-*.json` conservés au démarrage.
+const RECOVER_KEEP: usize = 5;
+
+/// Résultat d'un re-scan des médias/matériaux (worker `conduite-rescan`).
+struct RescanResult {
+    media: Vec<MediaRef>,
+    materials: Vec<MaterialRef>,
+}
 
 /// Canaux injectés par `main` (partagés avec le serveur HTTP).
 pub struct SessionChannels {
@@ -56,6 +73,10 @@ struct MaterialData {
     sources: IsfSources,
     /// (nom d'uniform, adresse registre).
     inputs: Vec<(String, String)>,
+    /// Specs typées des inputs, construites au parse : `rebuild_registry`
+    /// ne relit JAMAIS les `.fs` du disque (un drag de coin déclenchait une
+    /// relecture de tous les shaders sur le thread de tick).
+    typed_specs: Vec<ParamSpec>,
 }
 
 /// Adresses pré-formatées d'un slice (zéro allocation par frame).
@@ -108,6 +129,16 @@ pub struct Session {
     dirty: bool,
     last_edit: Option<Instant>,
     last_save: Instant,
+    /// Écritures disque hors tick (show.json, backups, snapshot post-panic).
+    saver: Saver,
+    /// Une sauvegarde est en vol sur le worker (une seule à la fois).
+    save_in_flight: bool,
+    /// Génération d'édition : `dirty` ne retombe que si la sauvegarde
+    /// terminée correspond au dernier état édité.
+    edit_gen: u64,
+    /// Le snapshot de récupération doit être re-poussé (débounce 1 s).
+    recover_dirty: bool,
+    last_recover_push: Instant,
 
     start: Instant,
     last_tick: Instant,
@@ -117,7 +148,9 @@ pub struct Session {
     dbo_target: f32,
     dbo_fade_s: f32,
 
-    health: HealthSampler,
+    /// Échantillonnage sysinfo sur thread dédié (None = thread refusé par
+    /// l'OS : santé machine absente, jamais de sysinfo sur le tick).
+    health: Option<SamplerThread>,
     fps: HashMap<OutputId, FpsCounter>,
     last_health: Instant,
     last_state: Instant,
@@ -137,24 +170,42 @@ pub struct Session {
     last_active: Option<CueNumber>,
     last_standby: Option<CueNumber>,
     gl_failed_flagged: bool,
+
+    /// Le Show a muté depuis la dernière sérialisation vers l'UI : la trame
+    /// d'état 10 Hz ne re-sérialise le Show QUE dans ce cas (le runtime
+    /// léger seul est sérialisé à 10 Hz).
+    state_show_dirty: bool,
+    /// Re-scan des médias en tâche de fond (résultat par canal).
+    rescan_tx: Sender<RescanResult>,
+    rescan_rx: Receiver<RescanResult>,
+    rescan_in_flight: bool,
+    /// Maintenance compositor différée au prochain tick avec GL courant :
+    /// détacher tous les matériaux + purger programmes/slices disparus,
+    /// puis préchauffer les programmes ISF du show (jamais de compilation
+    /// shader au GO).
+    comp_sync: bool,
+    /// Matériaux à recompiler à chaud (MaterialUpdate).
+    comp_reload: Vec<MaterialId>,
+    /// Buffers réutilisés des lectures préview asynchrones (program/standby).
+    preview_scratch: Vec<u8>,
+    preview_scratch_b: Vec<u8>,
+    /// Throttle du warn de saturation du bus de commandes.
+    last_cmd_warn: Option<Instant>,
+    /// Une génération de vignettes est déjà en cours (coalescence).
+    thumbs_running: Arc<AtomicBool>,
 }
 
 impl Session {
-    /// Construit la session : charge le show, (re)construit tous les moteurs
-    /// et démarre les surfaces de contrôle.
+    /// Construit la session : charge le show (avec repli sur les backups en
+    /// cas de fichier illisible — le show d'origine n'est JAMAIS écrasé par
+    /// la démo), (re)construit tous les moteurs et démarre les surfaces.
     pub fn new(dirs: Dirs, config: AppConfig, show_name: String, ch: SessionChannels) -> Session {
-        let (show, warnings) =
-            match conduite_core::load_show_with_media(&dirs.show_dir(&show_name), &dirs.media) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!(target: "app::session", show = %show_name, error = %e,
-                        "chargement du show impossible : show de démo en mémoire");
-                    (conduite_core::demo_show(), Vec::new())
-                }
-            };
+        let loaded = load_show_or_recover(&dirs, &show_name);
+        let (show, show_name, warnings) = (loaded.show, loaded.name, loaded.warnings);
         for w in &warnings {
             warn!(target: "app::session", "avertissement de chargement : {w}");
         }
+        notice_recover_files(&dirs.shows, &dirs.show_dir(&show_name));
         if config.audio_input.is_some() {
             warn!(target: "app::session",
                 "entrée audio configurée mais non intégrée (stub v1) : \
@@ -163,6 +214,15 @@ impl Session {
         let protocols = Protocols::spawn(ch.cmd_tx.clone(), &show.settings, &show.patch);
         let preview = PreviewWorker::spawn(ch.preview_tx.clone(), ch.preview_b_tx.clone());
         let placeholder = placeholder_jpeg(show.settings.mjpeg_width, show.settings.mjpeg_height);
+        let health = match SamplerThread::spawn() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!(target: "app::session", error = %e,
+                    "thread santé impossible : santé machine indisponible");
+                None
+            }
+        };
+        let (rescan_tx, rescan_rx) = crossbeam_channel::bounded::<RescanResult>(1);
         let now = Instant::now();
         let mut session = Session {
             dirs,
@@ -186,13 +246,18 @@ impl Session {
             dirty: false,
             last_edit: None,
             last_save: now,
+            saver: Saver::spawn(),
+            save_in_flight: false,
+            edit_gen: 0,
+            recover_dirty: false,
+            last_recover_push: now,
             start: now,
             last_tick: now,
             frame_index: 0,
             dbo_level: 0.0,
             dbo_target: 0.0,
             dbo_fade_s: 0.0,
-            health: HealthSampler::new(),
+            health,
             fps: HashMap::new(),
             last_health: now,
             last_state: now,
@@ -209,11 +274,21 @@ impl Session {
             last_active: None,
             last_standby: None,
             gl_failed_flagged: false,
+            state_show_dirty: true,
+            rescan_tx,
+            rescan_rx,
+            rescan_in_flight: false,
+            comp_sync: true,
+            comp_reload: Vec::new(),
+            preview_scratch: Vec::new(),
+            preview_scratch_b: Vec::new(),
+            last_cmd_warn: None,
+            thumbs_running: Arc::new(AtomicBool::new(false)),
         };
         session.players = Players::new(session.dirs.media.clone());
         session.rebuild_all();
         session.spawn_thumbs();
-        session.update_recover_snapshot();
+        session.push_recover_snapshot();
         info!(target: "app::session", show = %session.show.name,
             cues = session.show.cues.len(), "session prête");
         session
@@ -246,9 +321,15 @@ impl Session {
         if let Some(cfg) = self.show.outputs.iter().find(|o| o.id == output) {
             let mut cfg = cfg.clone();
             cfg.enabled = false;
-            let _ = self
+            // try_send : le bus est borné, le thread de session ne doit
+            // JAMAIS bloquer dessus (il est le seul à le drainer).
+            if self
                 .cmd_tx
-                .send((Source::Ui, Command::Edit(EditOp::OutputUpdate { output: cfg })));
+                .try_send((Source::Ui, Command::Edit(EditOp::OutputUpdate { output: cfg })))
+                .is_err()
+            {
+                warn!(target: "app::session", output, "bus saturé : fermeture de sortie perdue");
+            }
         }
     }
 
@@ -269,9 +350,34 @@ impl Session {
                 "GL indisponible : mode dégradé headless (UI/OSC/cues actifs)");
         }
 
-        // 1. Drain des commandes.
-        while let Ok((source, cmd)) = self.cmd_rx.try_recv() {
-            self.handle_command(source, cmd, now_s);
+        // 1. Drain des commandes — BORNÉ : un flood réseau ne monopolise
+        // jamais la boucle de rendu, le reste attend le tick suivant.
+        let mut drained = 0usize;
+        while drained < CMD_BUDGET_PER_TICK {
+            match self.cmd_rx.try_recv() {
+                Ok((source, cmd)) => {
+                    drained += 1;
+                    self.handle_command(source, cmd, now_s);
+                }
+                Err(_) => break,
+            }
+        }
+        if drained == CMD_BUDGET_PER_TICK && !self.cmd_rx.is_empty() {
+            let throttled = self
+                .last_cmd_warn
+                .map(|t| now.duration_since(t) < Duration::from_secs(1))
+                .unwrap_or(false);
+            if !throttled {
+                self.last_cmd_warn = Some(now);
+                warn!(target: "app::session", backlog = self.cmd_rx.len(),
+                    budget = CMD_BUDGET_PER_TICK,
+                    "bus de commandes saturé : drain plafonné (flood réseau ?)");
+            }
+        }
+
+        // 1 bis. Résultat d'un re-scan média en tâche de fond.
+        if let Ok(res) = self.rescan_rx.try_recv() {
+            self.apply_rescan(res);
         }
 
         // 2. Moteur de cues (l'oracle EOF interroge les players).
@@ -299,6 +405,22 @@ impl Session {
         // 5. DBO (fondu maître d'urgence, indépendant de la conduite).
         self.step_dbo(dt);
 
+        // 5 bis. Multiplicateurs de vitesse live → moteur de cues (compte à
+        // rebours AfterMedia). Poussé chaque tick : la vitesse peut aussi
+        // changer par blend de cue, pas seulement par ParamSet.
+        {
+            let cue = &mut self.cue;
+            let registry = &self.registry;
+            for (sid, addrs) in &self.addr_cache {
+                let mult = registry.value_f32(&addrs.speed);
+                // Vitesse nulle (média en pause) : mult invalide pour le
+                // moteur (warning) — on garde le dernier multiplicateur.
+                if mult.is_finite() && mult > 0.0 {
+                    cue.set_speed_mult(*sid, mult);
+                }
+            }
+        }
+
         // 6. Lecteurs : synchro sur les decks, horloges, préchargement.
         let status = self.cue.status();
         self.players.sync(&frame, &self.show, status.transition_active);
@@ -317,6 +439,7 @@ impl Session {
         let master = self.registry.value_f32("master/intensity").clamp(0.0, 1.0);
         let master_eff = master * (1.0 - frame.black.clamp(0.0, 1.0));
         if gfx.ready() && gfx.make_root_current() {
+            self.apply_compositor_maintenance(gfx);
             if let Some(gl) = gfx.gl.as_mut() {
                 let comp = &mut gl.compositor;
                 self.players.poll_uploads(&mut |slice, deck, f| {
@@ -332,7 +455,7 @@ impl Session {
                     .or_insert_with(|| FpsCounter::new(target_fps as f32))
                     .tick(now_s);
             });
-            self.render_previews(gfx, &frame, master_eff, now);
+            self.render_previews(gfx, &frame, master_eff, now, &plans);
         } else {
             // Headless : les décodages restent cadencés (frames jetées),
             // l'endpoint MJPEG reste vivant (placeholder).
@@ -347,12 +470,27 @@ impl Session {
         }
 
         // 9. État UI (10 Hz) + feedback OSC + événements de conduite.
+        // Seul le runtime (léger) est sérialisé à 10 Hz ; le Show complet
+        // n'est re-sérialisé QUE s'il a muté (édition, chargement, rescan) —
+        // jamais d'arbre JSON du show entier par période en régime établi.
         self.publish_cue_changes(&status);
         if now - self.last_state >= STATE_PERIOD {
             self.last_state = now;
             let rt = self.runtime_status(&status);
             self.protocols.osc_feedback(FeedbackEvent::Status(rt.clone()));
-            let _ = self.state_tx.send(json!({ "show": self.show, "runtime": rt }));
+            let rt_value = serde_json::to_value(&rt).unwrap_or(Value::Null);
+            let show_value = if self.state_show_dirty {
+                self.state_show_dirty = false;
+                Some(serde_json::to_value(&self.show).unwrap_or(Value::Null))
+            } else {
+                None
+            };
+            self.state_tx.send_modify(|v| {
+                if let Some(sv) = show_value {
+                    v["show"] = sv;
+                }
+                v["runtime"] = rt_value;
+            });
         }
         self.protocols.drain_midi_events(&self.events_tx);
 
@@ -366,7 +504,10 @@ impl Session {
         match cmd {
             Command::ParamSet { addr, value, source } => self.param_set(&addr, value, source),
             Command::ParamNudge { addr, delta, source } => {
-                let next = match self.registry.value(&addr) {
+                // Base du nudge : la CIBLE posée, hors modulation et hors
+                // lissage — nudger la valeur lue cuirait l'offset LFO dans
+                // la base et avalerait les crans rapides d'encodeur.
+                let next = match self.registry.target(&addr) {
                     Some(ParamValue::F(x)) => Some(ParamValue::F(x + delta)),
                     Some(ParamValue::I(i)) => Some(ParamValue::I(i + delta.round() as i64)),
                     Some(_) => {
@@ -433,6 +574,12 @@ impl Session {
             Command::ShowCollect => self.show_collect(),
             Command::ModeSet { mode } => {
                 self.mode = mode;
+                if mode == AppMode::Show {
+                    // Filet de sécurité : tous les programmes ISF du show
+                    // sont préchauffés avant la représentation (jamais de
+                    // glCompileShader au GO).
+                    self.comp_sync = true;
+                }
                 info!(target: "app::session", ?mode, "mode changé");
                 self.publish_event(&StateEvent::ModeChanged { mode });
             }
@@ -440,6 +587,14 @@ impl Session {
     }
 
     fn param_set(&mut self, addr: &str, value: ParamValue, source: Source) {
+        // Adresse inconnue du registre (OSC/WS forgé ou périmé) : sortie
+        // IMMÉDIATE — ne jamais alimenter le soft-takeover MIDI ni le
+        // feedback avec des adresses arbitraires (épuisement mémoire de
+        // `Pickup.logical` sous flood réseau). Warn throttlé côté surfaces.
+        if !self.registry.contains(addr) {
+            debug!(target: "app::session", %addr, ?source, "param_set sur une adresse inconnue");
+            return;
+        }
         self.registry.set(addr, value, source);
         let live = self.registry.value_f32(addr);
         self.protocols.midi_update_logical(addr, live);
@@ -470,6 +625,7 @@ impl Session {
                 }
                 if changed {
                     self.modul.load(&self.show.modulators, &self.show.routes);
+                    self.state_show_dirty = true;
                 }
             }
             "depth" => {
@@ -495,9 +651,12 @@ impl Session {
             warn!(target: "app::session", "édition refusée : mode Show verrouillé");
             return;
         }
+        // Les réglages d'avant l'op : `after_model_change` ne respawne les
+        // surfaces réseau que si la configuration réseau a réellement changé.
+        let prev_settings = self.show.settings.clone();
         self.undo.push(self.show.clone());
         op.apply(&mut self.show);
-        self.after_model_change(&op);
+        self.after_model_change(&op, &prev_settings);
         self.mark_dirty();
         self.publish_event(&StateEvent::EditApplied { op });
     }
@@ -541,14 +700,19 @@ impl Session {
     }
 
     /// Reconstructions ciblées après une mutation du modèle.
-    fn after_model_change(&mut self, op: &EditOp) {
+    fn after_model_change(&mut self, op: &EditOp, prev_settings: &ShowSettings) {
         use EditOp::*;
         match op {
             CueAdd { .. } | CueRemove { .. } | CueUpdate { .. } | CueUpdateState { .. } => {
                 self.reload_cues_preserving_position();
             }
-            SliceAdd { .. } | SliceRemove { .. } | SliceUpdate { .. } | CornerSet { .. } => {
+            SliceAdd { .. } | SliceUpdate { .. } | CornerSet { .. } => {
                 self.rebuild_registry();
+            }
+            SliceRemove { .. } => {
+                self.rebuild_registry();
+                // Textures/FBO du slice disparu à libérer côté GPU.
+                self.comp_sync = true;
             }
             OutputAdd { .. } | OutputRemove { .. } | OutputUpdate { .. } => {
                 self.outputs_dirty = true;
@@ -556,9 +720,23 @@ impl Session {
             MediaAdd { .. } | MediaRemove { .. } | MediaUpdate { .. } => {
                 self.players.clear();
             }
-            MaterialAdd { .. } | MaterialRemove { .. } | MaterialUpdate { .. } => {
+            MaterialUpdate { material } => {
                 self.load_materials();
                 self.rebuild_registry();
+                // Recompilation à chaud : sans elle, le ProgramCache ressert
+                // l'ancien programme et le shader corrigé ne prend jamais
+                // effet avant redémarrage.
+                self.materials_failed.remove(&material.id);
+                if !self.comp_reload.contains(&material.id) {
+                    self.comp_reload.push(material.id);
+                }
+            }
+            MaterialAdd { .. } | MaterialRemove { .. } => {
+                self.load_materials();
+                self.rebuild_registry();
+                // Remove : purge du programme GL orphelin + détachement des
+                // decks qui le portaient ; Add : préchauffage du nouveau.
+                self.comp_sync = true;
             }
             ModulatorAdd { .. } | ModulatorRemove { .. } | ModulatorUpdate { .. }
             | RouteAdd { .. } | RouteRemove { .. } | RouteUpdate { .. } => {
@@ -571,21 +749,23 @@ impl Session {
                 self.push_patch();
             }
             SettingsUpdate { .. } => {
-                self.protocols.respawn(&self.show.settings, &self.show.patch);
+                // Respawn (join de 4 threads, ~gel) uniquement si la
+                // configuration RÉSEAU a changé ; le reste se pousse à chaud.
+                let _ = prev_settings; // la signature réseau fait foi
+                self.protocols
+                    .respawn_if_changed(&self.show.settings, &self.show.patch);
                 self.push_patch();
             }
             ShowRename { .. } => {}
         }
     }
 
-    /// Recharge la conduite après édition des cues en préservant au mieux la
-    /// position (le moteur repart standby sur la cue active précédente).
+    /// Recharge la conduite après édition des cues en préservant la position
+    /// À CHAUD : la cue active reste au programme (le deck A ne se vide pas,
+    /// les players survivent, la sortie ne gèle pas) et le prochain GO
+    /// avance au lieu de rejouer la cue courante.
     fn reload_cues_preserving_position(&mut self) {
-        let st = self.cue.status();
-        self.cue.load(&self.show.cues);
-        if let Some(n) = st.active.or(st.standby) {
-            self.cue.standby(n);
-        }
+        self.cue.load_hot(&self.show.cues);
     }
 
     fn push_patch(&mut self) {
@@ -598,22 +778,34 @@ impl Session {
     fn mark_dirty(&mut self) {
         self.dirty = true;
         self.last_edit = Some(Instant::now());
-        self.update_recover_snapshot();
+        self.edit_gen = self.edit_gen.wrapping_add(1);
+        self.recover_dirty = true;
+        self.state_show_dirty = true;
     }
 
     // -------------------------------------------------- show load/save/scan
 
+    /// Demande une sauvegarde au thread d'écriture (clone du Show — la
+    /// sérialisation et les `fsync` vivent sur le worker, jamais sur le
+    /// tick). `dirty` ne retombe qu'au résultat, si rien n'a été édité
+    /// depuis (voir [`Session::autosave`]).
     fn save_show(&mut self) {
-        let dir = self.dirs.show_dir(&self.show_name);
-        match conduite_core::save_show_atomic(&dir, &self.show) {
-            Ok(()) => {
-                self.dirty = false;
-                self.last_save = Instant::now();
-                info!(target: "app::session", dir = %dir.display(), "show sauvegardé");
-            }
-            Err(e) => error!(target: "app::session", error = %e, "sauvegarde du show impossible"),
+        if self.save_in_flight {
+            debug!(target: "app::session", "sauvegarde déjà en vol");
+            return;
         }
-        self.update_recover_snapshot();
+        let dir = self.dirs.show_dir(&self.show_name);
+        let job = SaveJob::Save {
+            dir,
+            shows_dir: self.dirs.shows.clone(),
+            show: Box::new(self.show.clone()),
+            gen: self.edit_gen,
+        };
+        if self.saver.submit(job) {
+            self.save_in_flight = true;
+            self.last_save = Instant::now();
+            self.recover_dirty = false; // le worker met aussi le snapshot à jour
+        }
     }
 
     fn load_show(&mut self, name: &str) {
@@ -643,7 +835,7 @@ impl Session {
         self.dirty = false;
         self.rebuild_all();
         self.spawn_thumbs();
-        self.update_recover_snapshot();
+        self.push_recover_snapshot();
         self.publish_event(&StateEvent::ShowLoaded {
             name: self.show.name.clone(),
         });
@@ -651,7 +843,9 @@ impl Session {
     }
 
     /// Reconstruction complète : registre, conduite, modulation, matériaux,
-    /// lecteurs, surfaces.
+    /// lecteurs, surfaces (respawn réseau seulement si la config a changé),
+    /// et maintenance GPU différée (détachement des matériaux fantômes,
+    /// purge des programmes/slices disparus, préchauffage ISF).
     fn rebuild_all(&mut self) {
         self.load_materials();
         self.rebuild_registry();
@@ -659,40 +853,100 @@ impl Session {
         self.modul.load(&self.show.modulators, &self.show.routes);
         self.players.clear();
         self.material_bound.clear();
-        self.protocols.respawn(&self.show.settings, &self.show.patch);
+        // L'état GPU (Compositor) survit à material_bound.clear() : sans ce
+        // flag, l'ancien shader resterait affiché à la place de la vidéo
+        // (matériau fantôme) et ses FBO fuiraient.
+        self.comp_sync = true;
+        self.protocols
+            .respawn_if_changed(&self.show.settings, &self.show.patch);
         self.push_patch();
         self.outputs_dirty = true;
         self.last_active = None;
         self.last_standby = None;
+        self.state_show_dirty = true;
     }
 
+    /// Re-scan des médias et matériaux — REFUSÉ en mode Show, exécuté en
+    /// tâche de fond (scan disque + un ffprobe par média : jamais sur le
+    /// tick). Le résultat revient par canal et s'applique dans `tick`.
     fn media_rescan(&mut self) {
-        info!(target: "app::session", "re-scan des médias et matériaux");
-        let scanned = conduite_media_library::scan(&self.dirs.media);
-        self.show.media = conduite_media_library::reconcile(&self.show.media, scanned);
-        for m in &mut self.show.media {
-            m.missing = conduite_core::validate_relative_path(&m.path).is_err()
-                || !self.dirs.media.join(&m.path).is_file();
+        if self.mode == AppMode::Show {
+            warn!(target: "app::session", "re-scan refusé : mode Show verrouillé");
+            return;
         }
-        conduite_media_library::probe_all(&mut self.show.media, &self.dirs.media, |p| {
-            conduite_engine::probe(p).map(|i| ProbeInfo {
-                duration_s: i.duration_s,
-                fps: i.fps,
-                width: i.width,
-                height: i.height,
-            })
-        });
-        let scanned_mats = conduite_media_library::scan_materials(&self.dirs.shaders);
-        self.show.materials =
-            conduite_media_library::reconcile_materials(&self.show.materials, scanned_mats);
-        self.load_materials();
+        if self.rescan_in_flight {
+            info!(target: "app::session", "re-scan déjà en cours");
+            return;
+        }
+        info!(target: "app::session", "re-scan des médias et matériaux (tâche de fond)");
+        let media_dir = self.dirs.media.clone();
+        let shaders_dir = self.dirs.shaders.clone();
+        let existing_media = self.show.media.clone();
+        let existing_mats = self.show.materials.clone();
+        let tx = self.rescan_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("conduite-rescan".into())
+            .spawn(move || {
+                let scanned = conduite_media_library::scan(&media_dir);
+                let mut media = conduite_media_library::reconcile(&existing_media, scanned);
+                for m in &mut media {
+                    m.missing = conduite_core::validate_relative_path(&m.path).is_err()
+                        || !media_dir.join(&m.path).is_file();
+                }
+                conduite_media_library::probe_all(&mut media, &media_dir, |p| {
+                    conduite_engine::probe(p).map(|i| ProbeInfo {
+                        duration_s: i.duration_s,
+                        fps: i.fps,
+                        width: i.width,
+                        height: i.height,
+                    })
+                });
+                let scanned_mats = conduite_media_library::scan_materials(&shaders_dir);
+                let materials =
+                    conduite_media_library::reconcile_materials(&existing_mats, scanned_mats);
+                let _ = tx.send(RescanResult { media, materials });
+            });
+        match spawned {
+            Ok(_) => self.rescan_in_flight = true,
+            Err(e) => warn!(target: "app::session", error = %e, "thread de re-scan impossible"),
+        }
+    }
+
+    /// Applique le résultat d'un re-scan (sur le tick, données déjà
+    /// sondées : aucune I/O média). Les players ne sont détruits que si le
+    /// pool a réellement changé — un re-scan sans changement ne coupe pas
+    /// la lecture en cours et ne salit pas le show.
+    fn apply_rescan(&mut self, res: RescanResult) {
+        self.rescan_in_flight = false;
+        if self.mode == AppMode::Show {
+            // Passé en mode Show entre-temps : aucune mutation pendant la
+            // représentation, l'opérateur relancera un rescan en Edit.
+            warn!(target: "app::session", "résultat de re-scan ignoré (mode Show)");
+            return;
+        }
+        let media_changed = self.show.media != res.media;
+        let mats_changed = self.show.materials != res.materials;
+        if !media_changed && !mats_changed {
+            info!(target: "app::session", "re-scan : aucun changement");
+            return;
+        }
+        self.show.media = res.media;
+        self.show.materials = res.materials;
+        if mats_changed {
+            self.load_materials();
+            self.comp_sync = true;
+        }
         self.rebuild_registry();
-        self.players.clear();
-        self.spawn_thumbs();
+        if media_changed {
+            self.players.clear();
+            self.spawn_thumbs();
+        }
         self.mark_dirty();
         self.publish_event(&StateEvent::ShowLoaded {
             name: self.show.name.clone(),
         });
+        info!(target: "app::session", media = media_changed, materials = mats_changed,
+            "re-scan appliqué");
     }
 
     fn show_collect(&mut self) {
@@ -714,34 +968,70 @@ impl Session {
         }
     }
 
-    /// Vignettes en tâche de fond (jamais sur le tick).
+    /// Vignettes en tâche de fond (jamais sur le tick). Une génération déjà
+    /// en cours ⇒ coalescence : la génération suivante (rescan, nouveau
+    /// show) rattrapera ce qui n'est pas frais — pas de threads empilés.
     fn spawn_thumbs(&self) {
         let media = self.show.media.clone();
         if media.is_empty() {
             return;
         }
+        if self
+            .thumbs_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            debug!(target: "app::session", "génération de vignettes déjà en cours");
+            return;
+        }
         let media_dir = self.dirs.media.clone();
         let thumbs_dir = self.dirs.thumbs.clone();
+        let running = Arc::clone(&self.thumbs_running);
         let spawned = std::thread::Builder::new()
             .name("conduite-thumbs".into())
             .spawn(move || {
                 let report = conduite_media_library::generate_thumbs(&media, &media_dir, &thumbs_dir);
+                running.store(false, Ordering::SeqCst);
                 info!(target: "app::session", ?report, "vignettes générées");
             });
         if let Err(e) = spawned {
+            self.thumbs_running.store(false, Ordering::SeqCst);
             warn!(target: "app::session", error = %e, "thread vignettes impossible");
         }
     }
 
-    fn update_recover_snapshot(&self) {
-        match serde_json::to_string_pretty(&self.show) {
-            Ok(json) => logsetup::set_recover_snapshot(self.dirs.shows.clone(), json),
-            Err(e) => warn!(target: "app::session", error = %e, "snapshot de récupération impossible"),
+    /// Pousse un snapshot de récupération au worker (clone seul sur le tick,
+    /// sérialisation sur le worker).
+    fn push_recover_snapshot(&mut self) {
+        let job = SaveJob::Snapshot {
+            shows_dir: self.dirs.shows.clone(),
+            show: Box::new(self.show.clone()),
+        };
+        if self.saver.submit(job) {
+            self.recover_dirty = false;
+            self.last_recover_push = Instant::now();
         }
     }
 
+    /// Autosave + drain des résultats de sauvegarde. Tout le coût disque vit
+    /// sur le worker ; le tick clone au plus un Show par débounce.
     fn autosave(&mut self, now: Instant) {
-        if !self.dirty {
+        // Résultats du worker : `dirty` ne retombe que si la sauvegarde
+        // correspond au dernier état édité (sinon on resauvera).
+        while let Some(outcome) = self.saver.try_result() {
+            self.save_in_flight = false;
+            if outcome.ok && outcome.gen == self.edit_gen {
+                self.dirty = false;
+            }
+        }
+
+        // Snapshot de récupération débouncé (1 s) après édition.
+        if self.recover_dirty && now.duration_since(self.last_recover_push) >= RECOVER_PUSH_PERIOD
+        {
+            self.push_recover_snapshot();
+        }
+
+        if !self.dirty || self.save_in_flight {
             return;
         }
         let debounce = Duration::from_secs_f32(self.show.settings.autosave_debounce_s.max(0.1));
@@ -808,10 +1098,15 @@ impl Session {
             self.addr_cache.insert(s.id, a);
         }
 
-        // Inputs ISF des matériaux (specs typées depuis les IsfDoc).
-        let typed: Vec<ParamSpec> = self.material_typed_specs();
-        for sp in typed {
-            self.registry.register(sp);
+        // Inputs ISF des matériaux : specs typées mises en cache par
+        // `load_materials` — aucune lecture disque ici.
+        {
+            let registry = &mut self.registry;
+            for mat in self.materials.values() {
+                for sp in &mat.typed_specs {
+                    registry.register(sp.clone());
+                }
+            }
         }
 
         for m in &self.show.modulators {
@@ -859,51 +1154,6 @@ impl Session {
         }
     }
 
-    /// Specs typées des inputs ISF (Float/Bool/Long/Color/Point2D).
-    fn material_typed_specs(&self) -> Vec<ParamSpec> {
-        let mut out = Vec::new();
-        for m in &self.show.materials {
-            let path = self.dirs.shaders.join(&m.path);
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            let Ok(doc) = conduite_isf::parse(&src) else { continue };
-            for input in &doc.inputs {
-                let addr = format!("material/{}/{}", m.id, input.name);
-                let (kind, default) = match &input.kind {
-                    IsfInputKind::Float { min, max, default } => (
-                        ParamKind::Float { min: *min, max: *max },
-                        ParamValue::F(*default),
-                    ),
-                    IsfInputKind::Bool { default } => (ParamKind::Bool, ParamValue::B(*default)),
-                    IsfInputKind::Long { min, max, default, values, labels } => {
-                        if !labels.is_empty() && labels.len() == values.len() {
-                            let idx = values.iter().position(|v| v == default).unwrap_or(0);
-                            (ParamKind::Enum(labels.clone()), ParamValue::I(idx as i64))
-                        } else {
-                            (ParamKind::Int { min: *min, max: *max }, ParamValue::I(*default))
-                        }
-                    }
-                    IsfInputKind::Color { default } => (ParamKind::Color, ParamValue::Color(*default)),
-                    IsfInputKind::Point2D { default, .. } => {
-                        (ParamKind::Point2, ParamValue::P2(*default))
-                    }
-                    IsfInputKind::Image
-                    | IsfInputKind::Event
-                    | IsfInputKind::Audio
-                    | IsfInputKind::AudioFft => continue,
-                };
-                out.push(ParamSpec {
-                    addr,
-                    label: input.label.clone(),
-                    kind,
-                    default,
-                    smoothing_ms: 50.0,
-                    scriptable: true,
-                });
-            }
-        }
-        out
-    }
-
     /// Parse et génère le GLSL de tous les matériaux du show (IO — appelé
     /// uniquement au chargement et sur EditOp matériau, jamais par frame).
     fn load_materials(&mut self) {
@@ -949,12 +1199,64 @@ impl Session {
                 })
                 .map(|i| (i.name.clone(), format!("material/{}/{}", m.id, i.name)))
                 .collect();
-            self.materials.insert(m.id, MaterialData { sources, inputs });
+            let typed_specs = typed_specs_of(&doc, m.id);
+            self.materials.insert(m.id, MaterialData { sources, inputs, typed_specs });
         }
         info!(target: "app::session", count = self.materials.len(), "matériaux ISF chargés");
     }
 
     // ---------------------------------------------------------------- rendu
+
+    /// Maintenance GPU différée, exécutée en tête de tick avec le contexte
+    /// GL courant :
+    /// 1) `comp_sync` : détache TOUS les matériaux (miroir GPU de
+    ///    `material_bound.clear()` — sans quoi l'ancien shader reste affiché
+    ///    à la place de la vidéo après un chargement de show/undo/redo),
+    ///    purge les programmes ISF et les slices disparus (VRAM), puis
+    ///    préchauffe les programmes de tous les matériaux du show — jamais
+    ///    de `glCompileShader` au GO pendant la représentation ;
+    /// 2) `comp_reload` : recompilation à chaud des matériaux édités (sans
+    ///    elle le ProgramCache ressert l'ancien programme à vie).
+    fn apply_compositor_maintenance(&mut self, gfx: &mut Gfx) {
+        if !self.comp_sync && self.comp_reload.is_empty() {
+            return;
+        }
+        let Some(gl) = gfx.gl.as_mut() else { return };
+        let comp = &mut gl.compositor;
+        if self.comp_sync {
+            self.comp_sync = false;
+            comp.detach_all_materials();
+            self.material_bound.clear();
+            let keep_mats: Vec<MaterialId> = self.show.materials.iter().map(|m| m.id).collect();
+            comp.retain_materials(&keep_mats);
+            let keep_slices: Vec<SliceId> = self.show.slices.iter().map(|s| s.id).collect();
+            comp.prune_slices(&keep_slices);
+            let list: Vec<(MaterialId, &IsfSources)> = self
+                .materials
+                .iter()
+                .map(|(id, m)| (*id, &m.sources))
+                .collect();
+            for (id, e) in comp.prewarm(&list) {
+                error!(target: "app::session", material = id,
+                    "compilation du matériau (préchauffage) :\n{e}");
+                self.materials_failed.insert(id);
+            }
+        }
+        for id in std::mem::take(&mut self.comp_reload) {
+            let Some(mat) = self.materials.get(&id) else { continue };
+            match comp.reload_material(id, &mat.sources) {
+                Ok(()) => {
+                    self.materials_failed.remove(&id);
+                    info!(target: "app::session", material = id, "matériau recompilé à chaud");
+                }
+                Err(e) => {
+                    error!(target: "app::session", material = id,
+                        "recompilation du matériau :\n{e}");
+                    self.materials_failed.insert(id);
+                }
+            }
+        }
+    }
 
     /// Pose les matériaux ISF des decks et pousse leurs uniforms (TIME,
     /// TIMEDELTA, FRAMEINDEX, RENDERSIZE + inputs pilotés par le registre).
@@ -1086,24 +1388,39 @@ impl Session {
             .unwrap_or(true)
     }
 
-    /// Préviews MJPEG (program + standby), cadencées, jamais bloquantes.
-    fn render_previews(&mut self, gfx: &mut Gfx, frame: &CueFrame, master: f32, now: Instant) {
+    /// Préviews MJPEG (program + standby), cadencées, jamais bloquantes :
+    /// lecture asynchrone double-PBO (un canal par flux — la frame livrée
+    /// est celle du tick préview précédent, `false` = rien à envoyer), et
+    /// composition en réutilisant les FBO matériaux déjà rendus ce tick
+    /// (pas de re-passe ISF pleine résolution pour une cible 640×360). Le
+    /// plan program du tick est réutilisé (pas de `build_draws` en double).
+    fn render_previews(
+        &mut self,
+        gfx: &mut Gfx,
+        frame: &CueFrame,
+        master: f32,
+        now: Instant,
+        plans: &HashMap<OutputId, Vec<SliceDraw>>,
+    ) {
         let fps = self.show.settings.mjpeg_fps.max(1) as f32;
         let period = Duration::from_secs_f32(1.0 / fps);
         let (w, h) = (self.show.settings.mjpeg_width, self.show.settings.mjpeg_height);
         if now.duration_since(self.last_preview) >= period {
             self.last_preview = now;
-            let plans = self.build_draws(frame, None);
-            if let Some(slices) = first_output_plan(&self.show.outputs, &plans) {
-                if let Some(rgba) = gfx.render_preview(w, h, slices, master, self.dbo_level) {
+            if let Some(slices) = first_output_plan(&self.show.outputs, plans) {
+                let mut buf = std::mem::take(&mut self.preview_scratch);
+                let got =
+                    gfx.render_preview_into(0, w, h, slices, master, self.dbo_level, true, &mut buf);
+                if got {
                     self.preview.submit(PreviewJob {
-                        rgba,
+                        rgba: buf.clone(),
                         width: w,
                         height: h,
                         standby: false,
                         flip: true,
                     });
                 }
+                self.preview_scratch = buf;
             } else {
                 let _ = self.preview_tx.send(self.placeholder.clone());
             }
@@ -1111,17 +1428,20 @@ impl Session {
         // Standby : même chemin à cadence moitié (deck B plein, sans master).
         if now.duration_since(self.last_preview_b) >= period * 2 {
             self.last_preview_b = now;
-            let plans = self.build_draws(frame, Some(1.0));
-            if let Some(slices) = first_output_plan(&self.show.outputs, &plans) {
-                if let Some(rgba) = gfx.render_preview(w, h, slices, 1.0, 0.0) {
+            let plans_b = self.build_draws(frame, Some(1.0));
+            if let Some(slices) = first_output_plan(&self.show.outputs, &plans_b) {
+                let mut buf = std::mem::take(&mut self.preview_scratch_b);
+                let got = gfx.render_preview_into(1, w, h, slices, 1.0, 0.0, true, &mut buf);
+                if got {
                     self.preview.submit(PreviewJob {
-                        rgba,
+                        rgba: buf.clone(),
                         width: w,
                         height: h,
                         standby: true,
                         flip: true,
                     });
                 }
+                self.preview_scratch_b = buf;
             } else {
                 let _ = self.preview_b_tx.send(self.placeholder.clone());
             }
@@ -1149,9 +1469,22 @@ impl Session {
             match ev {
                 CueEvent::CueStarted { cue } => {
                     self.modul.retrigger();
+                    let mut media_slices: Vec<SliceId> = Vec::new();
                     if let Some(c) = self.find_cue(*cue) {
                         let states = c.mod_routes.clone();
+                        media_slices = c
+                            .states
+                            .iter()
+                            .filter(|st| matches!(st.content, Content::Media(_)))
+                            .map(|st| st.slice)
+                            .collect();
                         self.modul.apply_route_states(&states);
+                    }
+                    // Ré-activation d'une cue au même contenu (goto_after
+                    // vers soi-même, média répété) : le player déjà avancé
+                    // ou en EOF doit repartir de son point d'entrée.
+                    for s in media_slices {
+                        self.players.request_restart(s);
                     }
                     info!(target: "app::session", cue = %cue, "GO");
                 }
@@ -1209,7 +1542,9 @@ impl Session {
     }
 
     fn publish_health(&mut self) {
-        let sys = self.health.sample();
+        // Dernier échantillon du thread santé (verrou court, jamais de
+        // sysinfo/WMI sur le tick — à-coup 1 Hz supprimé).
+        let sys = self.health.as_ref().map(|h| h.latest()).unwrap_or_default();
         let counters: Vec<(OutputId, &FpsCounter)> =
             self.fps.iter().map(|(id, c)| (*id, c)).collect();
         let snapshot = conduite_system::merge(&counters, sys);
@@ -1285,4 +1620,308 @@ fn deck_gl(d: Deck) -> conduite_compositor::DeckSlot {
 /// Id numérique en tête d'un reste d'adresse (`{id}/...`).
 fn id_of(rest: &str) -> Option<u32> {
     rest.split('/').next()?.parse().ok()
+}
+
+/// Specs typées des inputs ISF d'un doc parsé (Float/Bool/Long/Color/
+/// Point2D) — construites une fois au `load_materials`, jamais relues du
+/// disque par `rebuild_registry`.
+fn typed_specs_of(doc: &conduite_isf::IsfDoc, material: u32) -> Vec<ParamSpec> {
+    let mut out = Vec::new();
+    for input in &doc.inputs {
+        let addr = format!("material/{material}/{}", input.name);
+        let (kind, default) = match &input.kind {
+            IsfInputKind::Float { min, max, default } => (
+                ParamKind::Float { min: *min, max: *max },
+                ParamValue::F(*default),
+            ),
+            IsfInputKind::Bool { default } => (ParamKind::Bool, ParamValue::B(*default)),
+            IsfInputKind::Long { min, max, default, values, labels } => {
+                if !labels.is_empty() && labels.len() == values.len() {
+                    let idx = values.iter().position(|v| v == default).unwrap_or(0);
+                    (ParamKind::Enum(labels.clone()), ParamValue::I(idx as i64))
+                } else {
+                    (ParamKind::Int { min: *min, max: *max }, ParamValue::I(*default))
+                }
+            }
+            IsfInputKind::Color { default } => (ParamKind::Color, ParamValue::Color(*default)),
+            IsfInputKind::Point2D { default, .. } => (ParamKind::Point2, ParamValue::P2(*default)),
+            IsfInputKind::Image
+            | IsfInputKind::Event
+            | IsfInputKind::Audio
+            | IsfInputKind::AudioFft => continue,
+        };
+        out.push(ParamSpec {
+            addr,
+            label: input.label.clone(),
+            kind,
+            default,
+            smoothing_ms: 50.0,
+            scriptable: true,
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------- chargement tolérant
+
+/// Show chargé (ou récupéré) au démarrage.
+struct LoadedShow {
+    show: Show,
+    /// Nom effectif : `<nom>-secours` si on est retombé sur la démo, pour
+    /// que save/autosave n'écrasent JAMAIS le dossier d'origine.
+    name: String,
+    warnings: Vec<LoadWarning>,
+}
+
+/// Charge `shows/<name>/show.json` avec récupération : fichier illisible ou
+/// de version future ⇒ l'original est PRÉSERVÉ (renommé `.corrompu-<ts>`),
+/// les backups sont tentés du plus récent au plus ancien, et en dernier
+/// recours la démo est chargée sous un nom distinct — le show d'origine
+/// n'est jamais écrasé et ses backups ne sont jamais élagués par la démo.
+fn load_show_or_recover(dirs: &Dirs, name: &str) -> LoadedShow {
+    let dir = dirs.show_dir(name);
+    match conduite_core::load_show_with_media(&dir, &dirs.media) {
+        Ok((show, warnings)) => LoadedShow {
+            show,
+            name: name.to_string(),
+            warnings,
+        },
+        Err(e) => {
+            let unsupported = matches!(e, CoreError::UnsupportedVersion(..));
+            error!(target: "app::session", show = name, error = %e,
+                "show illisible : tentative de récupération (backups)");
+            // Préserver l'original : renommage horodaté (jamais de perte).
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let kept = dir.join(format!("{}.corrompu-{stamp}", conduite_core::SHOW_FILE));
+            let src = dir.join(conduite_core::SHOW_FILE);
+            match std::fs::rename(&src, &kept) {
+                Ok(()) => warn!(target: "app::session", kept = %kept.display(),
+                    "fichier d'origine préservé"),
+                Err(re) => warn!(target: "app::session", error = %re,
+                    "renommage du fichier illisible impossible"),
+            }
+            if unsupported {
+                error!(target: "app::session",
+                    "version de format plus récente que ce logiciel : mettez \
+                     Conduite à jour ou rouvrez le show sur la machine d'origine");
+            }
+            if let Some(loaded) = try_backups(dirs, name) {
+                return loaded;
+            }
+            let fallback = format!("{name}-secours");
+            error!(target: "app::session", show = name, fallback = %fallback,
+                "aucun backup exploitable : show de démo chargé sous un nom \
+                 DISTINCT — le dossier d'origine ne sera pas écrasé");
+            LoadedShow {
+                show: conduite_core::demo_show(),
+                name: fallback,
+                warnings: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Tente les backups du plus récent au plus ancien : le premier qui se
+/// charge est restauré comme `show.json` (écriture atomique) et utilisé.
+fn try_backups(dirs: &Dirs, name: &str) -> Option<LoadedShow> {
+    let dir = dirs.show_dir(name);
+    let backups = dir.join(conduite_core::BACKUP_DIR);
+    let mut names: Vec<String> = std::fs::read_dir(&backups)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.starts_with("show-") && n.ends_with(".json"))
+        .collect();
+    names.sort(); // horodatage à largeur fixe : ordre lexicographique = chrono
+    for n in names.into_iter().rev() {
+        let path = backups.join(&n);
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if conduite_core::write_atomic(&dir.join(conduite_core::SHOW_FILE), &bytes).is_err() {
+            continue;
+        }
+        match conduite_core::load_show_with_media(&dir, &dirs.media) {
+            Ok((show, warnings)) => {
+                warn!(target: "app::session", backup = %path.display(),
+                    "show restauré depuis un backup — vérifiez la conduite");
+                return Some(LoadedShow {
+                    show,
+                    name: name.to_string(),
+                    warnings,
+                });
+            }
+            Err(e) => {
+                warn!(target: "app::session", backup = %path.display(), error = %e,
+                    "backup inexploitable, suivant");
+            }
+        }
+    }
+    None
+}
+
+/// Signale au démarrage un fichier de récupération post-panic plus récent
+/// que le show courant (log ERROR : visible console + UI web), et élague
+/// les `recover-*.json` au-delà de [`RECOVER_KEEP`].
+fn notice_recover_files(shows_dir: &std::path::Path, show_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(shows_dir) else { return };
+    let mut recovers: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.starts_with("recover-") && n.ends_with(".json"))
+        .collect();
+    if recovers.is_empty() {
+        return;
+    }
+    recovers.sort(); // horodaté : ordre chrono
+    // Élagage : garder les RECOVER_KEEP plus récents.
+    if recovers.len() > RECOVER_KEEP {
+        let excess = recovers.len() - RECOVER_KEEP;
+        for n in recovers.drain(..excess) {
+            let _ = std::fs::remove_file(shows_dir.join(n));
+        }
+    }
+    let newest = shows_dir.join(recovers.last().map(String::as_str).unwrap_or_default());
+    let show_mtime = std::fs::metadata(show_dir.join(conduite_core::SHOW_FILE))
+        .and_then(|m| m.modified())
+        .ok();
+    let recover_mtime = std::fs::metadata(&newest).and_then(|m| m.modified()).ok();
+    let newer = match (recover_mtime, show_mtime) {
+        (Some(r), Some(s)) => r > s,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if newer {
+        error!(target: "app::session", path = %newest.display(),
+            "un fichier de RÉCUPÉRATION post-crash est plus récent que le \
+             show chargé — pour le récupérer : copier ce fichier comme \
+             show.json dans le dossier du show puis recharger");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dirs(name: &str) -> Dirs {
+        let base = std::env::temp_dir().join(format!(
+            "conduite-session-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = Dirs {
+            media: base.join("media"),
+            shows: base.join("shows"),
+            shaders: base.join("shaders"),
+            logs: base.join("logs"),
+            thumbs: base.join("thumbs"),
+            base,
+        };
+        for d in [&dirs.media, &dirs.shows, &dirs.shaders] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        dirs
+    }
+
+    /// show.json corrompu + backup sain : le backup le plus récent est
+    /// restauré, le nom du show est conservé et l'original est préservé
+    /// en `.corrompu-<ts>` (jamais écrasé par la démo).
+    #[test]
+    fn corrupt_show_recovers_from_backup_and_keeps_original() {
+        let dirs = test_dirs("recover");
+        let dir = dirs.show_dir("gala");
+        let mut show = Show::new("Gala");
+        conduite_core::save_show_atomic(&dir, &show).expect("save v1");
+        show.name = "Gala v2".to_string();
+        conduite_core::save_show_atomic(&dir, &show).expect("save v2");
+        // Corruption du fichier principal (coupure de courant simulée).
+        std::fs::write(dir.join(conduite_core::SHOW_FILE), b"{ tronqu").expect("corrupt");
+
+        let loaded = load_show_or_recover(&dirs, "gala");
+        assert_eq!(loaded.name, "gala", "nom conservé : restauration backup");
+        assert_eq!(loaded.show.name, "Gala v2", "backup le plus récent utilisé");
+        let corrompu = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".corrompu-"));
+        assert!(corrompu, "l'original illisible est préservé");
+        let _ = std::fs::remove_dir_all(&dirs.base);
+    }
+
+    /// show.json corrompu SANS backup : démo chargée sous `<nom>-secours` —
+    /// save/autosave n'écraseront jamais le dossier d'origine.
+    #[test]
+    fn corrupt_show_without_backup_falls_back_to_distinct_name() {
+        let dirs = test_dirs("secours");
+        let dir = dirs.show_dir("gala");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(conduite_core::SHOW_FILE), b"pas du json").expect("write");
+
+        let loaded = load_show_or_recover(&dirs, "gala");
+        assert_eq!(loaded.name, "gala-secours", "nom DISTINCT du dossier d'origine");
+        let corrompu = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".corrompu-"));
+        assert!(corrompu, "l'original est préservé");
+        let _ = std::fs::remove_dir_all(&dirs.base);
+    }
+
+    /// Version future du format : refusée, préservée, backups tentés — et
+    /// à défaut, démo sous nom distinct.
+    #[test]
+    fn future_version_never_overwritten_by_demo() {
+        let dirs = test_dirs("future");
+        let dir = dirs.show_dir("gala");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let future = serde_json::json!({ "format_version": 99, "name": "Futur" });
+        std::fs::write(
+            dir.join(conduite_core::SHOW_FILE),
+            serde_json::to_vec(&future).expect("json"),
+        )
+        .expect("write");
+
+        let loaded = load_show_or_recover(&dirs, "gala");
+        assert_eq!(loaded.name, "gala-secours");
+        // Le contenu v99 existe toujours (renommé, pas détruit).
+        let kept = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().contains(".corrompu-"))
+            .expect("fichier préservé");
+        let bytes = std::fs::read(kept.path()).expect("read");
+        assert!(String::from_utf8_lossy(&bytes).contains("\"format_version\":99"));
+        let _ = std::fs::remove_dir_all(&dirs.base);
+    }
+
+    /// Chargement sain : nom et contenu inchangés.
+    #[test]
+    fn healthy_show_loads_unchanged() {
+        let dirs = test_dirs("sain");
+        let dir = dirs.show_dir("gala");
+        conduite_core::save_show_atomic(&dir, &Show::new("Gala")).expect("save");
+        let loaded = load_show_or_recover(&dirs, "gala");
+        assert_eq!(loaded.name, "gala");
+        assert_eq!(loaded.show.name, "Gala");
+        let _ = std::fs::remove_dir_all(&dirs.base);
+    }
+
+    /// Les `recover-*.json` sont élagués au-delà de [`RECOVER_KEEP`].
+    #[test]
+    fn recover_files_are_pruned() {
+        let dirs = test_dirs("prune");
+        for i in 0..8 {
+            std::fs::write(
+                dirs.shows.join(format!("recover-2026010{i}-000000.json")),
+                b"{}",
+            )
+            .expect("write");
+        }
+        notice_recover_files(&dirs.shows, &dirs.show_dir("gala"));
+        let count = std::fs::read_dir(&dirs.shows)
+            .expect("read_dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("recover-"))
+            .count();
+        assert_eq!(count, RECOVER_KEEP, "élagage aux {RECOVER_KEEP} plus récents");
+        let _ = std::fs::remove_dir_all(&dirs.base);
+    }
 }

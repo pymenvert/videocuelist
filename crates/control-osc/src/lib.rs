@@ -19,6 +19,7 @@
 mod feedback;
 mod map;
 mod packet;
+mod ratelimit;
 mod server;
 
 pub use feedback::{FeedbackEvent, FeedbackState, OscFeedback, OscFeedbackHandle};

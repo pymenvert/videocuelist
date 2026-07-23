@@ -31,6 +31,10 @@ pub enum CoreError {
     /// Fichier show écrit par une version plus récente du logiciel.
     #[error("format de show v{0} plus récent que ce logiciel (v{1})")]
     UnsupportedVersion(u32, u32),
+
+    /// Une autre instance vivante tient déjà le verrou mono-instance.
+    #[error("une autre instance de Conduite tourne déjà (verrou {path})")]
+    InstanceLocked { path: String },
 }
 
 impl CoreError {

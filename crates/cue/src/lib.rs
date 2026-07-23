@@ -81,6 +81,10 @@ pub struct CueFrame {
     /// Snapshot cible + alpha de courbe pour `params::Registry::blend_toward`.
     /// `Some(_, 1.0)` sur le tick de fin de transition, `None` au repos.
     pub params_target: Option<(BTreeMap<String, ParamValue>, f32)>,
+    /// ThroughBlack, première moitié (avant la bascule à mi-course) : le
+    /// deck B n'est pas encore révélé — l'app doit GELER ses players B
+    /// (le média de la cible démarre à la bascule, pas au début du fondu).
+    pub freeze_b: bool,
     pub events: Vec<CueEvent>,
 }
 
@@ -146,8 +150,20 @@ pub struct CueEngine {
     pending: Vec<Pending>,
     events: Vec<CueEvent>,
     last_now_s: f64,
-    /// Une transition s'est terminée ce tick : émettre l'alpha final 1.0.
-    just_finished: bool,
+    /// Snapshots des cues activées CE tick, fusionnés dans l'ordre (le
+    /// dernier l'emporte par adresse) : émis avec l'alpha final 1.0. Un GO
+    /// pendant une transition peut activer deux cues dans le même tick
+    /// (snap puis Cut) — chaque snapshot doit être posé, pas seulement
+    /// celui de la dernière cue active.
+    finished_params: Option<BTreeMap<String, ParamValue>>,
+    /// Origine de l'horloge média de la cue active : début de la transition
+    /// d'entrée (le deck B avance pendant la transition), mi-course pour
+    /// ThroughBlack (deck B gelé avant la bascule, cf. `CueFrame::freeze_b`).
+    media_start_s: f64,
+    /// Multiplicateurs de vitesse live par slice (param
+    /// `slice/{id}/media/speed` appliqué par l'app aux players), pour le
+    /// compte à rebours AfterMedia. Absent = 1.0.
+    speed_mult: BTreeMap<SliceId, f32>,
 }
 
 impl CueEngine {
@@ -170,8 +186,61 @@ impl CueEngine {
         self.panic = None;
         self.pending.clear();
         self.events.clear();
-        self.just_finished = false;
+        self.finished_params = None;
+        self.media_start_s = 0.0;
+        self.speed_mult.clear();
         debug!(target: "cue", count = self.cues.len(), "conduite chargée");
+    }
+
+    /// Recharge la conduite À CHAUD (édition pendant la lecture) : re-résout
+    /// les scènes en préservant la position par [`CueNumber`]. La cue active
+    /// reste au programme — le deck A ne se vide pas, l'app ne tue pas ses
+    /// players et le prochain GO avance au lieu de rejouer la cue courante.
+    /// Les horloges de follow/média, le `follow_fired`, le panic et les
+    /// multiplicateurs de vitesse sont conservés. Une transition en cours
+    /// saute à sa fin (édition pendant un fondu : jamais d'état à cheval sur
+    /// deux conduites). Cue active disparue ⇒ repli : plus rien au programme,
+    /// standby sur l'ancienne standby si elle existe encore, sinon la
+    /// première cue.
+    pub fn load_hot(&mut self, cues: &[Cue]) {
+        self.snap_transition(self.last_now_s);
+        let active_n = self.active.map(|i| self.cues[i].number);
+        let standby_n = self.standby.map(|i| self.cues[i].number);
+        let keep_cue_start = self.cue_start_s;
+        let keep_media_start = self.media_start_s;
+        let keep_follow_fired = self.follow_fired;
+        let keep_panic = self.panic.clone();
+        let keep_speed = std::mem::take(&mut self.speed_mult);
+        // Les événements du snap (et le snapshot de params à poser à 1.0)
+        // doivent survivre au rechargement.
+        let keep_events = std::mem::take(&mut self.events);
+        let keep_finished = self.finished_params.take();
+
+        self.load(cues);
+
+        self.events = keep_events;
+        self.finished_params = keep_finished;
+        self.panic = keep_panic;
+        self.speed_mult = keep_speed;
+        match active_n.and_then(|n| self.index_of(n)) {
+            Some(i) => {
+                self.active = Some(i);
+                self.cue_start_s = keep_cue_start;
+                self.media_start_s = keep_media_start;
+                self.follow_fired = keep_follow_fired;
+                self.standby = standby_n
+                    .and_then(|n| self.index_of(n))
+                    .or_else(|| self.standby_after(i));
+            }
+            None => {
+                if let Some(i) = standby_n.and_then(|n| self.index_of(n)) {
+                    self.standby = Some(i);
+                }
+                // Sinon : `load` a déjà posé standby = première cue.
+            }
+        }
+        debug!(target: "cue", count = self.cues.len(),
+            active = ?self.active, "conduite rechargée à chaud");
     }
 
     /// GO : la cue en standby devient la cible du deck B, transition
@@ -201,6 +270,22 @@ impl CueEngine {
     /// manuel relâche le noir.
     pub fn panic(&mut self, fade_s: f32) {
         self.pending.push(Pending::Panic(fade_s));
+    }
+
+    /// Multiplicateur de vitesse live d'un slice (param
+    /// `slice/{id}/media/speed` que l'app applique à ses players) : pris en
+    /// compte dans le compte à rebours AfterMedia de [`Self::status`].
+    /// Valeur non finie ou ≤ 0 ⇒ ignorée (warning). Remis à 1.0 par `load`.
+    pub fn set_speed_mult(&mut self, slice: SliceId, mult: f32) {
+        if mult.is_finite() && mult > 0.0 {
+            if (mult - 1.0).abs() < f32::EPSILON {
+                self.speed_mult.remove(&slice);
+            } else {
+                self.speed_mult.insert(slice, mult);
+            }
+        } else {
+            warn!(target: "cue", slice, mult, "multiplicateur de vitesse invalide ignoré");
+        }
     }
 
     /// Appelé chaque frame. Retourne l'état désiré des decks, l'alpha de
@@ -237,15 +322,24 @@ impl CueEngine {
             ),
         };
 
-        let params_target = if self.just_finished {
-            self.just_finished = false;
-            // Tick de fin : alpha 1.0 pour poser exactement les valeurs cibles.
-            self.active.map(|i| (self.targets[i].params.clone(), 1.0))
+        let params_target = if let Some(map) = self.finished_params.take() {
+            // Tick de fin : alpha 1.0 pour poser exactement les valeurs
+            // cibles (snapshots fusionnés de TOUTES les activations du tick).
+            Some((map, 1.0))
         } else if let Some(tr) = &self.transition {
             let p = self.transition_progress(tr, now);
             Some((self.targets[tr.to].params.clone(), tr.curve.apply(p)))
         } else {
             None
+        };
+
+        // ThroughBlack avant la bascule : le deck B ne doit pas avancer.
+        let freeze_b = match &self.transition {
+            Some(tr) => {
+                matches!(tr.kind, TransitionKind::ThroughBlack)
+                    && self.transition_progress(tr, now) < 0.5
+            }
+            None => false,
         };
 
         CueFrame {
@@ -254,6 +348,7 @@ impl CueEngine {
             blend,
             black,
             params_target,
+            freeze_b,
             events: std::mem::take(&mut self.events),
         }
     }
@@ -277,18 +372,22 @@ impl CueEngine {
 
         let (progress, remaining_s) = match self.active.map(|i| &self.cues[i]) {
             None => (0.0, None),
-            Some(cue) => {
-                let elapsed = (now - self.cue_start_s) as f32;
-                match cue.follow {
-                    FollowMode::Wait(s) if s > 0.0 => {
-                        ((elapsed / s).clamp(0.0, 1.0), Some((s - elapsed).max(0.0)))
-                    }
-                    FollowMode::Wait(_) => (1.0, Some(0.0)),
-                    // Manual/AfterMedia : durée média si les points IN/OUT
-                    // la donnent, sinon progression inconnue.
-                    _ => media_progress(cue, elapsed),
+            Some(cue) => match cue.follow {
+                FollowMode::Wait(s) if s > 0.0 => {
+                    // Le wait compte depuis la FIN de la transition d'entrée.
+                    let elapsed = (now - self.cue_start_s) as f32;
+                    ((elapsed / s).clamp(0.0, 1.0), Some((s - elapsed).max(0.0)))
                 }
-            }
+                FollowMode::Wait(_) => (1.0, Some(0.0)),
+                // Manual/AfterMedia : durée média si les points IN/OUT la
+                // donnent, sinon progression inconnue. Le média avance depuis
+                // le DÉBUT de la transition d'entrée (mi-course pour
+                // ThroughBlack), pas depuis sa fin : `media_start_s`.
+                _ => {
+                    let elapsed = (now - self.media_start_s) as f32;
+                    media_progress(cue, elapsed, &self.speed_mult)
+                }
+            },
         };
 
         CueStatus {
@@ -308,10 +407,19 @@ impl CueEngine {
         for cmd in cmds {
             match cmd {
                 Pending::Go => {
-                    // GO pendant transition : elle SAUTE à sa fin, puis nouveau GO.
-                    self.snap_transition(now);
-                    match self.standby {
+                    // Validation AVANT tout effet de bord : la standby
+                    // effective est celle qui suivra le snap de la
+                    // transition en cours. Un GO invalide (fin de conduite)
+                    // ne doit pas faire sauter le fondu en cours.
+                    let to = match &self.transition {
+                        Some(tr) => self.standby_after(tr.to),
+                        None => self.standby,
+                    };
+                    match to {
                         Some(to) => {
+                            // GO pendant transition : elle SAUTE à sa fin,
+                            // puis nouveau GO.
+                            self.snap_transition(now);
                             self.panic = None;
                             let tr = self.cues[to].transition.clone();
                             self.start_go(to, tr, now);
@@ -320,9 +428,15 @@ impl CueEngine {
                     }
                 }
                 Pending::Back => {
-                    self.snap_transition(now);
-                    match self.active {
+                    // Même principe : valider sur l'état post-snap sans
+                    // snapper si la commande est un no-op.
+                    let ai = match &self.transition {
+                        Some(tr) => Some(tr.to),
+                        None => self.active,
+                    };
+                    match ai {
                         Some(ai) if ai > 0 => {
+                            self.snap_transition(now);
                             self.panic = None;
                             // Transition de la cue active, pas de la cible.
                             let tr = self.cues[ai].transition.clone();
@@ -349,7 +463,12 @@ impl CueEngine {
                     None => self.warn_event(format!("STANDBY vers cue inexistante {n}")),
                 },
                 Pending::Panic(fade_s) => {
-                    let from = self.panic_black(now);
+                    // Le fondu part du noir RÉELLEMENT affiché : panic
+                    // précédent OU noir de la transition en cours (panic
+                    // pendant un ThroughBlack) — le noir de panic ne peut
+                    // jamais redescendre sous ce niveau, même quand la
+                    // transition se termine et relâche son propre noir.
+                    let from = self.panic_black(now).max(self.eval_transition(now).1);
                     self.panic = Some(PanicState { start_s: now, fade_s, from });
                     self.events.push(CueEvent::PanicStarted { fade_s });
                     warn!(target: "cue", fade_s, "PANIC : fondu au noir global");
@@ -363,8 +482,16 @@ impl CueEngine {
     fn start_go(&mut self, to: usize, tr: Transition, now: f64) {
         self.events.push(CueEvent::CueStarted { cue: self.cues[to].number });
         if matches!(tr.kind, TransitionKind::Cut) || tr.dur_s <= 0.0 {
+            self.media_start_s = now;
             self.activate(to, now);
         } else {
+            // Origine de l'horloge média : le deck B avance dès le début de
+            // la transition — sauf ThroughBlack, où il est gelé jusqu'à la
+            // bascule à mi-course (contrat `CueFrame::freeze_b`).
+            self.media_start_s = match tr.kind {
+                TransitionKind::ThroughBlack => now + f64::from(tr.dur_s) * 0.5,
+                _ => now,
+            };
             self.transition = Some(ActiveTransition {
                 to,
                 kind: tr.kind,
@@ -381,7 +508,14 @@ impl CueEngine {
         self.active = Some(idx);
         self.cue_start_s = now;
         self.follow_fired = false;
-        self.just_finished = true;
+        // Snapshot cible à poser à alpha 1.0 sur ce tick. En cas
+        // d'activations multiples dans le même tick, les snapshots sont
+        // fusionnés dans l'ordre (le dernier l'emporte par adresse) —
+        // équivalent à les poser séquentiellement.
+        let snapshot = self.targets[idx].params.clone();
+        self.finished_params
+            .get_or_insert_with(BTreeMap::new)
+            .extend(snapshot);
         self.standby = self.standby_after(idx);
         let number = self.cues[idx].number;
         self.events.push(CueEvent::TransitionFinished { cue: number });
@@ -525,13 +659,21 @@ fn resolve_scene(cue: &Cue) -> SceneTarget {
     SceneTarget { per_slice, params }
 }
 
-/// Progression média de la cue depuis `cue_start` quand les points IN/OUT
-/// donnent une durée (slices `FollowNext` prioritaires), sinon inconnue.
-fn media_progress(cue: &Cue, elapsed: f32) -> (f32, Option<f32>) {
-    let duration_of = |pb: &Playback| -> Option<f32> {
+/// Progression média de la cue depuis l'origine média (début de la
+/// transition d'entrée) quand les points IN/OUT donnent une durée (slices
+/// `FollowNext` prioritaires), sinon inconnue. `speed_mult` : multiplicateurs
+/// de vitesse live par slice (absent = 1.0).
+fn media_progress(
+    cue: &Cue,
+    elapsed: f32,
+    speed_mult: &BTreeMap<SliceId, f32>,
+) -> (f32, Option<f32>) {
+    let duration_of = |slice: SliceId, pb: &Playback| -> Option<f32> {
         let out = pb.out_s?;
-        if pb.speed > 0.0 && out > pb.in_s {
-            Some(((out - pb.in_s) / f64::from(pb.speed)) as f32)
+        let mult = speed_mult.get(&slice).copied().unwrap_or(1.0);
+        let speed = f64::from(pb.speed) * f64::from(mult);
+        if speed > 0.0 && out > pb.in_s {
+            Some(((out - pb.in_s) / speed) as f32)
         } else {
             None
         }
@@ -542,7 +684,7 @@ fn media_progress(cue: &Cue, elapsed: f32) -> (f32, Option<f32>) {
             if want_follow && !matches!(pb.end, EndMode::FollowNext) {
                 return None;
             }
-            duration_of(pb)
+            duration_of(st.slice, pb)
         })
     };
     match pick(true).or_else(|| pick(false)) {
@@ -681,6 +823,106 @@ mod tests {
         assert!(f.black.abs() < EPS, "panic oublié après load");
         assert!(f.deck_a.is_none());
         assert!(!e.status().transition_active);
+    }
+
+    // ---------------------------------------------------------- load_hot
+
+    /// Édition pendant la lecture : la cue active reste au programme (deck A
+    /// non vidé), la standby est conservée et le prochain GO avance.
+    #[test]
+    fn load_hot_preserves_active_and_deck_a() {
+        let cues = vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Cut, 0.0),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ];
+        let mut e = engine(cues.clone());
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 1.0); // cue 2000 au programme, standby 3000
+        assert_eq!(active(&e), Some(2000));
+
+        e.load_hot(&cues);
+        let f = tk(&mut e, 2.0);
+        assert_eq!(active(&e), Some(2000), "cue active conservée");
+        assert_eq!(standby_of(&e), Some(3000), "standby conservée");
+        assert!(f.deck_a.is_some(), "deck A non vidé : les players survivent");
+
+        e.go();
+        tk(&mut e, 3.0);
+        assert_eq!(active(&e), Some(3000), "GO avance, ne rejoue pas la courante");
+    }
+
+    /// Les horloges du follow Wait survivent au rechargement : pas de refire
+    /// immédiat, le follow part bien à l'échéance d'origine.
+    #[test]
+    fn load_hot_preserves_wait_clock_no_immediate_follow() {
+        let cues = vec![
+            with_follow(cue(1000, TransitionKind::Cut, 0.0), FollowMode::Wait(10.0)),
+            cue(2000, TransitionKind::Cut, 0.0),
+        ];
+        let mut e = engine(cues.clone());
+        e.go();
+        tk(&mut e, 0.0); // cue 1000 active, wait 10 s depuis t=0
+
+        tk(&mut e, 5.0);
+        e.load_hot(&cues);
+        let f = tk(&mut e, 5.1);
+        assert!(
+            !f.events.iter().any(|ev| matches!(ev, CueEvent::FollowFired { .. })),
+            "pas de follow immédiat après rechargement à chaud"
+        );
+        assert_eq!(active(&e), Some(1000));
+
+        let f = tk(&mut e, 10.2);
+        assert!(
+            f.events.iter().any(|ev| matches!(ev, CueEvent::FollowFired { .. })),
+            "le wait tire à son échéance d'origine"
+        );
+    }
+
+    /// Cue active supprimée par l'édition : plus rien au programme, standby
+    /// repliée sur l'ancienne standby si elle existe encore.
+    #[test]
+    fn load_hot_active_removed_falls_back_to_standby() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0); // 1000 active, standby 2000
+        e.load_hot(&[cue(2000, TransitionKind::Cut, 0.0)]);
+        tk(&mut e, 1.0);
+        assert_eq!(active(&e), None, "cue disparue : plus rien au programme");
+        assert_eq!(standby_of(&e), Some(2000));
+    }
+
+    /// Rechargement à chaud pendant une transition : elle saute à sa fin et
+    /// le snapshot de params de la cue snappée est bien posé à alpha 1.0.
+    #[test]
+    fn load_hot_during_transition_snaps_and_poses_params() {
+        let cues = vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            with_param(
+                with_state(cue(2000, TransitionKind::Crossfade, 4.0), 1, 7, EndMode::Hold, None),
+                "slice/1/opacity",
+                0.25,
+            ),
+        ];
+        let mut e = engine(cues.clone());
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 1.0); // crossfade 1000→2000 en cours
+
+        e.load_hot(&cues);
+        let f = tk(&mut e, 1.1);
+        assert_eq!(active(&e), Some(2000), "transition snappée à sa fin");
+        assert!(!e.status().transition_active);
+        let (map, alpha) = f.params_target.expect("snapshot de la cue snappée posé");
+        assert!((alpha - 1.0).abs() < EPS);
+        assert_eq!(map.get("slice/1/opacity"), Some(&ParamValue::F(0.25)));
     }
 
     // ------------------------------------------------------- cas limites
@@ -1395,5 +1637,348 @@ mod tests {
         assert!((f.blend - 0.0).abs() < EPS, "la transition démarre au tick, pas avant");
         tk(&mut e, 1002.0);
         assert_eq!(active(&e), Some(1000));
+    }
+
+    // ------------------------------------- panic pendant un through-black
+
+    #[test]
+    fn panic_at_through_black_midpoint_holds_full_black_forever() {
+        // ThroughBlack 4 s ; PANIC fade 5 s pressé à mi-course (noir plein).
+        // Le noir de panic part du noir affiché (1.0) : quand la transition
+        // se termine et relâche SON noir, l'image ne doit JAMAIS réapparaître.
+        let mut e = engine(vec![
+            with_state(cue(1000, TransitionKind::Cut, 0.0), 1, 10, EndMode::Loop, None),
+            with_state(cue(2000, TransitionKind::ThroughBlack, 4.0), 1, 20, EndMode::Loop, None),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 100.0); // transition démarre à 100
+        e.panic(5.0);
+        let f = tk(&mut e, 102.0); // mi-course : noir de transition = 1.0
+        assert!((f.black - 1.0).abs() < EPS, "noir plein au déclenchement");
+        // Frame par frame : la transition redescendrait son noir (103 -> 0.5,
+        // 104 -> fin), mais le panic tient le noir à 1.0.
+        for now in [103.0, 104.0, 105.0, 110.0, 200.0] {
+            let f = tk(&mut e, now);
+            assert!(
+                (f.black - 1.0).abs() < EPS,
+                "black = {} à t={now} : l'image réapparaît sous panic",
+                f.black
+            );
+        }
+        assert_eq!(active(&e), Some(2000), "la conduite continue sous le noir");
+    }
+
+    #[test]
+    fn panic_during_through_black_first_half_never_drops_below_level() {
+        // PANIC pressé à p=0.25 (noir de transition 0.5) : le noir de panic
+        // part de 0.5 et le noir affiché ne redescend jamais sous ce niveau.
+        let mut e = engine(vec![
+            with_state(cue(1000, TransitionKind::Cut, 0.0), 1, 10, EndMode::Loop, None),
+            with_state(cue(2000, TransitionKind::ThroughBlack, 4.0), 1, 20, EndMode::Loop, None),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 100.0);
+        e.panic(4.0);
+        let f = tk(&mut e, 101.0); // p = 0.25 -> noir transition 0.5
+        assert!((f.black - 0.5).abs() < 1e-4, "black = {}", f.black);
+        // Frame par frame : le noir affiché ne redescend JAMAIS sous le
+        // niveau de déclenchement (0.5) — avant le fix, la fin de la
+        // transition le laissait retomber à ~0.4 (image visible à 60 %).
+        for now in [101.5, 102.0, 102.5, 103.0, 103.5, 104.0, 104.5, 105.0] {
+            let f = tk(&mut e, now);
+            assert!(
+                f.black >= 0.5 - 1e-4,
+                "black = {} à t={now} : sous le niveau de déclenchement",
+                f.black
+            );
+        }
+        // Fin du fondu panic (from 0.5, fade 4 s -> plein à t=105) : noir tenu.
+        for now in [105.0, 110.0, 200.0] {
+            let f = tk(&mut e, now);
+            assert!((f.black - 1.0).abs() < EPS, "le panic tient le noir plein à t={now}");
+        }
+    }
+
+    // ------------------------------ GO Cut pendant transition : snapshots
+
+    #[test]
+    fn go_cut_during_transition_emits_snapped_cue_params() {
+        // Cue 2 (crossfade 6 s) scénarise slice/1/opacity -> 0.0. À mi-fondu,
+        // GO vers la cue 3 (Cut) qui ne scénarise PAS slice/1 : le snapshot
+        // alpha 1.0 doit contenir la cible de la cue 2 (opacity 0.0) ET les
+        // params de la cue 3 — sinon l'opacity reste figée à mi-fondu.
+        let c2 = with_param(
+            with_state(cue(2000, TransitionKind::Crossfade, 6.0), 1, 20, EndMode::Loop, None),
+            "slice/1/opacity",
+            0.0,
+        );
+        let c3 = with_param(
+            with_state(cue(3000, TransitionKind::Cut, 0.0), 2, 30, EndMode::Loop, None),
+            "slice/2/x",
+            0.7,
+        );
+        let mut e = engine(vec![cue(1000, TransitionKind::Cut, 0.0), c2, c3]);
+        e.go();
+        tk(&mut e, 0.0); // cue 1 active
+        e.go();
+        tk(&mut e, 10.0); // crossfade vers 2 démarre
+        let f = tk(&mut e, 13.0); // mi-fondu : opacity interpole vers 0.0
+        let (_, alpha) = f.params_target.expect("cible pendant transition");
+        assert!((alpha - 0.5).abs() < 1e-4);
+        e.go(); // GO Cut vers 3 : snap de la 2, puis activation de la 3
+        let f = tk(&mut e, 13.5);
+        let (map, alpha) = f.params_target.expect("snapshot de fin");
+        assert!((alpha - 1.0).abs() < EPS, "alpha final 1.0");
+        assert_eq!(
+            map.get("slice/1/opacity"),
+            Some(&ParamValue::F(0.0)),
+            "la cible de la cue snappée est posée"
+        );
+        assert_eq!(map.get("slice/2/x"), Some(&ParamValue::F(0.7)));
+        assert_eq!(active(&e), Some(3000));
+        assert!(!e.status().transition_active);
+    }
+
+    #[test]
+    fn double_go_cut_same_tick_merges_snapshots_last_wins() {
+        let c1 = with_param(
+            with_param(
+                with_state(cue(1000, TransitionKind::Cut, 0.0), 1, 10, EndMode::Loop, None),
+                "slice/1/opacity",
+                0.25,
+            ),
+            "common/x",
+            0.1,
+        );
+        let c2 = with_param(
+            with_state(cue(2000, TransitionKind::Cut, 0.0), 2, 20, EndMode::Loop, None),
+            "common/x",
+            0.9,
+        );
+        let mut e = engine(vec![c1, c2]);
+        e.go();
+        e.go();
+        let f = tk(&mut e, 0.0);
+        let (map, alpha) = f.params_target.expect("snapshot fusionné");
+        assert!((alpha - 1.0).abs() < EPS);
+        assert_eq!(
+            map.get("slice/1/opacity"),
+            Some(&ParamValue::F(0.25)),
+            "param de la première cue conservé"
+        );
+        assert_eq!(
+            map.get("common/x"),
+            Some(&ParamValue::F(0.9)),
+            "en doublon, la dernière activation l'emporte"
+        );
+        assert_eq!(active(&e), Some(2000));
+    }
+
+    // --------------------------- commandes invalides pendant transition
+
+    #[test]
+    fn extra_go_during_final_transition_does_not_snap() {
+        // Dernier fondu de la conduite : un GO de trop est un no-op
+        // (warning), il ne doit PAS faire sauter le fondu à sa fin.
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Crossfade, 4.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0); // active 1
+        e.go();
+        tk(&mut e, 10.0); // fondu final vers 2 démarre (fin à 14)
+        tk(&mut e, 11.0);
+        e.go(); // GO de trop
+        let f = tk(&mut e, 12.0); // p = 0.5
+        assert!(has_warning(&f), "GO sans standby : warning");
+        assert!(
+            !f.events.contains(&CueEvent::TransitionFinished { cue: CueNumber(2000) }),
+            "le fondu ne saute pas à sa fin"
+        );
+        assert!(e.status().transition_active, "le fondu final continue");
+        assert!((f.blend - 0.5).abs() < 1e-4, "blend intact = {}", f.blend);
+        assert_eq!(active(&e), Some(1000), "cue 1 encore au programme");
+        // Fin naturelle du fondu.
+        tk(&mut e, 14.0);
+        assert_eq!(active(&e), Some(2000));
+        assert!(!e.status().transition_active);
+    }
+
+    #[test]
+    fn back_during_entry_transition_of_first_cue_does_not_snap() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Crossfade, 4.0),
+            cue(2000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0); // transition d'entrée de la cue 1 en cours
+        e.back(); // BACK invalide : la cue 1 est la première
+        let f = tk(&mut e, 2.0); // p = 0.5
+        assert!(has_warning(&f));
+        assert!(e.status().transition_active, "la transition continue");
+        assert!((f.blend - 0.5).abs() < 1e-4, "blend intact = {}", f.blend);
+        assert_eq!(active(&e), None, "pas d'activation anticipée");
+        tk(&mut e, 4.0);
+        assert_eq!(active(&e), Some(1000), "fin naturelle");
+    }
+
+    // -------------------------------------------- through black : freeze_b
+
+    #[test]
+    fn through_black_freezes_deck_b_until_switch() {
+        let mut e = engine(vec![
+            with_state(cue(1000, TransitionKind::Cut, 0.0), 1, 10, EndMode::Loop, None),
+            with_state(cue(2000, TransitionKind::ThroughBlack, 2.0), 1, 20, EndMode::Loop, None),
+        ]);
+        // Au repos (standby préchargée) : pas de gel.
+        let f = tk(&mut e, 0.0);
+        assert!(!f.freeze_b);
+        e.go();
+        tk(&mut e, 0.5);
+        e.go();
+        // Première moitié : deck B gelé (le média ne doit pas avancer).
+        let f = tk(&mut e, 100.0); // p = 0
+        assert!(f.freeze_b, "gelé au départ de la transition");
+        let f = tk(&mut e, 100.5); // p = 0.25
+        assert!(f.freeze_b, "gelé avant la bascule");
+        // Bascule à mi-course : le deck B est révélé et doit tourner.
+        let f = tk(&mut e, 101.0); // p = 0.5
+        assert!(!f.freeze_b, "libéré à la bascule");
+        assert!((f.blend - 1.0).abs() < EPS);
+        let f = tk(&mut e, 101.5); // p = 0.75
+        assert!(!f.freeze_b);
+        let f = tk(&mut e, 102.0); // fin
+        assert!(!f.freeze_b);
+        assert_eq!(active(&e), Some(2000));
+    }
+
+    #[test]
+    fn crossfade_never_freezes_deck_b() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Crossfade, 2.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        for now in [10.0, 10.5, 11.0, 11.5, 12.0] {
+            let f = tk(&mut e, now);
+            assert!(!f.freeze_b, "crossfade : deck B jamais gelé (t={now})");
+        }
+    }
+
+    // ---------------------------------- compte à rebours média (AfterMedia)
+
+    /// Cue AfterMedia : média 60 s (IN 0, OUT 60, vitesse 1), FollowNext.
+    fn after_media_cue(n: u32, kind: TransitionKind, dur_s: f32) -> Cue {
+        with_state(
+            with_follow(cue(n, kind, dur_s), FollowMode::AfterMedia),
+            1,
+            20,
+            EndMode::FollowNext,
+            Some(60.0),
+        )
+    }
+
+    #[test]
+    fn after_media_countdown_starts_at_transition_begin() {
+        // Crossfade d'entrée 4 s : le média du deck B avance dès le début de
+        // la transition. À la fin de la transition, 4 s sont déjà consommées
+        // -> remaining = 56, pas 60 (le follow tirera 56 s plus tard).
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            after_media_cue(2000, TransitionKind::Crossfade, 4.0),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 100.0); // transition démarre à 100
+        tk(&mut e, 104.0); // fin de transition : cue 2 active
+        assert_eq!(active(&e), Some(2000));
+        let s = e.status();
+        assert!(
+            (s.remaining_s.unwrap_or(0.0) - 56.0).abs() < 1e-3,
+            "remaining = {:?} (attendu 56 : 60 - 4 s de transition)",
+            s.remaining_s
+        );
+        assert!((s.progress - 4.0 / 60.0).abs() < 1e-4);
+        // Plus tard : le décompte suit l'horloge média, pas cue_start.
+        tk(&mut e, 134.0);
+        let s = e.status();
+        assert!((s.remaining_s.unwrap_or(0.0) - 26.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn after_media_countdown_through_black_starts_at_switch() {
+        // ThroughBlack 4 s : le deck B est gelé pendant la première moitié
+        // (freeze_b) — le média ne démarre qu'à la bascule (mi-course).
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            after_media_cue(2000, TransitionKind::ThroughBlack, 4.0),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 100.0); // transition démarre à 100, bascule à 102
+        tk(&mut e, 104.0); // fin de transition
+        let s = e.status();
+        assert!(
+            (s.remaining_s.unwrap_or(0.0) - 58.0).abs() < 1e-3,
+            "remaining = {:?} (attendu 58 : média parti à la bascule)",
+            s.remaining_s
+        );
+    }
+
+    #[test]
+    fn after_media_countdown_uses_live_speed_mult() {
+        let mut e = engine(vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            after_media_cue(2000, TransitionKind::Crossfade, 4.0),
+            cue(3000, TransitionKind::Cut, 0.0),
+        ]);
+        e.set_speed_mult(1, 2.0); // slice 1 lu à 2x -> durée effective 30 s
+        e.go();
+        tk(&mut e, 0.0);
+        e.go();
+        tk(&mut e, 100.0);
+        tk(&mut e, 104.0);
+        let s = e.status();
+        assert!(
+            (s.remaining_s.unwrap_or(0.0) - 26.0).abs() < 1e-3,
+            "remaining = {:?} (attendu 26 : 60/2 - 4)",
+            s.remaining_s
+        );
+        assert!((s.progress - 4.0 / 30.0).abs() < 1e-4);
+        // Multiplicateur invalide : ignoré (warning), l'état ne change pas.
+        e.set_speed_mult(1, 0.0);
+        e.set_speed_mult(1, f32::NAN);
+        let s = e.status();
+        assert!((s.remaining_s.unwrap_or(0.0) - 26.0).abs() < 1e-3);
+        // Retour à 1.0 : durée pleine.
+        e.set_speed_mult(1, 1.0);
+        let s = e.status();
+        assert!((s.remaining_s.unwrap_or(0.0) - 56.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn after_media_countdown_cut_starts_at_activation() {
+        // Cut : pas de transition, l'horloge média part à l'activation
+        // (comportement inchangé).
+        let mut e = engine(vec![
+            after_media_cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Cut, 0.0),
+        ]);
+        e.go();
+        tk(&mut e, 100.0);
+        tk(&mut e, 110.0);
+        let s = e.status();
+        assert!((s.remaining_s.unwrap_or(0.0) - 50.0).abs() < 1e-3);
     }
 }

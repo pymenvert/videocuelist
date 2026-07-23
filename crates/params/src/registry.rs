@@ -178,6 +178,21 @@ impl Registry {
         Some(to_value(&state.spec.kind, &modulated(state)))
     }
 
+    /// L'adresse est-elle déclarée ? (garde d'entrée des surfaces réseau :
+    /// une adresse inconnue ne doit alimenter ni feedback ni soft-takeover.)
+    pub fn contains(&self, addr: &str) -> bool {
+        self.params.contains_key(addr)
+    }
+
+    /// CIBLE posée d'un paramètre — hors lissage ET hors modulation. Base
+    /// correcte d'un nudge d'encodeur : nudger la valeur lue (`value`)
+    /// intégrerait l'offset LFO dans la base et avalerait les crans rapides
+    /// pendant le lissage.
+    pub fn target(&self, addr: &str) -> Option<ParamValue> {
+        let state = self.params.get(addr)?;
+        Some(to_value(&state.spec.kind, &state.target))
+    }
+
     /// Composante scalaire de la valeur (r pour Color, x pour Point2,
     /// 0/1 pour Bool, index pour Enum). `0.0` si l'adresse est inconnue.
     pub fn value_f32(&self, addr: &str) -> f32 {
@@ -463,6 +478,31 @@ mod tests {
             .iter()
             .map(|(a, v)| (a.to_string(), v.clone()))
             .collect()
+    }
+
+    // ------------------------------------------------------------ cible
+
+    /// `target()` rend la cible posée, insensible au lissage en cours et aux
+    /// offsets de modulation — la base d'un nudge d'encodeur.
+    #[test]
+    fn target_ignores_smoothing_and_modulation() {
+        let mut reg = Registry::new();
+        reg.register(spec_f("master/intensity", 0.0, 80.0));
+        reg.set("master/intensity", ParamValue::F(0.5), Source::Ui);
+        // Lissage à mi-course : la valeur lue n'a pas encore convergé.
+        reg.tick(0.02);
+        // Offset LFO par-dessus.
+        reg.apply_modulation(&[("master/intensity".to_string(), 0.3)]);
+        let read = reg.value_f32("master/intensity");
+        assert!(read > 0.0, "valeur lue affectée par lissage+mod : {read}");
+        assert_eq!(
+            reg.target("master/intensity"),
+            Some(ParamValue::F(0.5)),
+            "la cible reste la valeur posée, sans lissage ni modulation"
+        );
+        assert!(reg.contains("master/intensity"));
+        assert!(!reg.contains("inconnu/xyz"));
+        assert_eq!(reg.target("inconnu/xyz"), None);
     }
 
     // -------------------------------------------------------- enregistrement

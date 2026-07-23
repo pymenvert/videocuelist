@@ -175,11 +175,25 @@ fn router(state: AppState) -> Router {
 
 /* ------------------------------------------------------------ assets */
 
-async fn index() -> Html<&'static str> {
-    Html(assets::INDEX_HTML)
+async fn index() -> Response {
+    if let Some((ct, body)) = assets::asset_dev("index.html") {
+        return ([(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "no-cache")], body)
+            .into_response();
+    }
+    Html(assets::INDEX_HTML).into_response()
 }
 
 async fn asset_route(Path(path): Path<String>) -> Response {
+    if let Some((content_type, body)) = assets::asset_dev(&path) {
+        return (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
+        )
+            .into_response();
+    }
     match assets::asset(&path) {
         Some((content_type, body)) => (
             [

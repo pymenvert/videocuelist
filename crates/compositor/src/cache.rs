@@ -61,6 +61,23 @@ impl<P> ProgramCache<P> {
         self.map.remove(&key)
     }
 
+    /// Vrai si un programme est déjà en cache pour cette clé.
+    pub fn contains(&self, key: MaterialId) -> bool {
+        self.map.contains_key(&key)
+    }
+
+    /// Ne conserve que les clés listées dans `keep` (matériaux encore
+    /// présents dans le show). Retourne les programmes évincés pour que
+    /// l'appelant libère leurs ressources GL — sans cet appel à chaque
+    /// changement de show, les programmes des matériaux disparus restent
+    /// en VRAM à vie.
+    pub fn retain(&mut self, keep: &[MaterialId]) -> Vec<P> {
+        crate::keys_not_kept(self.map.keys().copied(), keep)
+            .into_iter()
+            .filter_map(|k| self.map.remove(&k))
+            .collect()
+    }
+
     /// Nombre de programmes en cache.
     pub fn len(&self) -> usize {
         self.map.len()
@@ -135,6 +152,52 @@ mod tests {
         assert_eq!(old, Some(100));
         assert_eq!(cache.get(5), Some(&200));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn retain_evicts_absent_keys_and_returns_programs() {
+        let mut cache: ProgramCache<u32> = ProgramCache::default();
+        cache.ensure(1, || Ok::<_, String>(10)).expect("build");
+        cache.ensure(2, || Ok::<_, String>(20)).expect("build");
+        cache.ensure(3, || Ok::<_, String>(30)).expect("build");
+
+        let mut evicted = cache.retain(&[2]);
+        evicted.sort_unstable();
+        assert_eq!(evicted, [10, 30], "programmes évincés retournés pour libération GL");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains(2));
+        assert!(!cache.contains(1));
+        assert!(!cache.contains(3));
+
+        // Le prochain ensure d'une clé évincée recompile.
+        let mut builds = 0;
+        cache
+            .ensure(1, || -> Result<u32, String> {
+                builds += 1;
+                Ok(11)
+            })
+            .expect("rebuild");
+        assert_eq!(builds, 1, "recompilé après éviction");
+
+        // `keep` vide : tout est purgé (changement de show sans matériaux).
+        let evicted = cache.retain(&[]);
+        assert_eq!(evicted.len(), 2);
+        assert!(cache.is_empty());
+
+        // retain sur cache vide : no-op.
+        assert!(cache.retain(&[1, 2]).is_empty());
+    }
+
+    #[test]
+    fn retain_with_all_keys_kept_is_a_noop() {
+        let mut cache: ProgramCache<u32> = ProgramCache::default();
+        cache.ensure(7, || Ok::<_, String>(70)).expect("build");
+        cache.ensure(8, || Ok::<_, String>(80)).expect("build");
+        // Clés surnuméraires dans keep : sans effet.
+        assert!(cache.retain(&[7, 8, 99]).is_empty());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(7), Some(&70));
+        assert_eq!(cache.get(8), Some(&80));
     }
 
     #[test]

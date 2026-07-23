@@ -76,6 +76,23 @@
   function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
   function fmtF(v, d) { return (typeof v === 'number' && isFinite(v)) ? v.toFixed(d === undefined ? 2 : d) : '—'; }
 
+  /* Icônes SVG inline (statiques, aucune ressource externe). */
+  var ICONS = {
+    list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>',
+    film: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4.5" width="19" height="15" rx="2"/><path d="M7 4.5v15M17 4.5v15M2.5 9.5H7M2.5 14.5H7M17 9.5h4.5M17 14.5h4.5"/></svg>',
+    sparkle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l2 5.5 5.5 2-5.5 2-2 5.5-2-5.5L4.5 11 10 9z"/><path d="M19 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg>',
+    wave: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12h4l3-8 5 16 3-8h3.5"/></svg>',
+    plug: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7.5V3.5M15 7.5V3.5M7 7.5h10v3.5a5 5 0 0 1-10 0zM12 16v4.5"/></svg>',
+    screen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8M12 17v3.5"/></svg>'
+  };
+
+  /* État vide sympathique : icône + message. */
+  function emptyState(icon, text) {
+    var ic = el('span', { class: 'empty-icon', 'aria-hidden': 'true' });
+    ic.innerHTML = ICONS[icon] || '';
+    return el('div', { class: 'empty-state' }, ic, el('span', null, text));
+  }
+
   /* ================================================ numéros de cue (millièmes) */
 
   function cnStr(n) {
@@ -177,12 +194,63 @@
     return sendCmd({ cmd: 'param_set', addr: addr, value: value, source: 'ui' });
   }
 
-  function go() { sendCmd({ cmd: 'cue_go' }); }
+  /* GO : anti-rafale — un GO au plus toutes les 250 ms, quel que soit le
+     chemin (Espace, bouton, double événement). Une touche qui accroche ne
+     fait pas défiler la conduite. */
+  var lastGoTs = 0;
+
+  function go() {
+    var now = Date.now();
+    if (now - lastGoTs < 250) { return; }
+    lastGoTs = now;
+    sendCmd({ cmd: 'cue_go' });
+  }
   function back() { sendCmd({ cmd: 'cue_back' }); }
 
   function dboToggle() {
     if (rt().dbo) { sendCmd({ cmd: 'dbo_release' }); }
     else { sendCmd({ cmd: 'dbo', fade_s: 0.0 }); }
+  }
+
+  /* Touche B : même garde-fou que le bouton DBO — jamais de blackout sur un
+     simple keydown. Maintien 400 ms OU double frappe rapprochée, avec
+     feedback visuel d'armement sur le bouton ; l'auto-repeat est ignoré. */
+  var DBOKEY = { holdTimer: null, lastTap: 0, fired: false };
+
+  function dboArmVisual(on) {
+    var btn = byId('dbo-btn');
+    if (btn) {
+      btn.classList.toggle('arming', on);
+      btn.classList.toggle('arming-key', on);
+    }
+  }
+
+  function dboKeyDown() {
+    if (DBOKEY.holdTimer) { return; }
+    var now = Date.now();
+    if (now - DBOKEY.lastTap < 400) {          /* double frappe : déclenche */
+      DBOKEY.lastTap = 0;
+      DBOKEY.fired = true;
+      dboToggle();
+      return;
+    }
+    DBOKEY.fired = false;
+    dboArmVisual(true);
+    DBOKEY.holdTimer = setTimeout(function () { /* maintien 400 ms : déclenche */
+      DBOKEY.holdTimer = null;
+      dboArmVisual(false);
+      DBOKEY.fired = true;
+      dboToggle();
+    }, 400);
+  }
+
+  function dboKeyUp() {
+    var wasArming = !!DBOKEY.holdTimer;
+    if (DBOKEY.holdTimer) { clearTimeout(DBOKEY.holdTimer); DBOKEY.holdTimer = null; }
+    dboArmVisual(false);
+    /* un appui court (relâché avant 400 ms) compte comme première frappe */
+    DBOKEY.lastTap = (wasArming && !DBOKEY.fired) ? Date.now() : 0;
+    DBOKEY.fired = false;
   }
 
   /* Cue cible pour les assignations de contenu : standby, sinon active. */
@@ -298,13 +366,15 @@
         var tip = byId('tooltip');
         if (!tip || !document.contains(target)) { return; }
         tip.textContent = target.getAttribute('data-tip') || '';
-        tip.classList.remove('hidden');
+        tip.classList.remove('hidden', 'above', 'below');
         tip.style.left = '0px'; tip.style.top = '0px';
         var r = target.getBoundingClientRect();
         var tw = tip.offsetWidth, th = tip.offsetHeight;
         var x = clamp(r.left, 8, window.innerWidth - tw - 8);
-        var y = r.bottom + 6;
-        if (y + th > window.innerHeight - 8) { y = r.top - th - 6; }
+        var y = r.bottom + 8;
+        var side = 'below';
+        if (y + th > window.innerHeight - 8) { y = r.top - th - 8; side = 'above'; }
+        tip.classList.add(side);
         tip.style.left = x + 'px';
         tip.style.top = Math.max(8, y) + 'px';
       }, 400);
@@ -345,11 +415,12 @@
     var nav = byId('tabs');
     if (!nav) { return; }
     nav.textContent = '';
-    visibleTabs().forEach(function (t) {
+    visibleTabs().forEach(function (t, i) {
+      var key = i === 9 ? '0' : String(i + 1);
       nav.appendChild(el('button', {
         class: t.id === S.tab ? 'active' : '', 'data-tip': t.tip,
         onclick: function () { setTab(t.id); }
-      }, t.label));
+      }, el('span', { class: 'tab-key' }, key), t.label));
     });
   }
 
@@ -368,6 +439,32 @@
     }
     updateDyn();
     updateHealth();
+  }
+
+  /* Re-render différé : si l'opérateur est en train de taper dans un champ
+     (ici ou depuis un autre poste — portable + tablette en calage), un
+     renderMain() immédiat détruirait le focus et la saisie. S.show est déjà
+     à jour (applyOp) ; on re-rend au blur. */
+  var renderPending = false;
+
+  function requestRenderMain() {
+    var main = byId('main');
+    var ae = document.activeElement;
+    var editing = ae && main && main.contains(ae) &&
+      (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable);
+    if (editing) { renderPending = true; return; }
+    renderPending = false;
+    renderMain();
+  }
+
+  function installDeferredRender() {
+    document.addEventListener('focusout', function () {
+      if (!renderPending) { return; }
+      /* laisser le focus se poser (Tab -> champ suivant) avant de re-tester */
+      setTimeout(function () {
+        if (renderPending) { requestRenderMain(); }
+      }, 0);
+    });
   }
 
   function renderAll() {
@@ -415,9 +512,9 @@
       el('h2', null, 'Transport'),
       el('div', { id: 'transport' },
         el('button', {
-          id: 'go-btn', 'data-tip': 'GO : lance la cue en standby (Espace)',
+          id: 'go-btn', 'data-tip': 'GO : lance la cue en standby. Raccourci : Espace',
           onclick: go
-        }, 'GO'),
+        }, el('span', { class: 'go-label' }, 'GO'), el('kbd', null, 'Espace')),
         el('button', { 'data-tip': 'Back : revient à la cue précédente', onclick: back }, 'BACK'),
         el('button', {
           'data-tip': 'Standby sur la cue suivante sans la lancer',
@@ -439,13 +536,20 @@
       var v = parseFloat(master.value);
       var lbl = byId('master-val');
       if (lbl) { lbl.textContent = Math.round(v * 100) + ' %'; }
+      MASTER.until = Date.now() + 250;
       sendParam('master/intensity', { f: v });
     });
+    /* interaction réelle uniquement : un <input type=range> garde le focus
+       après un drag, tester activeElement figeait le slider face aux
+       changements MIDI/OSC/DBO. */
+    master.addEventListener('pointerdown', function () { MASTER.held = true; });
+    master.addEventListener('pointerup', function () { MASTER.held = false; MASTER.until = Date.now() + 250; });
+    master.addEventListener('pointercancel', function () { MASTER.held = false; MASTER.until = Date.now() + 250; });
 
     var dbo = el('button', {
       id: 'dbo-btn',
       'data-tip': 'DBO — blackout d’urgence. Double-clic ou maintien 600 ms (touche B). Re-déclencher pour relever.'
-    }, 'DBO');
+    }, el('span', { class: 'dbo-label' }, 'DBO'));
     installDbo(dbo);
 
     right.appendChild(el('div', { class: 'panel' },
@@ -464,13 +568,51 @@
   };
 
   function previewImg(src, tip) {
-    var img = el('img', { src: src, alt: 'préview', 'data-tip': tip });
+    var img = el('img', {
+      src: src, alt: 'préview', 'data-tip': tip,
+      'data-src': src, class: 'preview-stream'
+    });
+    var fresh = { loads: 0, last: Date.now() };
+    img.addEventListener('load', function () {
+      /* en flux multipart, chaque frame déclenche 'load' (Chrome/Firefox) */
+      fresh.loads++;
+      fresh.last = Date.now();
+      if (img.parentNode && img.parentNode.classList) {
+        img.parentNode.classList.remove('stale');
+      }
+    });
     img.addEventListener('error', function () {
       setTimeout(function () {
         if (document.contains(img)) { img.src = src + '?r=' + Date.now(); }
       }, 2000);
     });
+    /* Watchdog de fraîcheur : une fin de flux « propre » (moteur qui coupe
+       le canal, proxy qui ferme) ne déclenche PAS 'error' — l'image gèle
+       sur la dernière frame. Si le navigateur émet bien un 'load' par frame
+       (>= 2 vus) et que plus rien n'arrive depuis 6 s : voile « préview
+       perdue » + rechargement cache-busté. */
+    var wd = setInterval(function () {
+      if (!document.contains(img)) { clearInterval(wd); return; }
+      if (fresh.loads >= 2 && Date.now() - fresh.last > 6000) {
+        if (img.parentNode && img.parentNode.classList) {
+          img.parentNode.classList.add('stale');
+        }
+        fresh.loads = 0;
+        fresh.last = Date.now();
+        img.src = src + '?r=' + Date.now();
+      }
+    }, 3000);
     return img;
+  }
+
+  /* Recharge tous les flux MJPEG (cache-bust) — à chaque (re)connexion WS,
+     car un flux mort sans coupure WS ne se répare pas tout seul. */
+  function refreshPreviews() {
+    var imgs = document.querySelectorAll('img.preview-stream');
+    for (var i = 0; i < imgs.length; i++) {
+      var src = imgs[i].getAttribute('data-src');
+      if (src) { imgs[i].src = src + '?r=' + Date.now(); }
+    }
   }
 
   function doGoto(input) {
@@ -498,8 +640,8 @@
     var wrap = el('div', { id: 'cuelist', 'data-tip': 'Clic : met la cue en standby. Double-clic : GOTO immédiat.' });
     var list = cues();
     if (!list.length) {
-      wrap.appendChild(el('div', { class: 'muted', style: 'padding:12px' },
-        'Aucune cue. Créez-en dans l’onglet Cues.'));
+      wrap.appendChild(el('div', { style: 'padding:12px' },
+        emptyState('list', 'Aucune cue — créez la conduite dans l’onglet Cues.')));
       return wrap;
     }
     list.forEach(function (c) {
@@ -508,7 +650,7 @@
           c.color ? el('span', { class: 'cue-color-dot', style: 'background:' + c.color }) : null,
           cnStr(c.number)),
         el('span', { class: 'cue-name' }, c.name || ''),
-        el('span', { class: 'muted' }, transitionLabel(c.transition), followBadge(c)),
+        el('span', { class: 'cue-trans' }, transitionLabel(c.transition), followBadge(c)),
         c.notes ? el('span', { class: 'cue-notes' }, c.notes) : null,
         el('div', { class: 'cue-progress' }, el('div')));
       row.addEventListener('click', function () { sendCmd({ cmd: 'cue_standby', cue: c.number }); });
@@ -537,15 +679,45 @@
     btn.addEventListener('dblclick', function () { if (!fired) { dboToggle(); } fired = false; });
     btn.addEventListener('pointerdown', function () {
       fired = false;
-      holdTimer = setTimeout(function () { fired = true; dboToggle(); }, 600);
+      btn.classList.add('arming');
+      holdTimer = setTimeout(function () {
+        fired = true;
+        btn.classList.remove('arming');
+        dboToggle();
+      }, 600);
     });
-    function cancel() { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } }
+    function cancel() {
+      btn.classList.remove('arming');
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    }
     btn.addEventListener('pointerup', cancel);
     btn.addEventListener('pointerleave', cancel);
+    /* Tactile : un scroll ou un long-press système émet pointercancel —
+       sans ce listener, le timer de 600 ms partait quand même (blackout
+       fantôme pendant un simple défilement de page). */
+    btn.addEventListener('pointercancel', cancel);
+    btn.addEventListener('lostpointercapture', cancel);
   }
+
+  function rtItem(label, val, cls) {
+    return el('span', null,
+      el('span', { class: 'rt-label' }, label),
+      el('span', { class: 'rt-val' + (cls ? ' ' + cls : '') }, val));
+  }
+
+  /* Chip de santé : vert = OK, ambre = à surveiller, rouge = problème. */
+  function chip(cls, text, tip) {
+    return el('span', { class: 'chip' + (cls ? ' ' + cls : ''), 'data-tip': tip || null }, text);
+  }
+
+  /* État d'interaction du slider master (survit aux re-renders). */
+  var MASTER = { held: false, until: 0 };
 
   /* Mises à jour dynamiques (10 Hz) sans re-render. */
   function updateDyn() {
+    /* re-render différé en attente : re-tenter dès que la saisie est finie
+       (ceinture au focusout, qui peut ne pas être émis fenêtre non focusée) */
+    if (renderPending) { requestRenderMain(); if (!renderPending) { return; } }
     var r = rt();
     /* cuelist : surlignage + progression */
     var rows = document.querySelectorAll('.cue-row');
@@ -560,12 +732,14 @@
     });
     var line = byId('rt-line');
     if (line) {
-      line.textContent = 'Active : ' + cnStr(r.active) + '   |   Standby : ' + cnStr(r.standby) +
-        (r.remaining_s > 0 ? ('   |   Reste ' + fmtF(r.remaining_s, 1) + ' s') : '') +
-        (r.transition_active ? '   |   transition…' : '');
+      line.textContent = '';
+      line.appendChild(rtItem('ACTIVE', cnStr(r.active), ''));
+      line.appendChild(rtItem('STANDBY', cnStr(r.standby), 'rt-standby'));
+      if (r.remaining_s > 0) { line.appendChild(rtItem('RESTE', fmtF(r.remaining_s, 1) + ' s', '')); }
+      if (r.transition_active) { line.appendChild(rtItem('TRANSITION', 'en cours…', '')); }
     }
     var master = byId('master-range');
-    if (master && document.activeElement !== master) {
+    if (master && !MASTER.held && Date.now() >= MASTER.until) {
       master.value = r.master;
       var lbl = byId('master-val');
       if (lbl) { lbl.textContent = Math.round(r.master * 100) + ' %'; }
@@ -573,7 +747,8 @@
     var dbo = byId('dbo-btn');
     if (dbo) {
       dbo.classList.toggle('engaged', !!r.dbo);
-      dbo.textContent = r.dbo ? 'DBO ACTIF — relâcher' : 'DBO';
+      var dlbl = dbo.querySelector('.dbo-label');
+      if (dlbl) { dlbl.textContent = r.dbo ? 'DBO ACTIF — relâcher' : 'DBO'; }
     }
     var bpm = byId('bpm-val');
     if (bpm) { bpm.textContent = fmtF(r.bpm, 1); }
@@ -587,17 +762,34 @@
     var line = byId('health-line');
     if (!line) { return; }
     var h = S.health;
-    if (!h) { line.textContent = S.connected ? 'En attente de données…' : 'Hors ligne'; return; }
-    var parts = [];
-    (h.fps || []).forEach(function (p) { parts.push('S' + p[0] + ' ' + fmtF(p[1], 0) + ' fps'); });
+    line.textContent = '';
+    if (!h) {
+      line.appendChild(chip(S.connected ? '' : 'bad',
+        S.connected ? 'En attente de données…' : 'Hors ligne'));
+      return;
+    }
+    function grade(v, warnAt, badAt) {
+      if (typeof v !== 'number' || !isFinite(v)) { return ''; }
+      if (v >= badAt) { return 'bad'; }
+      if (v >= warnAt) { return 'warn'; }
+      return 'ok';
+    }
+    (h.fps || []).forEach(function (p) {
+      var v = p[1];
+      var cls = (typeof v === 'number' && isFinite(v))
+        ? (v >= 30 ? 'ok' : (v >= 15 ? 'warn' : 'bad')) : '';
+      line.appendChild(chip(cls, 'S' + p[0] + ' ' + fmtF(v, 0) + ' fps', 'Cadence de rendu de la sortie ' + p[0]));
+    });
     var drops = 0;
     (h.drops || []).forEach(function (p) { drops += p[1]; });
-    parts.push('drops ' + drops);
-    parts.push('CPU ' + fmtF(h.cpu_pct, 0) + ' %');
-    parts.push(fmtF(h.mem_mb, 0) + ' Mo');
-    if (h.temp_c !== null && h.temp_c !== undefined) { parts.push(fmtF(h.temp_c, 0) + ' °C'); }
-    parts.push('WS ' + (S.connected ? 'OK' : 'coupé'));
-    line.textContent = parts.join('  •  ');
+    line.appendChild(chip(grade(drops, 1, 100), 'drops ' + drops, 'Frames perdues (cumul)'));
+    line.appendChild(chip(grade(h.cpu_pct, 70, 90), 'CPU ' + fmtF(h.cpu_pct, 0) + ' %', 'Charge processeur du moteur'));
+    line.appendChild(chip('', fmtF(h.mem_mb, 0) + ' Mo', 'Mémoire utilisée par le moteur'));
+    if (h.temp_c !== null && h.temp_c !== undefined) {
+      line.appendChild(chip(grade(h.temp_c, 70, 80), fmtF(h.temp_c, 0) + ' °C', 'Température (Raspberry Pi)'));
+    }
+    line.appendChild(chip(S.connected ? 'ok' : 'bad', 'WS ' + (S.connected ? 'OK' : 'coupé'),
+      'Liaison WebSocket avec le moteur'));
   }
 
   /* ================================================================= CUES */
@@ -673,7 +865,8 @@
     });
     panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
     if (!cues().length) {
-      panel.appendChild(el('div', { class: 'muted', style: 'padding:10px' }, 'Aucune cue — bouton « Ajouter » pour commencer.'));
+      panel.appendChild(el('div', { style: 'padding:10px 0 0' },
+        emptyState('list', 'Aucune cue — bouton « Ajouter » pour commencer la conduite.')));
     }
     root.appendChild(panel);
     return root;
@@ -835,13 +1028,15 @@
       }, '− Slice')));
 
     slicesOfOutput().forEach(function (s) {
-      var row = el('div', {
-        class: 'toolbar', style: s.id === S.sel.slice ? 'color:var(--accent)' : '',
-        'data-tip': 'Sélectionne ce slice dans l’éditeur'
-      }, el('span', { style: 'cursor:pointer', onclick: function () { S.sel.slice = s.id; S.sel.corner = null; renderMain(); } },
-        s.name + ' (z ' + s.z + (s.enabled ? '' : ', désactivé') + ')'));
-      slicePanel.appendChild(row);
+      slicePanel.appendChild(el('div', {
+        class: 'slice-item' + (s.id === S.sel.slice ? ' selected' : ''),
+        'data-tip': 'Sélectionne ce slice dans l’éditeur',
+        onclick: function () { S.sel.slice = s.id; S.sel.corner = null; renderMain(); }
+      }, s.name + ' (z ' + s.z + (s.enabled ? '' : ', désactivé') + ')'));
     });
+    if (!slicesOfOutput().length) {
+      slicePanel.appendChild(emptyState('screen', 'Aucun slice sur cette sortie — « + Slice » pour caler une zone.'));
+    }
     side.appendChild(slicePanel);
 
     /* mires */
@@ -952,14 +1147,22 @@
         y: (e.clientY - r.top) * cv.height / r.height
       };
     }
-    cv.addEventListener('mousedown', function (e) {
+    /* Pointer Events + setPointerCapture : le drag survit à la sortie du
+       canvas (cas fréquent : coin calé au bord, x=0 ou 1) — les move/up
+       continuent d'arriver même hors canvas, le coin ne « lâche » plus. */
+    cv.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) { return; }
       var p = pos(e);
       /* poignée d'abord (slice sélectionné prioritaire) */
       var hit = hitCorner(p, currentSlice()) || hitCornerAny(p);
       if (hit) {
         S.sel.slice = hit.slice.id;
         S.sel.corner = hit.corner;
-        if (!isShowMode()) { drag = { slice: hit.slice, corner: hit.corner }; S.dragging = true; }
+        if (!isShowMode()) {
+          drag = { slice: hit.slice, corner: hit.corner };
+          S.dragging = true;
+          try { cv.setPointerCapture(e.pointerId); } catch (err) { /* capture indisponible */ }
+        }
         drawMapping();
         return;
       }
@@ -969,7 +1172,7 @@
       S.sel.corner = null;
       renderMain();
     });
-    cv.addEventListener('mousemove', function (e) {
+    cv.addEventListener('pointermove', function (e) {
       if (!drag) { return; }
       var p = pos(e);
       var nx = clamp(p.x / cv.width, 0, 1), ny = clamp(p.y / cv.height, 0, 1);
@@ -989,8 +1192,8 @@
       drag = null;
       S.dragging = false;
     }
-    cv.addEventListener('mouseup', endDrag);
-    cv.addEventListener('mouseleave', endDrag);
+    cv.addEventListener('pointerup', endDrag);
+    cv.addEventListener('pointercancel', endDrag);
 
     function hitCorner(p, s) {
       if (!s) { return null; }
@@ -1087,9 +1290,10 @@
         'data-tip': m.path + (m.missing ? ' — FICHIER MANQUANT' : '') + ' — clic : sélectionner, double-clic : assigner au slice'
       },
         img,
+        m.missing ? el('span', { class: 'badge-missing' }, 'MANQUANT') : null,
         el('div', { class: 'media-name' }, m.name),
         el('div', { class: 'media-meta' },
-          m.missing ? 'MANQUANT' :
+          m.missing ? 'fichier introuvable' :
             (m.width + '×' + m.height + (m.duration_s ? ' • ' + fmtF(m.duration_s, 1) + ' s' : ''))));
       card.addEventListener('click', function () { S.sel.media = m.id; renderMain(); });
       card.addEventListener('dblclick', function () {
@@ -1099,7 +1303,7 @@
       grid.appendChild(card);
     });
     if (!medias().length) {
-      grid.appendChild(el('div', { class: 'muted' }, 'Aucun média — déposez des fichiers dans media/ puis « Re-scanner ».'));
+      grid.appendChild(emptyState('film', 'Aucun média — déposez des fichiers dans media/ puis « Re-scanner ».'));
     }
     panel.appendChild(grid);
     root.appendChild(panel);
@@ -1138,8 +1342,8 @@
     });
     left.appendChild(table);
     if (!materials().length) {
-      left.appendChild(el('div', { class: 'muted', style: 'padding:10px' },
-        'Aucun matériau — déposez des .fs (ISF) dans shaders/ puis re-scannez.'));
+      left.appendChild(el('div', { style: 'padding:10px 0 0' },
+        emptyState('sparkle', 'Aucun matériau — déposez des .fs (ISF) dans shaders/ puis re-scannez.')));
     }
     root.appendChild(left);
 
@@ -1301,7 +1505,8 @@
     modulators().forEach(function (m) { table.appendChild(modulatorRow(m)); });
     modPanel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
     if (!modulators().length) {
-      modPanel.appendChild(el('div', { class: 'muted', style: 'padding:10px' }, 'Aucun modulateur.'));
+      modPanel.appendChild(el('div', { style: 'padding:10px 0 0' },
+        emptyState('wave', 'Aucun modulateur — « + LFO » ou « + Bande audio » pour animer un paramètre.')));
     }
     root.appendChild(modPanel);
 
@@ -1327,6 +1532,10 @@
         el('th', { class: 'edit-only' }, '')));
     routes().forEach(function (r) { rtable.appendChild(routeRow(r)); });
     routePanel.appendChild(el('div', { style: 'overflow-x:auto' }, rtable));
+    if (!routes().length) {
+      routePanel.appendChild(el('div', { style: 'padding:10px 0 0' },
+        emptyState('wave', 'Aucune route — un modulateur n’agit que routé vers un paramètre.')));
+    }
     root.appendChild(routePanel);
 
     return root;
@@ -1492,7 +1701,8 @@
     (patch().midi || []).forEach(function (b, i) { mtable.appendChild(midiRow(b, i)); });
     midi.appendChild(el('div', { style: 'overflow-x:auto' }, mtable));
     if (!(patch().midi || []).length) {
-      midi.appendChild(el('div', { class: 'muted', style: 'padding:8px' }, 'Aucun binding MIDI.'));
+      midi.appendChild(el('div', { style: 'padding:8px 0 0' },
+        emptyState('plug', 'Aucun binding MIDI — « + CC » ou « + Note » pour piloter la conduite.')));
     }
     root.appendChild(midi);
 
@@ -1521,7 +1731,8 @@
     (patch().artnet || []).forEach(function (e, i) { atable.appendChild(artnetRow(e, i)); });
     art.appendChild(el('div', { style: 'overflow-x:auto' }, atable));
     if (!(patch().artnet || []).length) {
-      art.appendChild(el('div', { class: 'muted', style: 'padding:8px' }, 'Aucun patch Art-Net.'));
+      art.appendChild(el('div', { style: 'padding:8px 0 0' },
+        emptyState('plug', 'Aucun patch Art-Net — « + Canal » pour piloter un paramètre en DMX.')));
     }
     root.appendChild(art);
 
@@ -1705,7 +1916,8 @@
 
     panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
     if (!outputs().length) {
-      panel.appendChild(el('div', { class: 'muted', style: 'padding:10px' }, 'Aucune sortie configurée.'));
+      panel.appendChild(el('div', { style: 'padding:10px 0 0' },
+        emptyState('screen', 'Aucune sortie — « + Sortie » puis activez-la pour projeter.')));
     }
     root.appendChild(panel);
     return root;
@@ -1756,6 +1968,11 @@
     if (!list) { return; }
     list.textContent = '';
     filteredLogs().forEach(function (l) { list.appendChild(logLineDom(l)); });
+    if (!filteredLogs().length) {
+      list.appendChild(emptyState('list', S.logFilter === 'all'
+        ? 'Journal vide — les événements du moteur s’afficheront ici.'
+        : 'Aucune ligne à ce niveau de filtre.'));
+    }
     list.scrollTop = list.scrollHeight;
     var count = byId('journal-count');
     if (count) { count.textContent = filteredLogs().length + ' ligne(s)'; }
@@ -1774,6 +1991,8 @@
     if (S.logs.length > 500) { S.logs.splice(0, S.logs.length - 500); }
     var list = byId('journal-list');
     if (list && (S.logFilter === 'all' || S.logFilter === level)) {
+      var empty = list.querySelector('.empty-state');
+      if (empty) { list.removeChild(empty); }
       list.appendChild(logLineDom({ level: level, target: target, message: message }));
       list.scrollTop = list.scrollHeight;
     }
@@ -1877,9 +2096,11 @@
         if (e.key === 'Escape') { t.blur(); }
         return;
       }
-      if (e.code === 'Space') { e.preventDefault(); go(); return; }
-      if (e.key === 'b' || e.key === 'B') { dboToggle(); return; }
-      if (e.key === 't' || e.key === 'T') { sendCmd({ cmd: 'tap_tempo' }); return; }
+      /* e.repeat : l'auto-repeat clavier ne doit JAMAIS déclencher une
+         action de conduite (rafale de GO, strobe DBO, tap tempo faussé). */
+      if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) { go(); } return; }
+      if (e.key === 'b' || e.key === 'B') { if (!e.repeat) { dboKeyDown(); } return; }
+      if (e.key === 't' || e.key === 'T') { if (!e.repeat) { sendCmd({ cmd: 'tap_tempo' }); } return; }
       if (/^[1-9]$/.test(e.key)) {
         var tab = visibleTabs()[parseInt(e.key, 10) - 1];
         if (tab) { setTab(tab.id); }
@@ -1891,6 +2112,9 @@
         return;
       }
       if (S.tab === 'mapping') { mappingKey(e); }
+    });
+    document.addEventListener('keyup', function (e) {
+      if (e.key === 'b' || e.key === 'B') { dboKeyUp(); }
     });
   }
 
@@ -1943,7 +2167,7 @@
           /* pas de re-render pendant un drag : juste le canvas */
           if (!S.dragging) { drawMapping(); }
         } else {
-          renderMain();
+          requestRenderMain();
         }
         break;
       default:
@@ -1989,6 +2213,7 @@
   document.addEventListener('DOMContentLoaded', function () {
     installTooltips();
     installKeyboard();
+    installDeferredRender();
     startClock();
     var badge = byId('mode-badge');
     if (badge) {
@@ -1996,7 +2221,7 @@
         sendCmd({ cmd: 'mode_set', mode: isShowMode() ? 'edit' : 'show' });
       });
     }
-    Conduite.ws.on('open', function () { S.connected = true; updateHealth(); });
+    Conduite.ws.on('open', function () { S.connected = true; refreshPreviews(); updateHealth(); });
     Conduite.ws.on('close', function () { S.connected = false; updateHealth(); });
     Conduite.ws.on('message', onMessage);
     Conduite.ws.connect();

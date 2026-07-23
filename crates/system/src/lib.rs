@@ -3,6 +3,10 @@
 //! Santé machine pour le bandeau Live et la page Journal :
 //! - [`HealthSampler`] : CPU (processus + global), mémoire, température,
 //!   via `sysinfo`, rafraîchi au plus une fois par seconde ;
+//! - [`SamplerThread`] : le même échantillonnage sur un **thread dédié**
+//!   (le rafraîchissement sysinfo — WMI sous Windows — peut bloquer des
+//!   dizaines de ms : jamais sur le thread de rendu) ; le tick ne fait que
+//!   [`SamplerThread::latest`], copie sous mutex très court ;
 //! - [`FpsCounter`] : FPS lissé et frames perdues par sortie — **pur**,
 //!   horloge injectée, testé avec une horloge simulée ;
 //! - [`merge`] : fusion des compteurs et de l'échantillon système en
@@ -12,7 +16,7 @@ mod fps;
 mod sampler;
 
 pub use fps::FpsCounter;
-pub use sampler::{HealthSampler, SysSample};
+pub use sampler::{HealthSampler, SamplerThread, SysSample};
 
 use conduite_core::{HealthSnapshot, OutputId};
 

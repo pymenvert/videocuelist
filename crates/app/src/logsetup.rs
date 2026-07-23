@@ -129,7 +129,9 @@ pub fn install_panic_hook() {
         if let Some((shows_dir, json)) = snapshot {
             let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
             let path = shows_dir.join(format!("recover-{stamp}.json"));
-            match std::fs::write(&path, json) {
+            // Écriture atomique : c'est potentiellement la SEULE copie des
+            // éditions non sauvegardées — jamais de fichier tronqué.
+            match conduite_core::write_atomic(&path, json.as_bytes()) {
                 Ok(()) => tracing::error!(target: "app",
                     path = %path.display(), "show sauvegardé pour récupération"),
                 Err(e) => tracing::error!(target: "app", error = %e,

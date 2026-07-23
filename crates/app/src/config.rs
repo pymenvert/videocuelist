@@ -78,12 +78,16 @@ impl AppConfig {
         }
     }
 
-    /// Sauvegarde vers `base/config.toml` (best-effort, loggué).
+    /// Sauvegarde vers `base/config.toml` (best-effort, loggué). Écriture
+    /// ATOMIQUE (tmp + rename + fsync) : une coupure de courant pendant
+    /// l'écriture ne doit jamais laisser un fichier tronqué — sinon le
+    /// prochain boot repart sur les défauts (`last_show = "demo"`, port
+    /// 9820) et rejoue le show de démo en pleine représentation.
     pub fn save(&self, base: &Path) {
         let path = base.join(CONFIG_FILE);
         match toml::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
+                if let Err(e) = conduite_core::write_atomic(&path, text.as_bytes()) {
                     warn!(target: "app::config", path = %path.display(), error = %e,
                         "écriture de la config impossible");
                 }

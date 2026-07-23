@@ -105,6 +105,78 @@ fn loop_continue_au_dela_de_la_duree() {
 }
 
 #[test]
+#[ignore = "exige ffmpeg : boucle avec in/out (respawn hors thread appelant)"]
+fn loop_avec_in_out_reboucle_par_respawn() {
+    // Cas du finding « respawn sur le thread de rendu » : in/out désactivent
+    // -stream_loop, la boucle passe par le respawn du superviseur. On vérifie
+    // que le player continue de produire des frames DANS le segment sur
+    // plusieurs cycles, sans eof et sans blocage du thread appelant.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let video = make_test_video(dir.path()).expect("génération testsrc");
+    let pb = Playback { in_s: 0.2, out_s: Some(0.5), speed: 1.0, end: EndMode::Loop };
+    let mut p = open_ffmpeg(&video, &pb).expect("open");
+    p.play();
+
+    let mut frames = 0usize;
+    let mut t = 0.2f64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // Segment de 0,3 s à 30 fps ≈ 9 frames/cycle : 40 frames ≈ 4+ cycles.
+    while frames < 40 && std::time::Instant::now() < deadline {
+        if let Some(f) = p.poll_frame(t) {
+            assert!(
+                f.pts_s >= 0.2 - 1e-6 && f.pts_s < 0.5 + 1.0 / 30.0,
+                "pts média dans le segment in/out, obtenu {}",
+                f.pts_s
+            );
+            frames += 1;
+            t += 1.0 / 30.0;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!p.eof(), "une boucle in/out ne doit jamais passer eof");
+    }
+    assert!(frames >= 40, "la boucle in/out doit traverser plusieurs respawns ({frames} frames)");
+    assert!(p.healthy());
+}
+
+#[test]
+#[ignore = "exige ffmpeg : seek après eof (ring rouvert par le superviseur)"]
+fn seek_apres_eof_reprend_la_lecture() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let video = make_test_video(dir.path()).expect("génération testsrc");
+    let mut p = open_ffmpeg(&video, &playback(EndMode::Hold)).expect("open");
+    p.play();
+
+    // Lire jusqu'à l'eof (Hold).
+    let mut t = 0.0f64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !p.eof() && std::time::Instant::now() < deadline {
+        if p.poll_frame(t).is_some() {
+            t += 1.0 / 30.0;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            t += 0.002;
+        }
+    }
+    assert!(p.eof(), "Hold doit finir en eof");
+
+    // Seek : le superviseur relance le process et rouvre le ring.
+    p.seek(0.2);
+    assert!(!p.eof(), "le seek doit sortir de l'eof");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut got = None;
+    while got.is_none() && std::time::Instant::now() < deadline {
+        got = p.poll_frame(0.2);
+        if got.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    let f = got.expect("frame après seek post-eof");
+    assert!((f.pts_s - 0.2).abs() < 0.2, "pts proche du seek, obtenu {}", f.pts_s);
+    assert!(p.healthy());
+}
+
+#[test]
 #[ignore = "exige ffmpeg : seek"]
 fn seek_relance_et_produit_des_frames() {
     let dir = tempfile::tempdir().expect("tempdir");

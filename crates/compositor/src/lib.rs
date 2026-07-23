@@ -135,6 +135,16 @@ pub enum CompositorError {
     FramebufferIncomplete(u32),
 }
 
+/// Clés présentes dans `existing` mais absentes de `keep` — support pur de
+/// l'élagage ([`Compositor::prune_slices`], [`ProgramCache::retain`]), testé
+/// sans GL.
+pub(crate) fn keys_not_kept<K: Copy + PartialEq>(
+    existing: impl Iterator<Item = K>,
+    keep: &[K],
+) -> Vec<K> {
+    existing.filter(|k| !keep.contains(k)).collect()
+}
+
 /// Remplit `indices` avec l'ordre de dessin des slices : z croissant,
 /// **stable** (à z égal, l'ordre de déclaration est conservé). Le buffer est
 /// réutilisé chaque frame — zéro allocation une fois la capacité atteinte.
@@ -195,6 +205,20 @@ mod tests {
             z,
             ..SliceDraw::new(slice)
         }
+    }
+
+    #[test]
+    fn keys_not_kept_filters_only_absent_keys() {
+        let existing = [1u32, 2, 3, 4];
+        assert_eq!(keys_not_kept(existing.iter().copied(), &[2, 4]), [1, 3]);
+        // Tout conservé : rien à élaguer.
+        assert!(keys_not_kept(existing.iter().copied(), &[1, 2, 3, 4]).is_empty());
+        // `keep` vide : tout est élagué.
+        assert_eq!(keys_not_kept(existing.iter().copied(), &[]), [1, 2, 3, 4]);
+        // Clés de `keep` inconnues : ignorées sans effet.
+        assert_eq!(keys_not_kept(existing.iter().copied(), &[9, 2, 3, 4]), [1]);
+        // Source vide : rien à élaguer.
+        assert!(keys_not_kept(std::iter::empty::<u32>(), &[1]).is_empty());
     }
 
     #[test]

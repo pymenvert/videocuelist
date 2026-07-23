@@ -33,8 +33,8 @@ pub use modulation::{Freq, ModKind, ModRoute, ModRouteState, ModulatorCfg, Route
 pub use patch::{DmxBits, MidiBinding, OscOutCfg, PatchEntry, PatchTable};
 pub use paths::validate_relative_path;
 pub use persist::{
-    load_show, load_show_with_media, save_show_atomic, write_atomic, LoadWarning, BACKUP_DIR,
-    BACKUP_KEEP, SHOW_FILE,
+    acquire_instance_lock, load_show, load_show_with_media, save_show_atomic, write_atomic,
+    InstanceLock, LoadWarning, BACKUP_DIR, BACKUP_KEEP, LOCK_FILE, SHOW_FILE,
 };
 
 #[cfg(test)]

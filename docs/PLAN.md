@@ -2,6 +2,12 @@
 
 Règle : **chaque phase livre un outil utilisable en l'état**, avec un critère de sortie testable. On ne passe pas à la phase suivante sans l'avoir validé.
 
+> **État au 2026-07-24** : v1 desktop construite en une itération nocturne (phases 0 à 4
+> compressées, backend vidéo ffmpeg, Windows validé). Restent de la phase 0 : la
+> validation macOS/Ubuntu réelles (la CI compile les trois) et le bench Raspberry Pi
+> (backend GStreamer à brancher derrière `PlayerBackend`). Les critères de sortie
+> ci-dessous restent la référence pour valider chaque périmètre en conditions réelles.
+
 ## Phase 0 — Socle & dérisquage
 
 Workspace Rust, CI GitHub Actions (build 4 plateformes), reprise des acquis Lanterne (shaders homographie, PlayerBackend, pipelines GStreamer), une sortie plein écran, lecture vidéo HAP + H.264, bench.

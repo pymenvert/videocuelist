@@ -13,6 +13,12 @@
 
 use std::collections::HashMap;
 
+/// Borne du cache logique. Les adresses arrivent de surfaces réseau non
+/// authentifiées (OSC/WS → app → [`Pickup::update_logical`]) : sans borne,
+/// un émetteur hostile égrenant des adresses toutes distinctes ferait
+/// grossir la map sans limite (épuisement mémoire en cours de spectacle).
+const MAX_LOGICAL_ENTRIES: usize = 4096;
+
 /// Décision du pickup pour une valeur entrante.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PickupDecision {
@@ -50,6 +56,22 @@ impl Pickup {
     /// valeur change ailleurs : cue, UI, OSC…). Le désengagement éventuel des
     /// faders concernés est détecté paresseusement au prochain mouvement.
     pub fn update_logical(&mut self, addr: &str, value: f32) {
+        self.insert_logical(addr, value);
+    }
+
+    /// Insertion bornée dans le cache logique : à saturation
+    /// ([`MAX_LOGICAL_ENTRIES`]), une entrée arbitraire est évincée.
+    /// Dégradation douce : pour l'adresse évincée, le soft-takeover repart en
+    /// « prise immédiate » (valeur logique inconnue) — la mémoire, elle,
+    /// reste bornée même sous flood d'adresses hostiles.
+    fn insert_logical(&mut self, addr: &str, value: f32) {
+        if !self.logical.contains_key(addr) && self.logical.len() >= MAX_LOGICAL_ENTRIES {
+            if let Some(evicted) = self.logical.keys().next().cloned() {
+                self.logical.remove(&evicted);
+                tracing::debug!(target: "control_midi::pickup", %evicted,
+                    "cache logique plein : éviction d'une entrée");
+            }
+        }
         self.logical.insert(addr.to_string(), value);
     }
 
@@ -113,9 +135,10 @@ impl Pickup {
             }
         }
 
+        let engaged = fs.engaged;
         fs.last = Some(incoming);
-        if fs.engaged {
-            self.logical.insert(addr.to_string(), incoming);
+        if engaged {
+            self.insert_logical(addr, incoming);
             PickupDecision::Pass(incoming)
         } else {
             // `engaged == false` implique une valeur logique connue.
@@ -212,6 +235,44 @@ mod tests {
         assert_eq!(p.filter(0, 8, "b", 0.5, TOL), PickupDecision::Pass(0.5));
         assert!(!p.is_engaged(0, 7));
         assert!(p.is_engaged(0, 8));
+    }
+
+    #[test]
+    fn logical_cache_is_bounded_under_hostile_flood() {
+        let mut p = Pickup::new();
+        // Un émetteur hostile égrène des adresses toutes distinctes
+        // (« /conduite/param/<compteur> ») : la map doit rester bornée.
+        for i in 0..(MAX_LOGICAL_ENTRIES + 1000) {
+            p.update_logical(&format!("hostile/{i}"), 0.5);
+        }
+        assert!(
+            p.logical.len() <= MAX_LOGICAL_ENTRIES,
+            "cache logique non borné : {} entrées",
+            p.logical.len()
+        );
+        // Le pickup reste pleinement fonctionnel après le flood.
+        p.update_logical("master/intensity", 0.5);
+        assert_eq!(
+            p.filter(0, 7, "master/intensity", 0.2, TOL),
+            blocked(0.5, 0.2)
+        );
+        assert_eq!(
+            p.filter(0, 7, "master/intensity", 0.6, TOL),
+            PickupDecision::Pass(0.6)
+        );
+        assert!(p.logical.len() <= MAX_LOGICAL_ENTRIES);
+    }
+
+    #[test]
+    fn engaged_fader_insert_path_is_bounded_too() {
+        let mut p = Pickup::new();
+        for i in 0..MAX_LOGICAL_ENTRIES {
+            p.update_logical(&format!("bourrage/{i}"), 0.0);
+        }
+        // Valeur logique inconnue ⇒ prise immédiate : le Pass insère dans le
+        // cache via le chemin `filter`, qui doit lui aussi rester borné.
+        assert_eq!(p.filter(0, 7, "nouvelle/addr", 0.3, TOL), PickupDecision::Pass(0.3));
+        assert!(p.logical.len() <= MAX_LOGICAL_ENTRIES);
     }
 
     #[test]
