@@ -1,7 +1,10 @@
-﻿[package]
+[package]
 name = "conduite-control-artnet"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+conduite-core = { version = "0.1.0", path = "../core" }
+crossbeam-channel = "0.5.16"
+tracing = "0.1.44"

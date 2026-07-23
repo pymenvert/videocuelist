@@ -1,7 +1,13 @@
-﻿[package]
+[package]
 name = "conduite-isf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tracing = "0.1.44"
+
+[dev-dependencies]
+glsl-lang = "0.8.1"

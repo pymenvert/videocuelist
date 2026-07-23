@@ -1,7 +1,10 @@
-﻿[package]
+[package]
 name = "conduite-system"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+conduite-core = { version = "0.1.0", path = "../core" }
+sysinfo = "0.39.6"
+tracing = "0.1.44"

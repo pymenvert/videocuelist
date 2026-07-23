@@ -1,7 +1,21 @@
-﻿[package]
+[package]
 name = "conduite-control-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+bytes = "1.12.1"
+conduite-core = { version = "0.1.0", path = "../core" }
+crossbeam-channel = "0.5.16"
+futures-util = "0.3.33"
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt", "net", "sync", "time", "fs", "macros"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
+# Alignée sur la version tirée par axum 0.8 (évite deux arbres tungstenite).
+tokio-tungstenite = "0.29.0"

@@ -17,6 +17,13 @@ dist/
 *.log
 /logs/
 
+# Packaging
+/dist/
+
+# Shaders perso de l'utilisateur (les exemples restent versionnés)
+/shaders/*
+!/shaders/examples/
+
 # OS
 .DS_Store
 Thumbs.db

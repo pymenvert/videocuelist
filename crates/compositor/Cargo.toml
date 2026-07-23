@@ -1,7 +1,13 @@
-﻿[package]
+[package]
 name = "conduite-compositor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+conduite-core = { version = "0.1.0", path = "../core" }
+conduite-engine = { version = "0.1.0", path = "../engine" }
+conduite-isf = { version = "0.1.0", path = "../isf" }
+glow = "0.18.0"
+thiserror = "2.0.19"
+tracing = "0.1.44"

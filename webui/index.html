@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conduite — régie vidéo</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div id="banner" class="hidden">Reconnexion au moteur…</div>
+<header id="topbar">
+  <div id="brand" data-tip="Conduite — régie vidéo de spectacle">CONDUITE<span id="show-name"></span></div>
+  <nav id="tabs" data-tip="Onglets — raccourcis clavier 1 à 9 (0 = Réglages)"></nav>
+  <div id="top-right">
+    <span id="mode-badge" data-tip="Mode courant. Double-clic pour basculer Édition / Show (le mode Show verrouille toute édition).">ÉDITION</span>
+    <span id="clock" data-tip="Horloge locale">--:--:--</span>
+  </div>
+</header>
+<main id="main"></main>
+<div id="tooltip" class="hidden" role="tooltip"></div>
+<script src="/assets/ws.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>
