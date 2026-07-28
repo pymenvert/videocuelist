@@ -13,7 +13,7 @@ use crate::model::{
     OutputId, ParamValue, Show, ShowSettings, Slice, SliceId, SliceState,
 };
 use crate::modulation::{ModRoute, ModulatorCfg};
-use crate::patch::{MidiBinding, OscOutCfg, PatchEntry};
+use crate::patch::{KeyBinding, MidiBinding, OscOutCfg, PatchEntry};
 
 /// Origine d'une commande (arbitrage priorité / feedback / journal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +87,10 @@ pub enum Command {
     ShowNew,
     /// Re-scan du dossier `media/` (vignettes, état OK/manquant).
     MediaRescan,
+    /// Génère un zip de diagnostic (logs récents, config, show, versions,
+    /// santé — chemins personnels expurgés) en tâche de fond ; l'app publie
+    /// [`crate::StateEvent::DiagnosticReady`] à la fin.
+    DiagnosticReport,
     /// « Collecter le show » : copie de tous les médias dans un dossier autonome.
     ShowCollect,
     /// Edit (libre) | Show (verrouillé).
@@ -134,6 +138,8 @@ pub enum EditOp {
     PatchMidiRemove { index: usize },
     PatchMidiUpdate { index: usize, binding: MidiBinding },
     PatchOscOutSet { cfg: Option<OscOutCfg> },
+    KeyBindingAdd { binding: KeyBinding },
+    KeyBindingRemove { index: usize },
     ShowRename { name: String },
     SettingsUpdate { settings: ShowSettings },
 }
@@ -236,6 +242,12 @@ impl EditOp {
                 }
             }
             EditOp::PatchOscOutSet { cfg } => show.patch.osc_out = cfg.clone(),
+            EditOp::KeyBindingAdd { binding } => show.patch.keys.push(binding.clone()),
+            EditOp::KeyBindingRemove { index } => {
+                if *index < show.patch.keys.len() {
+                    show.patch.keys.remove(*index);
+                }
+            }
             EditOp::ShowRename { name } => show.name = name.clone(),
             EditOp::SettingsUpdate { settings } => show.settings = settings.clone(),
         }

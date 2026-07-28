@@ -13,6 +13,21 @@ pub struct PatchTable {
     pub artnet: Vec<PatchEntry>,
     pub midi: Vec<MidiBinding>,
     pub osc_out: Option<OscOutCfg>,
+    /// Raccourcis clavier remappables (capturés par l'UI en mode learn).
+    /// Le moteur ne fait que les persister : l'exécution reste côté UI
+    /// (la webui traduit touche → commande). Les raccourcis SYSTÈME
+    /// (Espace GO, Échap panic, B DBO) restent prioritaires et non
+    /// remappables. Absent des shows antérieurs ⇒ vide.
+    pub keys: Vec<KeyBinding>,
+}
+
+/// Raccourci clavier remappable : touche (ex. `"F5"`, `"Ctrl+3"`) →
+/// commande sérialisable. La chaîne `key` est celle capturée par l'UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyBinding {
+    /// Ex. `"F5"`, `"Ctrl+3"`, `"Shift+G"` (format capturé par l'UI).
+    pub key: String,
+    pub command: CommandTemplate,
 }
 
 /// Résolution DMX d'une entrée de patch.

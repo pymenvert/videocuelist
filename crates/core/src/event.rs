@@ -37,6 +37,20 @@ pub enum StateEvent {
     MasterChanged { value: f32 },
     /// Dead blackout posé/levé.
     DboChanged { active: bool },
+    /// Le zip de diagnostic est prêt (chemin expurgé, relatif ou `~`).
+    DiagnosticReady { path: String },
+}
+
+/// Mise à jour disponible (vérification opt-in au démarrage — voir
+/// `ShowSettings::update_check`). Jamais de téléchargement automatique.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    /// Version publiée (ex. `"0.2.0"`).
+    pub version: String,
+    /// Page de téléchargement (releases GitHub).
+    pub url: String,
+    /// Notes de version courtes.
+    pub notes: String,
 }
 
 /// Instantané de conduite sérialisé vers l'UI (~10 Hz).
@@ -57,6 +71,10 @@ pub struct RuntimeStatus {
     pub dbo: bool,
     /// Niveaux instantanés des modulateurs : (id, niveau 0..1) — vumètres UI.
     pub mod_levels: Vec<(u32, f32)>,
+    /// Mise à jour disponible (`None` = pas de vérification ou à jour).
+    /// Absent du JSON quand `None` (compat trames existantes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateInfo>,
 }
 
 impl Default for RuntimeStatus {
@@ -72,6 +90,7 @@ impl Default for RuntimeStatus {
             master: 1.0,
             dbo: false,
             mod_levels: Vec::new(),
+            update: None,
         }
     }
 }

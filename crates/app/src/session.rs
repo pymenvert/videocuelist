@@ -531,6 +531,11 @@ impl Session {
 
     fn handle_command(&mut self, source: Source, cmd: Command, now_s: f64) {
         match cmd {
+            // P2-2 : génération du zip de diagnostic (implémentation à venir
+            // dans ce lot — le refus est propre en attendant).
+            Command::DiagnosticReport => {
+                warn!(target: "app::session", "rapport de diagnostic : pas encore disponible");
+            }
             Command::ParamSet { addr, value, source } => self.param_set(&addr, value, source),
             Command::ParamNudge { addr, delta, source } => {
                 // Base du nudge : la CIBLE posée, hors modulation et hors
@@ -777,6 +782,8 @@ impl Session {
             | PatchOscOutSet { .. } => {
                 self.push_patch();
             }
+            // Raccourcis clavier : exécutés côté UI, la persistance suffit.
+            KeyBindingAdd { .. } | KeyBindingRemove { .. } => {}
             SettingsUpdate { .. } => {
                 // Respawn (join de 4 threads, ~gel) uniquement si la
                 // configuration RÉSEAU a changé ; le reste se pousse à chaud.
@@ -1634,6 +1641,8 @@ impl Session {
             master: self.registry.value_f32("master/intensity"),
             dbo: self.dbo_level > 0.001,
             mod_levels: self.modul.levels().collect(),
+            // Renseigné par la vérification de mise à jour opt-in (P2-3).
+            update: None,
         }
     }
 

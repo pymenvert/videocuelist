@@ -118,10 +118,18 @@ pub enum PatternKind {
     Grid,
     /// Damier.
     Checker,
-    /// Mire d'identification : nom + numéro du slice.
+    /// Mire d'identification : nom + numéro du slice, nom + résolution de
+    /// la sortie.
     Ident,
     /// Barres de couleurs.
     Bars,
+    /// Grille de convergence grossière (4 cases par côté). Variante
+    /// ADDITIVE (compat serde : les shows antérieurs n'en portent pas).
+    Grid4,
+    /// Grille de convergence fine (16 cases par côté). Additive.
+    Grid16,
+    /// Barres de couleurs SMPTE. Additive.
+    ColorBars,
 }
 
 /// Contenu posé sur un slice pour une cue.
@@ -399,7 +407,20 @@ pub struct ShowSettings {
     /// machine (`config.toml`) ou capture coupée. Modifiable à chaud par
     /// `SettingsUpdate`.
     pub audio_input: Option<String>,
+    /// Vérification de mise à jour au démarrage (opt-in, défaut FAUX).
+    /// Une seule requête, en mode Edit uniquement, timeout 3 s, jamais de
+    /// téléchargement — le résultat remonte dans `runtime.update`.
+    pub update_check: bool,
+    /// URL du manifeste `latest.json` (`{version, url, notes}`).
+    pub update_url: String,
+    /// Priorité process ABOVE_NORMAL au passage en mode Show (retour à
+    /// Normal en Edit). Windows uniquement, défaut faux.
+    pub boost_priority: bool,
 }
+
+/// URL par défaut du manifeste de mise à jour (raw GitHub du dépôt).
+pub const UPDATE_URL_DEFAULT: &str =
+    "https://raw.githubusercontent.com/pymenvert/videocuelist/main/latest.json";
 
 impl Default for ShowSettings {
     fn default() -> Self {
@@ -415,6 +436,9 @@ impl Default for ShowSettings {
             autosave_debounce_s: 2.0,
             autosave_interval_s: 60.0,
             audio_input: None,
+            update_check: false,
+            update_url: UPDATE_URL_DEFAULT.to_string(),
+            boost_priority: false,
         }
     }
 }

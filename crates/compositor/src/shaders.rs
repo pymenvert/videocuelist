@@ -54,6 +54,11 @@ pub fn pattern_code(kind: Option<PatternKind>) -> i32 {
         Some(PatternKind::Checker) => PATTERN_CHECKER,
         Some(PatternKind::Bars) => PATTERN_BARS,
         Some(PatternKind::Ident) => PATTERN_IDENT,
+        // Variantes P2 additives : repli provisoire sur la mire la plus
+        // proche tant que le shader dédié n'est pas implémenté (contrat
+        // Mires — voir docs/INTERFACES.md).
+        Some(PatternKind::Grid4) | Some(PatternKind::Grid16) => PATTERN_GRID,
+        Some(PatternKind::ColorBars) => PATTERN_BARS,
     }
 }
 

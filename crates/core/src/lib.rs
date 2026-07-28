@@ -22,15 +22,15 @@ pub mod persist;
 pub use command::{Command, CommandTemplate, EditOp, Source};
 pub use demo::demo_show;
 pub use error::CoreError;
-pub use event::{HealthSnapshot, RuntimeStatus, StateEvent};
+pub use event::{HealthSnapshot, RuntimeStatus, StateEvent, UpdateInfo};
 pub use model::{
     AppMode, Content, Cue, CueNumber, CueTriggers, Curve, EndMode, FollowMode, MaterialId,
     MaterialRef, MediaId, MediaRef, ModId, OutputCfg, OutputId, ParamValue, PatternKind, Playback,
     Rect, Show, ShowSettings, Slice, SliceId, SliceState, Transition, TransitionKind,
-    FORMAT_VERSION,
+    FORMAT_VERSION, UPDATE_URL_DEFAULT,
 };
 pub use modulation::{Freq, ModKind, ModRoute, ModRouteState, ModulatorCfg, RouteMode, Wave};
-pub use patch::{DmxBits, MidiBinding, OscOutCfg, PatchEntry, PatchTable};
+pub use patch::{DmxBits, KeyBinding, MidiBinding, OscOutCfg, PatchEntry, PatchTable};
 pub use paths::validate_relative_path;
 pub use persist::{
     acquire_instance_lock, load_show, load_show_with_media, save_show_atomic, write_atomic,
@@ -280,6 +280,135 @@ mod tests {
             let back: Command = serde_json::from_str(want).expect("de");
             assert_eq!(back, cmd);
         }
+    }
+
+    /// Contrat P2 : diagnostic, clavier remappable, mires additionnelles,
+    /// réglages de mise à jour — JSON figé.
+    #[test]
+    fn p2_contract_json_is_stable() {
+        // Command::DiagnosticReport.
+        let json = serde_json::to_string(&Command::DiagnosticReport).expect("ser");
+        assert_eq!(json, r#"{"cmd":"diagnostic_report"}"#);
+        let back: Command = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, Command::DiagnosticReport);
+
+        // StateEvent::DiagnosticReady.
+        let ev = StateEvent::DiagnosticReady {
+            path: "logs/diagnostic-20260728-120000.zip".into(),
+        };
+        let json = serde_json::to_string(&ev).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"type":"diagnostic_ready","path":"logs/diagnostic-20260728-120000.zip"}"#
+        );
+
+        // EditOp KeyBindingAdd / KeyBindingRemove.
+        let add = Command::Edit(EditOp::KeyBindingAdd {
+            binding: KeyBinding {
+                key: "Ctrl+3".into(),
+                command: CommandTemplate::Goto { cue: CueNumber(3000) },
+            },
+        });
+        let json = serde_json::to_string(&add).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"cmd":"edit","op":"key_binding_add","binding":{"key":"Ctrl+3","command":{"cmd":"goto","cue":3000}}}"#
+        );
+        let back: Command = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, add);
+        let rm = Command::Edit(EditOp::KeyBindingRemove { index: 2 });
+        let json = serde_json::to_string(&rm).expect("ser");
+        assert_eq!(json, r#"{"cmd":"edit","op":"key_binding_remove","index":2}"#);
+
+        // PatternKind : variantes additives figées.
+        for (kind, want) in [
+            (PatternKind::Grid4, r#""grid4""#),
+            (PatternKind::Grid16, r#""grid16""#),
+            (PatternKind::ColorBars, r#""color_bars""#),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).expect("ser"), want);
+            let back: PatternKind = serde_json::from_str(want).expect("de");
+            assert_eq!(back, kind);
+        }
+
+        // UpdateInfo (runtime.update).
+        let info = UpdateInfo {
+            version: "0.2.0".into(),
+            url: "https://github.com/pymenvert/videocuelist/releases".into(),
+            notes: "Corrections".into(),
+        };
+        let json = serde_json::to_string(&info).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"version":"0.2.0","url":"https://github.com/pymenvert/videocuelist/releases","notes":"Corrections"}"#
+        );
+    }
+
+    /// `runtime.update` est ABSENT de la trame quand `None` (compat) et
+    /// présent quand une mise à jour est connue.
+    #[test]
+    fn runtime_update_field_is_optional() {
+        let st = RuntimeStatus::default();
+        let json = serde_json::to_string(&st).expect("ser");
+        assert!(!json.contains("update"), "champ absent quand None : {json}");
+        let back: RuntimeStatus = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, st);
+
+        let st = RuntimeStatus {
+            update: Some(UpdateInfo {
+                version: "9.9.9".into(),
+                url: "u".into(),
+                notes: "n".into(),
+            }),
+            ..RuntimeStatus::default()
+        };
+        let json = serde_json::to_string(&st).expect("ser");
+        assert!(json.contains(r#""update":{"version":"9.9.9""#));
+        let back: RuntimeStatus = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, st);
+    }
+
+    /// Réglages de mise à jour : opt-in (défaut FAUX), URL par défaut sur le
+    /// raw GitHub du dépôt ; `boost_priority` défaut faux ; un show antérieur
+    /// (sans ces champs, sans `keys`) charge avec les défauts.
+    #[test]
+    fn update_and_priority_settings_default_off() {
+        let s = ShowSettings::default();
+        assert!(!s.update_check, "opt-in : défaut FAUX");
+        assert_eq!(s.update_url, UPDATE_URL_DEFAULT);
+        assert!(s.update_url.starts_with("https://raw.githubusercontent.com/"));
+        assert!(!s.boost_priority);
+
+        let json = r#"{"format_version":1,"name":"ancien","patch":{"artnet":[],"midi":[]}}"#;
+        let show: Show = serde_json::from_str(json).expect("show antérieur");
+        assert!(!show.settings.update_check);
+        assert!(show.patch.keys.is_empty(), "keys absent ⇒ vide");
+    }
+
+    /// KeyBindingAdd/Remove mutent bien la table ; remove hors bornes = no-op.
+    #[test]
+    fn key_binding_ops_apply() {
+        let mut show = Show::new("t");
+        EditOp::KeyBindingAdd {
+            binding: KeyBinding {
+                key: "F5".into(),
+                command: CommandTemplate::Go,
+            },
+        }
+        .apply(&mut show);
+        EditOp::KeyBindingAdd {
+            binding: KeyBinding {
+                key: "F6".into(),
+                command: CommandTemplate::Back,
+            },
+        }
+        .apply(&mut show);
+        assert_eq!(show.patch.keys.len(), 2);
+        EditOp::KeyBindingRemove { index: 99 }.apply(&mut show); // no-op
+        assert_eq!(show.patch.keys.len(), 2);
+        EditOp::KeyBindingRemove { index: 0 }.apply(&mut show);
+        assert_eq!(show.patch.keys.len(), 1);
+        assert_eq!(show.patch.keys[0].key, "F6");
     }
 
     #[test]

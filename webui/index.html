@@ -18,6 +18,13 @@
   </div>
 </header>
 <main id="main"></main>
+<footer id="statusbar">
+  <span class="chip" id="foot-conn" data-tip="Liaison WebSocket avec le moteur">…</span>
+  <span id="foot-show" class="muted"></span>
+  <span class="spacer"></span>
+  <button id="update-badge" class="hidden" data-tip="Une nouvelle version est disponible — clic pour le détail (aucun téléchargement automatique)"></button>
+</footer>
+<div id="toasts" aria-live="polite"></div>
 <div id="tooltip" class="hidden" role="tooltip"></div>
 <script src="/assets/ws.js"></script>
 <script src="/assets/app.js"></script>
