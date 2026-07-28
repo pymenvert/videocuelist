@@ -72,7 +72,9 @@ $proc = Start-Process -FilePath $exe -ArgumentList @("--port", "$Port") -Working
 Write-Host ("conduite.exe PID {0}" -f $proc.Id)
 
 # Attendre /health = ok (30 s max).
-$healthUrl = "http://localhost:$Port/health"
+# 127.0.0.1 et pas « localhost » : Windows résout localhost en ::1 d'abord,
+# or le moteur écoute en IPv4 (0.0.0.0) — le poll de santé expirerait.
+$healthUrl = "http://127.0.0.1:$Port/health"
 $ok = $false
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
@@ -92,7 +94,7 @@ Write-Host "/health ok — version $($h.version)"
 # ------------------------------------------------------------- WebSocket
 $ct = [System.Threading.CancellationToken]::None
 $ws = New-Object System.Net.WebSockets.ClientWebSocket
-$ws.ConnectAsync([Uri]("ws://localhost:{0}/ws" -f $Port), $ct).GetAwaiter().GetResult() | Out-Null
+$ws.ConnectAsync([Uri]("ws://127.0.0.1:{0}/ws" -f $Port), $ct).GetAwaiter().GetResult() | Out-Null
 Write-Host "WebSocket /ws connecté."
 
 $recvBuf = New-Object byte[] 262144
