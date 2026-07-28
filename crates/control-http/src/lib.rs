@@ -8,6 +8,10 @@
 //!   trames `dyn` (runtime) throttlées à 10 Hz, commandes entrantes ;
 //! - `GET /preview.mjpeg` / `GET /preview-b.mjpeg` : préviews program /
 //!   standby en `multipart/x-mixed-replace` ;
+//! - `GET /preview.h264` : préview program H.264 sur WebSocket — 1er message
+//!   texte = config JSON `{"codec","format":"annexb","width","height","fps"}`
+//!   puis frames binaires Annex-B ; **503** si `h264_mf` est indisponible
+//!   (le client reste en MJPEG) ;
 //! - `GET /thumb/{id}.jpg` : vignettes du cache.
 //!
 //! Le serveur vit sur son propre thread (runtime tokio dédié) : la boucle
@@ -16,7 +20,7 @@
 pub mod assets;
 mod server;
 
-pub use server::{epoch_ms, HttpDeps, HttpServer, HttpServerHandle};
+pub use server::{epoch_ms, H264Msg, HttpDeps, HttpServer, HttpServerHandle};
 
 #[cfg(test)]
 mod tests {
@@ -43,12 +47,18 @@ mod tests {
         events_tx: broadcast::Sender<Value>,
         preview_tx: broadcast::Sender<Bytes>,
         preview_b_tx: broadcast::Sender<Bytes>,
+        h264_tx: broadcast::Sender<H264Msg>,
+        h264_clients: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         thumb_dir: PathBuf,
         tick_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
         early_log: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
     fn harness(name: &str) -> Harness {
+        harness_with(name, true)
+    }
+
+    fn harness_with(name: &str, h264_available: bool) -> Harness {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (state_tx, state_rx) = watch::channel(json!({
             "show": { "name": "test-show" },
@@ -57,6 +67,8 @@ mod tests {
         let (events_tx, events_rx) = broadcast::channel(64);
         let (preview_tx, preview_rx) = broadcast::channel(8);
         let (preview_b_tx, preview_b_rx) = broadcast::channel(8);
+        let (h264_tx, h264_rx) = broadcast::channel(64);
+        let h264_clients = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thumb_dir = std::env::temp_dir().join(format!(
             "conduite-http-test-{name}-{}",
             std::process::id()
@@ -83,6 +95,9 @@ mod tests {
             tick_ms: tick_ms.clone(),
             version: "0.0.0-test".to_string(),
             early_log: early_log.clone(),
+            h264_rx,
+            h264_clients: h264_clients.clone(),
+            h264_available: std::sync::Arc::new(move || h264_available),
         };
         let handle = HttpServer::spawn("127.0.0.1:0".parse().expect("addr"), deps).expect("spawn");
         Harness {
@@ -92,6 +107,8 @@ mod tests {
             events_tx,
             preview_tx,
             preview_b_tx,
+            h264_tx,
+            h264_clients,
             thumb_dir,
             tick_ms,
             early_log,
@@ -417,6 +434,113 @@ mod tests {
             b"JPGSTBY",
         )
         .await;
+    }
+
+    // -------------------------------------------------------- préview H.264
+
+    /// Contrat : `h264_mf` indisponible ⇒ l'endpoint répond **503** au
+    /// handshake WebSocket (le client reste en MJPEG).
+    #[tokio::test]
+    async fn preview_h264_replies_503_when_encoder_unavailable() {
+        let h = harness_with("h264-503", false);
+        let url = format!("ws://{}/preview.h264", h.handle.local_addr());
+        let err = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect_err("le handshake doit échouer en 503");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 503, "contrat : 503");
+            }
+            other => panic!("erreur HTTP attendue, obtenu : {other:?}"),
+        }
+        assert_eq!(
+            h.h264_clients.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "aucun client compté après un refus 503"
+        );
+    }
+
+    /// Une requête non-WebSocket sur un serveur avec h264 : 426 (l'endpoint
+    /// existe, il attend un upgrade) — jamais 404.
+    #[test]
+    fn preview_h264_plain_get_is_426() {
+        let h = harness("h264-426");
+        let (head, _) = http_get(&h, "/preview.h264");
+        assert!(head.starts_with("HTTP/1.1 426"), "en-têtes : {head}");
+    }
+
+    /// Contrat du flux : le compteur de clients monte à la connexion (la
+    /// session démarre l'encodeur en le voyant), le 1er message est la
+    /// config JSON — même si des access units la précèdent dans le canal —
+    /// puis les frames binaires Annex-B suivent ; le compteur retombe à la
+    /// déconnexion.
+    #[tokio::test]
+    async fn preview_h264_config_first_then_binary_frames() {
+        let h = harness("h264-flux");
+        let url = format!("ws://{}/preview.h264", h.handle.local_addr());
+        let (mut ws, resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connexion WS h264");
+        assert_eq!(resp.status().as_u16(), 101);
+
+        // Le serveur compte le client (la session verrait 0 → 1).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.h264_clients.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            assert!(std::time::Instant::now() < deadline, "compteur jamais incrémenté");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Un AU AVANT la config : il doit être retenu (config d'abord).
+        h.h264_tx
+            .send(H264Msg::Au(Bytes::from_static(b"\x00\x00\x00\x01\x65avant")))
+            .expect("send AU");
+        h.h264_tx
+            .send(H264Msg::Config(json!({
+                "codec": "avc1.42E01E",
+                "format": "annexb",
+                "width": 640,
+                "height": 360,
+                "fps": 15
+            })))
+            .expect("send config");
+        h.h264_tx
+            .send(H264Msg::Au(Bytes::from_static(b"\x00\x00\x00\x01\x65frame1")))
+            .expect("send AU");
+
+        // 1er message : la config, en texte.
+        let first = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timeout config")
+            .expect("flux terminé")
+            .expect("erreur WS");
+        let TgMessage::Text(text) = first else {
+            panic!("1er message : config JSON attendue, obtenu {first:?}");
+        };
+        let cfg: Value = serde_json::from_str(text.as_str()).expect("config JSON");
+        assert_eq!(cfg["codec"], "avc1.42E01E");
+        assert_eq!(cfg["format"], "annexb");
+        assert_eq!(cfg["width"], 640);
+        assert_eq!(cfg["height"], 360);
+        assert_eq!(cfg["fps"], 15);
+
+        // 2e message : la frame binaire émise APRÈS la config.
+        let second = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timeout frame")
+            .expect("flux terminé")
+            .expect("erreur WS");
+        let TgMessage::Binary(data) = second else {
+            panic!("frame binaire attendue, obtenu {second:?}");
+        };
+        assert_eq!(&data[..], b"\x00\x00\x00\x01\x65frame1");
+
+        // Déconnexion : le compteur retombe (la session arrêtera l'encodeur).
+        drop(ws);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while h.h264_clients.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(std::time::Instant::now() < deadline, "compteur jamais décrémenté");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     // -------------------------------------------------------------- health

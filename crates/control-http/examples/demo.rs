@@ -26,6 +26,8 @@ fn main() {
     let (events_tx, events_rx) = tokio::sync::broadcast::channel(64);
     let (_preview_tx, preview_rx) = tokio::sync::broadcast::channel(8);
     let (_preview_b_tx, preview_b_rx) = tokio::sync::broadcast::channel(8);
+    // Pas d'encodeur H.264 dans la démo : /preview.h264 répond 503.
+    let (_h264_tx, h264_rx) = tokio::sync::broadcast::channel(8);
 
     let deps = HttpDeps {
         cmd_tx,
@@ -40,6 +42,9 @@ fn main() {
         )),
         version: "demo".to_string(),
         early_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        h264_rx,
+        h264_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        h264_available: std::sync::Arc::new(|| false),
     };
     let handle = HttpServer::spawn("127.0.0.1:8787".parse().expect("addr"), deps).expect("spawn");
     println!("Démo : http://{}", handle.local_addr());

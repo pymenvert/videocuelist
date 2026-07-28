@@ -142,6 +142,11 @@ fn run() -> i32 {
     let (events_tx, _events_keep) = broadcast::channel(512);
     let (preview_tx, _preview_keep) = broadcast::channel(8);
     let (preview_b_tx, _preview_b_keep) = broadcast::channel(8);
+    // Préview H.264 (WS /preview.h264) : config + access units produits par
+    // la session ; le compteur de clients pilote le cycle de vie de
+    // l'encodeur ffmpeg (0 client = aucun process).
+    let (h264_tx, _h264_keep) = broadcast::channel(64);
+    let h264_clients = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let dirs = Dirs::detect();
     let log_handles = logsetup::init(&dirs.logs, events_tx.clone());
@@ -210,6 +215,10 @@ fn run() -> i32 {
         tick_ms: tick_ms.clone(),
         version: version_string(),
         early_log: log_handles.early_log,
+        h264_rx: h264_tx.subscribe(),
+        h264_clients: h264_clients.clone(),
+        // Sonde paresseuse (un `ffmpeg -encoders` mémorisé au 1er client).
+        h264_available: std::sync::Arc::new(conduite_engine::h264_mf_available),
     }) {
         Ok(handle) => Some(handle),
         Err(code) => return code,
@@ -226,6 +235,8 @@ fn run() -> i32 {
             events_tx,
             preview_tx,
             preview_b_tx,
+            h264_tx,
+            h264_clients,
             tick_ms,
         },
     );

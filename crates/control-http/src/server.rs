@@ -8,7 +8,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -38,6 +38,19 @@ const MJPEG_BOUNDARY: &str = "frame";
 /// Cadence maximale des trames `dyn` vers chaque client WS (10 Hz).
 const DYN_PERIOD: Duration = Duration::from_millis(100);
 
+/// Message du flux préview H.264 (`GET /preview.h264`, WebSocket). Produit
+/// par la session (app), diffusé tel quel à chaque client connecté.
+#[derive(Debug, Clone)]
+pub enum H264Msg {
+    /// Handshake JSON du contrat — `{"codec","format":"annexb","width",
+    /// "height","fps"}`. Ré-émis par la session à chaque nouveau client et à
+    /// chaque (re)démarrage d'encodeur ; le serveur garantit qu'il précède
+    /// toute frame binaire sur chaque connexion.
+    Config(Value),
+    /// Un access unit H.264 Annex-B complet (message binaire WS).
+    Au(Bytes),
+}
+
 /// Dépendances injectées par `app` au démarrage du serveur.
 pub struct HttpDeps {
     /// Commandes sortantes vers le moteur (la web UI émet `Source::Ui`).
@@ -65,6 +78,16 @@ pub struct HttpDeps {
     /// rejouées à chaque nouvelle connexion WS pour que les erreurs émises
     /// AVANT la connexion (bind OSC raté…) apparaissent dans le journal web.
     pub early_log: Arc<Mutex<Vec<Value>>>,
+    /// Flux préview H.264 (`GET /preview.h264`) : config + access units
+    /// produits par la session.
+    pub h264_rx: broadcast::Receiver<H264Msg>,
+    /// Nombre de clients H.264 connectés — la session démarre/arrête
+    /// l'encodeur ffmpeg selon ce compteur (0 client = pas de process).
+    pub h264_clients: Arc<AtomicUsize>,
+    /// `h264_mf` est-il disponible ? Sondé PARESSEUSEMENT (premier appel =
+    /// un `ffmpeg -encoders`, mémorisé côté engine) : `false` ⇒ l'endpoint
+    /// répond 503 et le client reste en MJPEG (contrat).
+    pub h264_available: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// Âge de tick au-delà duquel `/health` répond `stalled` (moteur figé).
@@ -194,6 +217,7 @@ fn router(state: AppState) -> Router {
         .route("/ws", get(ws_route))
         .route("/preview.mjpeg", get(preview_program))
         .route("/preview-b.mjpeg", get(preview_standby))
+        .route("/preview.h264", get(preview_h264))
         .route("/thumb/{file}", get(thumb))
         .route("/about", get(about))
         .route("/health", get(health))
@@ -339,6 +363,107 @@ fn mjpeg_part(jpeg: &Bytes) -> Bytes {
     out.extend_from_slice(jpeg);
     out.extend_from_slice(b"\r\n");
     Bytes::from(out)
+}
+
+/* -------------------------------------------------------- préview H.264 */
+
+/// Garde de comptage des clients H.264 : incrémente à la connexion,
+/// décrémente au drop (déconnexion, erreur, arrêt serveur) — la session
+/// observe ce compteur pour démarrer/arrêter l'encodeur ffmpeg.
+struct H264ClientGuard(Arc<AtomicUsize>);
+
+impl H264ClientGuard {
+    fn new(counter: Arc<AtomicUsize>) -> H264ClientGuard {
+        counter.fetch_add(1, Ordering::SeqCst);
+        H264ClientGuard(counter)
+    }
+}
+
+impl Drop for H264ClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// `GET /preview.h264` — préview H.264 sur WebSocket (contrat
+/// docs/INTERFACES.md) : 1er message texte = config JSON
+/// `{"codec","format":"annexb","width","height","fps"}`, puis frames
+/// binaires Annex-B. Si `h264_mf` est indisponible : **503** (le client
+/// reste en MJPEG). Requête non-WebSocket : 426 (l'endpoint existe).
+async fn preview_h264(
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+    State(st): State<AppState>,
+) -> Response {
+    // Sonde bloquante (un `ffmpeg -encoders` mémorisé) : hors du runtime.
+    let probe = st.inner.h264_available.clone();
+    let available = tokio::task::spawn_blocking(move || probe())
+        .await
+        .unwrap_or(false);
+    if !available {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "encodeur h264_mf indisponible : rester en MJPEG",
+        )
+            .into_response();
+    }
+    match ws {
+        Ok(ws) => ws.on_upgrade(move |socket| handle_h264(socket, st)),
+        Err(_) => (
+            StatusCode::UPGRADE_REQUIRED,
+            "préview H.264 : WebSocket attendu",
+        )
+            .into_response(),
+    }
+}
+
+/// Boucle d'une connexion préview H.264 : garantit que la config précède
+/// toute frame binaire ; un client en retard saute des access units (il se
+/// resynchronise au keyframe suivant, jamais de backpressure).
+async fn handle_h264(socket: WebSocket, st: AppState) {
+    // S'abonner AVANT d'annoncer le client : la config que la session
+    // ré-émet en voyant le compteur monter ne peut pas être ratée.
+    let mut rx = st.inner.h264_rx.resubscribe();
+    let _guard = H264ClientGuard::new(st.inner.h264_clients.clone());
+    let (mut tx, mut client) = socket.split();
+    let mut configured = false;
+    tracing::debug!(target: "control_http", "client préview H.264 connecté");
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(H264Msg::Config(v)) => {
+                    let Ok(text) = serde_json::to_string(&v) else { continue };
+                    if tx.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                    configured = true;
+                }
+                Ok(H264Msg::Au(bytes)) => {
+                    // Le 1er message de chaque connexion DOIT être la config.
+                    if !configured {
+                        continue;
+                    }
+                    if tx.send(Message::Binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!(target: "control_http", skipped = n,
+                        "client H.264 en retard : access units sautés");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            m = client.next() => match m {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {} // le client n'a rien à nous dire
+                Some(Err(e)) => {
+                    tracing::debug!(target: "control_http", error = %e,
+                        "erreur WS préview H.264");
+                    break;
+                }
+            },
+        }
+    }
+    tracing::debug!(target: "control_http", "client préview H.264 déconnecté");
 }
 
 /* ------------------------------------------------------------ WebSocket */

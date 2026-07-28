@@ -104,11 +104,17 @@ fn run_server(name: &str, crash_dir: &Path) -> i32 {
     let handler = Handler {
         dir: crash_dir.to_path_buf(),
     };
-    if let Err(e) = server.run(Box::new(handler), &shutdown, Some(SERVER_IDLE_TIMEOUT)) {
-        eprintln!("conduite-crash : boucle serveur terminée sur erreur ({e})");
-        return 1;
-    }
-    0
+    let code = match server.run(Box::new(handler), &shutdown, Some(SERVER_IDLE_TIMEOUT)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("conduite-crash : boucle serveur terminée sur erreur ({e})");
+            1
+        }
+    };
+    // Le fichier socket ne doit jamais traîner (best-effort, doublé côté
+    // client dans `CrashGuard::drop`).
+    let _ = std::fs::remove_file(name);
+    code
 }
 
 // ------------------------------------------------------------------- client
@@ -120,6 +126,8 @@ fn run_server(name: &str, crash_dir: &Path) -> i32 {
 pub struct CrashGuard {
     _handler: crash_handler::CrashHandler,
     child: std::process::Child,
+    /// Chemin du fichier socket (nettoyé au drop, best-effort).
+    socket: PathBuf,
 }
 
 impl Drop for CrashGuard {
@@ -134,6 +142,8 @@ impl Drop for CrashGuard {
                 let _ = self.child.wait();
             }
         }
+        // Fichier socket : jamais de résidu (le serveur l'efface aussi).
+        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
@@ -150,7 +160,18 @@ pub fn spawn(logs_dir: &Path) -> Option<CrashGuard> {
         }
     };
     let crash_dir = logs_dir.join("crash");
-    let name = format!("conduite-crash-{}", std::process::id());
+    // Le fichier socket vit dans logs/crash/ (chemin ABSOLU : un nom relatif
+    // atterrirait dans le cwd — un résidu à la racine du dossier portable) ;
+    // le dossier doit exister AVANT le bind du serveur.
+    if let Err(e) = std::fs::create_dir_all(&crash_dir) {
+        warn!(target: "app::crash", error = %e,
+            "dossier logs/crash impossible : capture de crash inactive");
+        return None;
+    }
+    let socket = crash_dir.join(format!("conduite-crash-{}.sock", std::process::id()));
+    // Résidu d'un lancement précédent (même PID recyclé) : on repart net.
+    let _ = std::fs::remove_file(&socket);
+    let name = socket.to_string_lossy().into_owned();
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg(CRASH_SERVER_FLAG)
@@ -210,6 +231,7 @@ pub fn spawn(logs_dir: &Path) -> Option<CrashGuard> {
             Some(CrashGuard {
                 _handler: handler,
                 child,
+                socket,
             })
         }
         Err(e) => {

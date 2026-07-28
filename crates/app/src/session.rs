@@ -68,6 +68,9 @@ const TICK_REANCHOR_GAP: Duration = Duration::from_secs(3);
 const SHOWS_REFRESH_PERIOD: Duration = Duration::from_secs(10);
 /// Nombre maximal d'entrées « média manquant » dans `runtime.warnings`.
 const WARN_MEDIA_MAX: usize = 20;
+/// Backoff avant une nouvelle tentative de démarrage de l'encodeur H.264
+/// (spawn raté ou process mort) : jamais de spawn-loop ffmpeg.
+const H264_RETRY: Duration = Duration::from_secs(5);
 
 /// Résultat d'un re-scan des médias/matériaux (worker `conduite-rescan`).
 struct RescanResult {
@@ -83,6 +86,11 @@ pub struct SessionChannels {
     pub events_tx: broadcast::Sender<Value>,
     pub preview_tx: broadcast::Sender<Bytes>,
     pub preview_b_tx: broadcast::Sender<Bytes>,
+    /// Flux préview H.264 (config + access units) vers `/preview.h264`.
+    pub h264_tx: broadcast::Sender<conduite_control_http::H264Msg>,
+    /// Clients H.264 connectés (incr/décr par le serveur web) : pilote le
+    /// cycle de vie de l'encodeur ffmpeg (0 client = aucun process).
+    pub h264_clients: Arc<std::sync::atomic::AtomicUsize>,
     /// Horodatage (ms UNIX) du dernier tick, partagé avec `GET /health`.
     pub tick_ms: Arc<AtomicU64>,
 }
@@ -211,6 +219,21 @@ pub struct Session {
     /// Buffers réutilisés des lectures préview asynchrones (program/standby).
     preview_scratch: Vec<u8>,
     preview_scratch_b: Vec<u8>,
+    /// Flux préview H.264 vers `/preview.h264` (serveur web).
+    h264_tx: broadcast::Sender<conduite_control_http::H264Msg>,
+    /// Clients H.264 connectés (compteur partagé avec le serveur web).
+    h264_clients: Arc<std::sync::atomic::AtomicUsize>,
+    /// Encodeur ffmpeg h264_mf — vivant uniquement quand des clients sont
+    /// connectés (drop = kill + wait du process, jamais de zombie).
+    h264_enc: Option<conduite_engine::PreviewEncoder>,
+    /// Paramètres (w, h, fps) de l'encodeur en cours (respawn si changés).
+    h264_cfg: (u32, u32, u32),
+    /// Dernier nombre de clients observé (nouveau client ⇒ config ré-émise).
+    h264_seen_clients: usize,
+    /// Pas de nouvelle tentative de spawn avant cet instant (backoff).
+    h264_retry_at: Option<Instant>,
+    /// Buffer réutilisé du flip vertical (glReadPixels sort bas→haut).
+    h264_flip: Vec<u8>,
     /// Throttle du warn de saturation du bus de commandes.
     last_cmd_warn: Option<Instant>,
     /// Une génération de vignettes est déjà en cours (coalescence).
@@ -330,6 +353,13 @@ impl Session {
             comp_reload: Vec::new(),
             preview_scratch: Vec::new(),
             preview_scratch_b: Vec::new(),
+            h264_tx: ch.h264_tx,
+            h264_clients: ch.h264_clients,
+            h264_enc: None,
+            h264_cfg: (0, 0, 0),
+            h264_seen_clients: 0,
+            h264_retry_at: None,
+            h264_flip: Vec::new(),
             last_cmd_warn: None,
             thumbs_running: Arc::new(AtomicBool::new(false)),
             tick_ms: ch.tick_ms,
@@ -1929,6 +1959,9 @@ impl Session {
         let fps = self.show.settings.mjpeg_fps.max(1) as f32;
         let period = Duration::from_secs_f32(1.0 / fps);
         let (w, h) = (self.show.settings.mjpeg_width, self.show.settings.mjpeg_height);
+        // Encodeur H.264 : démarré/arrêté selon les clients de /preview.h264
+        // (coût d'un load atomique quand personne n'est connecté).
+        self.manage_h264(now);
         if now.duration_since(self.last_preview) >= period {
             self.last_preview = now;
             if let Some(slices) = first_output_plan(&self.show.outputs, plans) {
@@ -1936,6 +1969,9 @@ impl Session {
                 let got =
                     gfx.render_preview_into(0, w, h, slices, master, self.dbo_level, true, &mut buf);
                 if got {
+                    // La même frame RGBA nourrit l'encodeur H.264 (flip fait
+                    // dans feed_h264, push non bloquant côté engine).
+                    self.feed_h264(&buf, w, h);
                     self.preview.submit(PreviewJob {
                         rgba: buf.clone(),
                         width: w,
@@ -1973,7 +2009,12 @@ impl Session {
     }
 
     /// Headless : l'endpoint MJPEG reste vivant avec un placeholder.
+    /// Pas de frames GL ⇒ pas d'encodeur H.264 (le client `/preview.h264`
+    /// ne reçoit jamais de config et retombe en MJPEG, contrat).
     fn headless_previews(&mut self, now: Instant) {
+        if self.h264_enc.take().is_some() {
+            info!(target: "app::session", "préview H.264 arrêtée (headless)");
+        }
         let fps = self.show.settings.mjpeg_fps.max(1) as f32;
         let period = Duration::from_secs_f32(1.0 / fps);
         if now.duration_since(self.last_preview) >= period {
@@ -1984,6 +2025,104 @@ impl Session {
             self.last_preview_b = now;
             let _ = self.preview_b_tx.send(self.placeholder.clone());
         }
+    }
+
+    /// Cycle de vie de l'encodeur H.264 de préview (contrat /preview.h264) :
+    /// démarré quand au moins un client WebSocket est connecté, arrêté à
+    /// zéro client (drop = kill du ffmpeg), respawn si les réglages préview
+    /// changent ou si le process meurt (backoff [`H264_RETRY`]). La config
+    /// JSON est ré-émise à chaque nouveau client — le serveur web garantit
+    /// qu'elle précède toute frame binaire sur chaque connexion.
+    fn manage_h264(&mut self, now: Instant) {
+        use conduite_control_http::H264Msg;
+
+        let clients = self.h264_clients.load(Ordering::SeqCst);
+        if clients == 0 {
+            if self.h264_enc.take().is_some() {
+                info!(target: "app::session", "préview H.264 arrêtée (plus de client)");
+            }
+            self.h264_seen_clients = 0;
+            self.h264_retry_at = None;
+            return;
+        }
+
+        let cfg = (
+            self.show.settings.mjpeg_width,
+            self.show.settings.mjpeg_height,
+            u32::from(self.show.settings.mjpeg_fps.max(1)),
+        );
+        if let Some(enc) = &self.h264_enc {
+            if !enc.is_alive() {
+                warn!(target: "app::session",
+                    "encodeur H.264 terminé inopinément : nouvelle tentative dans {H264_RETRY:?}");
+                self.h264_enc = None;
+                self.h264_retry_at = Some(now + H264_RETRY);
+            } else if self.h264_cfg != cfg {
+                info!(target: "app::session", "réglages préview changés : encodeur H.264 relancé");
+                self.h264_enc = None;
+            }
+        }
+        if self.h264_enc.is_none() {
+            if self.h264_retry_at.is_some_and(|t| now < t) {
+                return;
+            }
+            // Un spawn de process (~qq ms) sur le tick, au plus une fois par
+            // connexion client (backoff sur échec) : acceptable, tracé.
+            match conduite_engine::PreviewEncoder::new(cfg.0, cfg.1, cfg.2) {
+                Ok(enc) => {
+                    self.h264_enc = Some(enc);
+                    self.h264_cfg = cfg;
+                    self.h264_retry_at = None;
+                    self.h264_seen_clients = 0; // force la ré-émission de la config
+                    info!(target: "app::session", w = cfg.0, h = cfg.1, fps = cfg.2,
+                        "préview H.264 démarrée");
+                }
+                Err(e) => {
+                    warn!(target: "app::session", error = %e,
+                        "préview H.264 indisponible (les clients restent en MJPEG)");
+                    self.h264_retry_at = Some(now + H264_RETRY);
+                    return;
+                }
+            }
+        }
+        // Nouveau client : la config repart (1er message du contrat WS).
+        if clients > self.h264_seen_clients {
+            let _ = self.h264_tx.send(H264Msg::Config(json!({
+                "codec": conduite_engine::PREVIEW_CODEC_STRING,
+                "format": "annexb",
+                "width": self.h264_cfg.0,
+                "height": self.h264_cfg.1,
+                "fps": self.h264_cfg.2,
+            })));
+        }
+        self.h264_seen_clients = clients;
+        // Access units prêts → diffusion aux clients (canal borné en amont).
+        if let Some(enc) = &self.h264_enc {
+            while let Some(au) = enc.poll_access_unit() {
+                let _ = self.h264_tx.send(H264Msg::Au(Bytes::from(au.data)));
+            }
+        }
+    }
+
+    /// Alimente l'encodeur H.264 avec la frame préview RGBA (lignes bas→haut
+    /// telles que lues du FBO : retournées ici dans un buffer réutilisé —
+    /// ~1 Mo memcpy en 640×360, puis `push_frame` non bloquant côté engine).
+    fn feed_h264(&mut self, rgba: &[u8], w: u32, h: u32) {
+        let Some(enc) = &mut self.h264_enc else { return };
+        if (w, h) != (self.h264_cfg.0, self.h264_cfg.1) {
+            return; // réglages en cours de changement : frame sautée
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        let stride = wu * 4;
+        if rgba.len() < stride * hu {
+            return;
+        }
+        self.h264_flip.clear();
+        self.h264_flip.reserve(stride * hu);
+        for y in (0..hu).rev() {
+            self.h264_flip.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
+        }
+        enc.push_frame(&self.h264_flip);
     }
 
     // ------------------------------------------------------------ événements
