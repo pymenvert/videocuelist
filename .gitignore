@@ -36,3 +36,6 @@ desktop.ini
 # Config machine (auto-cree au premier lancement)
 config.toml
 conduite.lock
+
+# Binaires ffmpeg LGPL (telecharges par tools/get-ffmpeg-lgpl.ps1, jamais versionnes)
+/tools/ffmpeg-lgpl/
