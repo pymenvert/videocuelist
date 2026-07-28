@@ -1,0 +1,800 @@
+{
+  "format_version": 1,
+  "name": "show-maximal",
+  "outputs": [
+    {
+      "id": 1,
+      "name": "Projecteur jardin",
+      "monitor_index": 2,
+      "width": 1920,
+      "height": 1080,
+      "fullscreen": true,
+      "enabled": true
+    }
+  ],
+  "slices": [
+    {
+      "id": 1,
+      "name": "Fond",
+      "output": 1,
+      "corners": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.125
+        ],
+        [
+          0.875,
+          1.0
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ],
+      "src": {
+        "x": 0.25,
+        "y": 0.25,
+        "w": 0.5,
+        "h": 0.5
+      },
+      "z": -3,
+      "enabled": true
+    }
+  ],
+  "media": [
+    {
+      "id": 1,
+      "path": "boucle.mp4",
+      "name": "Boucle",
+      "duration_s": 12.5,
+      "fps": 25.0,
+      "width": 1920,
+      "height": 1080,
+      "missing": true
+    }
+  ],
+  "materials": [
+    {
+      "id": 1,
+      "path": "plasma.fs",
+      "name": "Plasma"
+    }
+  ],
+  "cues": [
+    {
+      "number": 1500,
+      "name": "Cue 1",
+      "color": "#3fa9f5",
+      "notes": "Attendre le noir complet avant GO.",
+      "armed": true,
+      "transition": {
+        "kind": "cut",
+        "dur_s": 1.5,
+        "curve": "linear"
+      },
+      "follow": "manual",
+      "goto_after": 1000,
+      "states": [
+        {
+          "slice": 1,
+          "content": "none",
+          "playback": {
+            "in_s": 1.5,
+            "out_s": 42.25,
+            "speed": 1.5,
+            "end": "loop"
+          },
+          "params": {
+            "material/1/mode": {
+              "s": "miroir"
+            },
+            "slice/1/blendmode": {
+              "i": 2
+            },
+            "slice/1/enabled": {
+              "b": true
+            },
+            "slice/1/opacity": {
+              "f": 0.75
+            },
+            "slice/1/pos": {
+              "p2": [
+                0.25,
+                0.75
+              ]
+            },
+            "slice/1/tint": {
+              "color": [
+                1.0,
+                0.5,
+                0.25,
+                1.0
+              ]
+            }
+          }
+        }
+      ],
+      "mod_routes": [
+        {
+          "route_id": 1,
+          "depth": 0.5,
+          "enabled": true
+        }
+      ],
+      "triggers": {
+        "midi_note": [
+          0,
+          60
+        ],
+        "osc": "/conduite/cue/1"
+      }
+    },
+    {
+      "number": 2500,
+      "name": "Cue 2",
+      "color": "#3fa9f5",
+      "notes": "Attendre le noir complet avant GO.",
+      "armed": false,
+      "transition": {
+        "kind": "crossfade",
+        "dur_s": 1.5,
+        "curve": "ease_in"
+      },
+      "follow": "after_media",
+      "goto_after": 1000,
+      "states": [
+        {
+          "slice": 1,
+          "content": {
+            "media": 1
+          },
+          "playback": {
+            "in_s": 1.5,
+            "out_s": 42.25,
+            "speed": 1.5,
+            "end": "ping_pong"
+          },
+          "params": {
+            "material/1/mode": {
+              "s": "miroir"
+            },
+            "slice/1/blendmode": {
+              "i": 2
+            },
+            "slice/1/enabled": {
+              "b": true
+            },
+            "slice/1/opacity": {
+              "f": 0.75
+            },
+            "slice/1/pos": {
+              "p2": [
+                0.25,
+                0.75
+              ]
+            },
+            "slice/1/tint": {
+              "color": [
+                1.0,
+                0.5,
+                0.25,
+                1.0
+              ]
+            }
+          }
+        }
+      ],
+      "mod_routes": [
+        {
+          "route_id": 1,
+          "depth": 0.5,
+          "enabled": false
+        }
+      ],
+      "triggers": {
+        "midi_note": [
+          0,
+          60
+        ],
+        "osc": "/conduite/cue/2"
+      }
+    },
+    {
+      "number": 3500,
+      "name": "Cue 3",
+      "color": "#3fa9f5",
+      "notes": "Attendre le noir complet avant GO.",
+      "armed": true,
+      "transition": {
+        "kind": "through_black",
+        "dur_s": 1.5,
+        "curve": "ease_out"
+      },
+      "follow": {
+        "wait": 2.5
+      },
+      "goto_after": 1000,
+      "states": [
+        {
+          "slice": 1,
+          "content": {
+            "material": 1
+          },
+          "playback": {
+            "in_s": 1.5,
+            "out_s": 42.25,
+            "speed": 1.5,
+            "end": "hold"
+          },
+          "params": {
+            "material/1/mode": {
+              "s": "miroir"
+            },
+            "slice/1/blendmode": {
+              "i": 2
+            },
+            "slice/1/enabled": {
+              "b": true
+            },
+            "slice/1/opacity": {
+              "f": 0.75
+            },
+            "slice/1/pos": {
+              "p2": [
+                0.25,
+                0.75
+              ]
+            },
+            "slice/1/tint": {
+              "color": [
+                1.0,
+                0.5,
+                0.25,
+                1.0
+              ]
+            }
+          }
+        }
+      ],
+      "mod_routes": [
+        {
+          "route_id": 1,
+          "depth": 0.5,
+          "enabled": true
+        }
+      ],
+      "triggers": {
+        "midi_note": [
+          0,
+          60
+        ],
+        "osc": "/conduite/cue/3"
+      }
+    },
+    {
+      "number": 4500,
+      "name": "Cue 4",
+      "color": "#3fa9f5",
+      "notes": "Attendre le noir complet avant GO.",
+      "armed": false,
+      "transition": {
+        "kind": "crossfade",
+        "dur_s": 1.5,
+        "curve": "ease_in_out"
+      },
+      "follow": "manual",
+      "goto_after": 1000,
+      "states": [
+        {
+          "slice": 1,
+          "content": {
+            "color": [
+              0.125,
+              0.25,
+              0.5,
+              1.0
+            ]
+          },
+          "playback": {
+            "in_s": 1.5,
+            "out_s": 42.25,
+            "speed": 1.5,
+            "end": "black"
+          },
+          "params": {
+            "material/1/mode": {
+              "s": "miroir"
+            },
+            "slice/1/blendmode": {
+              "i": 2
+            },
+            "slice/1/enabled": {
+              "b": true
+            },
+            "slice/1/opacity": {
+              "f": 0.75
+            },
+            "slice/1/pos": {
+              "p2": [
+                0.25,
+                0.75
+              ]
+            },
+            "slice/1/tint": {
+              "color": [
+                1.0,
+                0.5,
+                0.25,
+                1.0
+              ]
+            }
+          }
+        }
+      ],
+      "mod_routes": [
+        {
+          "route_id": 1,
+          "depth": 0.5,
+          "enabled": false
+        }
+      ],
+      "triggers": {
+        "midi_note": [
+          0,
+          60
+        ],
+        "osc": "/conduite/cue/4"
+      }
+    },
+    {
+      "number": 5500,
+      "name": "Cue 5",
+      "color": "#3fa9f5",
+      "notes": "Attendre le noir complet avant GO.",
+      "armed": true,
+      "transition": {
+        "kind": "cut",
+        "dur_s": 1.5,
+        "curve": "s_curve"
+      },
+      "follow": "after_media",
+      "goto_after": 1000,
+      "states": [
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "grid"
+          },
+          "playback": {
+            "in_s": 1.5,
+            "out_s": 42.25,
+            "speed": 1.5,
+            "end": "follow_next"
+          },
+          "params": {
+            "material/1/mode": {
+              "s": "miroir"
+            },
+            "slice/1/blendmode": {
+              "i": 2
+            },
+            "slice/1/enabled": {
+              "b": true
+            },
+            "slice/1/opacity": {
+              "f": 0.75
+            },
+            "slice/1/pos": {
+              "p2": [
+                0.25,
+                0.75
+              ]
+            },
+            "slice/1/tint": {
+              "color": [
+                1.0,
+                0.5,
+                0.25,
+                1.0
+              ]
+            }
+          }
+        }
+      ],
+      "mod_routes": [
+        {
+          "route_id": 1,
+          "depth": 0.5,
+          "enabled": true
+        }
+      ],
+      "triggers": {
+        "midi_note": [
+          0,
+          60
+        ],
+        "osc": "/conduite/cue/5"
+      }
+    },
+    {
+      "number": 9999,
+      "name": "Mires",
+      "color": "#ff8800",
+      "notes": "Calage projecteurs.",
+      "armed": true,
+      "transition": {
+        "kind": "cut",
+        "dur_s": 0.0,
+        "curve": "linear"
+      },
+      "follow": "manual",
+      "goto_after": null,
+      "states": [
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "grid"
+          },
+          "playback": null,
+          "params": {}
+        },
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "checker"
+          },
+          "playback": null,
+          "params": {}
+        },
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "ident"
+          },
+          "playback": null,
+          "params": {}
+        },
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "bars"
+          },
+          "playback": null,
+          "params": {}
+        },
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "grid4"
+          },
+          "playback": null,
+          "params": {}
+        },
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "grid16"
+          },
+          "playback": null,
+          "params": {}
+        },
+        {
+          "slice": 1,
+          "content": {
+            "pattern": "color_bars"
+          },
+          "playback": null,
+          "params": {}
+        }
+      ],
+      "mod_routes": [],
+      "triggers": {
+        "midi_note": null,
+        "osc": null
+      }
+    }
+  ],
+  "patch": {
+    "artnet": [
+      {
+        "universe": 0,
+        "channel": 1,
+        "bits": "eight",
+        "addr": "master/intensity",
+        "min": 0.0,
+        "max": 1.0,
+        "smoothing_ms": 50.0
+      },
+      {
+        "universe": 3,
+        "channel": 511,
+        "bits": "sixteen",
+        "addr": "slice/1/opacity",
+        "min": 0.25,
+        "max": 0.75,
+        "smoothing_ms": 0.0
+      }
+    ],
+    "midi": [
+      {
+        "note": {
+          "channel": 0,
+          "note": 60,
+          "command": {
+            "cmd": "go"
+          }
+        }
+      },
+      {
+        "cc": {
+          "channel": 15,
+          "cc": 7,
+          "fourteen_bits": true,
+          "addr": "master/intensity",
+          "min": 0.0,
+          "max": 1.0,
+          "pickup": true
+        }
+      }
+    ],
+    "osc_out": {
+      "host": "192.168.1.50",
+      "port": 9001
+    },
+    "keys": [
+      {
+        "key": "Ctrl+F1",
+        "command": {
+          "cmd": "go"
+        }
+      },
+      {
+        "key": "Ctrl+F2",
+        "command": {
+          "cmd": "back"
+        }
+      },
+      {
+        "key": "Ctrl+F3",
+        "command": {
+          "cmd": "goto",
+          "cue": 2500
+        }
+      },
+      {
+        "key": "Ctrl+F4",
+        "command": {
+          "cmd": "standby",
+          "cue": 3000
+        }
+      },
+      {
+        "key": "Ctrl+F5",
+        "command": {
+          "cmd": "panic",
+          "fade_s": 3.0
+        }
+      },
+      {
+        "key": "Ctrl+F6",
+        "command": {
+          "cmd": "dbo",
+          "fade_s": 0.5
+        }
+      },
+      {
+        "key": "Ctrl+F7",
+        "command": {
+          "cmd": "dbo_release"
+        }
+      },
+      {
+        "key": "Ctrl+F8",
+        "command": {
+          "cmd": "tap_tempo"
+        }
+      },
+      {
+        "key": "Ctrl+F9",
+        "command": {
+          "cmd": "bpm_set",
+          "bpm": 120.5
+        }
+      },
+      {
+        "key": "Ctrl+F10",
+        "command": {
+          "cmd": "param_set",
+          "addr": "master/intensity",
+          "value": {
+            "f": 0.5
+          }
+        }
+      },
+      {
+        "key": "Ctrl+F11",
+        "command": {
+          "cmd": "mode_set",
+          "mode": "show"
+        }
+      },
+      {
+        "key": "Ctrl+F12",
+        "command": {
+          "cmd": "mode_set",
+          "mode": "edit"
+        }
+      }
+    ]
+  },
+  "modulators": [
+    {
+      "id": 1,
+      "name": "LFO 1",
+      "kind": {
+        "lfo": {
+          "wave": "sine",
+          "freq": {
+            "hz": 1.5
+          },
+          "phase": 0.125
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "LFO 2",
+      "kind": {
+        "lfo": {
+          "wave": "tri",
+          "freq": {
+            "bpm_sync": {
+              "mult": 0.25
+            }
+          },
+          "phase": 0.125
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "LFO 3",
+      "kind": {
+        "lfo": {
+          "wave": {
+            "square": {
+              "pw": 0.25
+            }
+          },
+          "freq": {
+            "hz": 1.5
+          },
+          "phase": 0.125
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "LFO 4",
+      "kind": {
+        "lfo": {
+          "wave": "saw",
+          "freq": {
+            "bpm_sync": {
+              "mult": 0.25
+            }
+          },
+          "phase": 0.125
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "LFO 5",
+      "kind": {
+        "lfo": {
+          "wave": "random_sh",
+          "freq": {
+            "hz": 1.5
+          },
+          "phase": 0.125
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "LFO 6",
+      "kind": {
+        "lfo": {
+          "wave": "drift",
+          "freq": {
+            "bpm_sync": {
+              "mult": 0.25
+            }
+          },
+          "phase": 0.125
+        }
+      }
+    },
+    {
+      "id": 10,
+      "name": "Basses",
+      "kind": {
+        "audio_band": {
+          "low_hz": 20.0,
+          "high_hz": 200.0,
+          "gain": 1.5,
+          "floor": 0.125,
+          "attack_ms": 10.0,
+          "release_ms": 80.0,
+          "normalize": false
+        }
+      }
+    },
+    {
+      "id": 11,
+      "name": "Timecode (réservé v2)",
+      "kind": {
+        "timecode_chase": {}
+      }
+    }
+  ],
+  "routes": [
+    {
+      "id": 1,
+      "source": 1,
+      "target_addr": "slice/1/opacity",
+      "depth": 0.5,
+      "mode": "add"
+    },
+    {
+      "id": 2,
+      "source": 1,
+      "target_addr": "slice/1/opacity",
+      "depth": 0.5,
+      "mode": "mul"
+    },
+    {
+      "id": 3,
+      "source": 1,
+      "target_addr": "slice/1/opacity",
+      "depth": 0.5,
+      "mode": "replace"
+    }
+  ],
+  "settings": {
+    "osc_in_port": 9100,
+    "osc_out_port": 9101,
+    "artnet_enabled": true,
+    "artnet_universes": [
+      0,
+      3
+    ],
+    "language": "fr",
+    "mjpeg_fps": 12,
+    "mjpeg_width": 640,
+    "mjpeg_height": 360,
+    "autosave_debounce_s": 2.5,
+    "autosave_interval_s": 90.0,
+    "audio_input": "default",
+    "min_go_interval_ms": 400,
+    "cue_defaults": {
+      "transition": {
+        "kind": "crossfade",
+        "dur_s": 2.0,
+        "curve": "s_curve"
+      },
+      "follow": {
+        "wait": 1.5
+      },
+      "color": "#3ff59a"
+    },
+    "update_check": true,
+    "update_url": "https://raw.githubusercontent.com/pymenvert/videocuelist/main/latest.json",
+    "boost_priority": true
+  }
+}

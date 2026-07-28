@@ -12,11 +12,13 @@
 //! Contrat normatif : `docs/INTERFACES.md` (section compositor).
 
 mod cache;
+pub mod font;
 mod gl;
 pub mod homography;
 pub mod shaders;
 
 pub use cache::ProgramCache;
+pub use font::{encode_output_ident, IDENT_TEXT_MAX};
 pub use gl::Compositor;
 pub use shaders::GlslVersion;
 

@@ -237,6 +237,13 @@ pub struct Session {
     monitor_fallback: Vec<OutputId>,
     /// Hot-reload des shaders : watcher de `shaders/` (None si indisponible).
     shader_watch: Option<ShaderWatch>,
+    /// Vérification de mise à jour opt-in en vol (thread `conduite-update`,
+    /// une seule fois au démarrage en mode Edit) — le tick fait un `try_recv`.
+    update_rx: Option<Receiver<conduite_core::UpdateInfo>>,
+    /// Mise à jour disponible, publiée dans `runtime.update` (badge UI).
+    update_info: Option<conduite_core::UpdateInfo>,
+    /// Une génération de rapport de diagnostic est déjà en cours.
+    diagnostic_running: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -336,7 +343,19 @@ impl Session {
             last_shows_refresh: now,
             monitor_fallback: Vec::new(),
             shader_watch: None,
+            update_rx: None,
+            update_info: None,
+            diagnostic_running: Arc::new(AtomicBool::new(false)),
         };
+        // Vérification de mise à jour OPT-IN : une seule requête, au
+        // démarrage (toujours en mode Edit), timeout 3 s, jamais de
+        // téléchargement — tout vit sur le thread `conduite-update`.
+        if session.show.settings.update_check {
+            session.update_rx = Some(crate::update::spawn(
+                session.show.settings.update_url.clone(),
+                env!("CARGO_PKG_VERSION"),
+            ));
+        }
         session.shader_watch = ShaderWatch::spawn(&session.dirs.shaders);
         session.players = Players::new(session.dirs.media.clone());
         session.rebuild_all();
@@ -668,6 +687,24 @@ impl Session {
         }
         self.protocols.drain_midi_events(&self.events_tx);
 
+        // 9 bis. Résultat de la vérification de mise à jour opt-in (un seul
+        // message, thread déjà terminé) : publié dans `runtime.update`.
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(update) => {
+                    info!(target: "app::session", version = %update.version,
+                        "mise à jour disponible (badge UI, aucun téléchargement)");
+                    self.update_info = Some(update);
+                    self.update_rx = None;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Vérification terminée sans nouveauté (ou hors-ligne).
+                    self.update_rx = None;
+                }
+            }
+        }
+
         // 10. Autosave (débounce après édition + périodique si dirty).
         self.autosave(now);
     }
@@ -676,11 +713,9 @@ impl Session {
 
     fn handle_command(&mut self, source: Source, cmd: Command, now_s: f64) {
         match cmd {
-            // P2-2 : génération du zip de diagnostic (implémentation à venir
-            // dans ce lot — le refus est propre en attendant).
-            Command::DiagnosticReport => {
-                warn!(target: "app::session", "rapport de diagnostic : pas encore disponible");
-            }
+            // Rapport de diagnostic : zip généré en tâche de fond (jamais
+            // sur le tick), chemins expurgés, DiagnosticReady à la fin.
+            Command::DiagnosticReport => self.spawn_diagnostic(),
             Command::ParamSet { addr, value, source } => self.param_set(&addr, value, source),
             Command::CueGo => {
                 // Anti double-GO (contrat min_go_interval_ms) : appliqué ICI,
@@ -803,6 +838,11 @@ impl Session {
                     // glCompileShader au GO).
                     self.comp_sync = true;
                 }
+                // Priorité process en OPTION (Windows) : ABOVE_NORMAL en
+                // mode Show, retour à Normal en Edit (P2-6, défaut faux).
+                crate::platform::boost_process_priority(
+                    self.show.settings.boost_priority && mode == AppMode::Show,
+                );
                 info!(target: "app::session", ?mode, "mode changé");
                 self.publish_event(&StateEvent::ModeChanged { mode });
             }
@@ -1224,6 +1264,11 @@ impl Session {
                 // Entrée audio à chaud : re-spawn du thread de capture
                 // uniquement si le device effectif a changé.
                 self.sync_audio_input();
+                // Boost de priorité (dé)coché à chaud : ré-appliqué selon le
+                // mode courant (l'édition n'existe qu'en mode Edit → Normal).
+                crate::platform::boost_process_priority(
+                    self.show.settings.boost_priority && self.mode == AppMode::Show,
+                );
             }
             ShowRename { .. } => {}
         }
@@ -2020,6 +2065,90 @@ impl Session {
         }
     }
 
+    /// Génère le rapport de diagnostic en TÂCHE DE FOND (thread
+    /// `conduite-diagnostic`) : zip horodaté dans `logs/` (logs récents,
+    /// config, show, versions, santé — chemins personnels expurgés, borné
+    /// ~10 Mo). Publie `StateEvent::DiagnosticReady { path }` à la fin
+    /// (chemin RELATIF au dossier portable : jamais de chemin personnel
+    /// dans l'UI). Une génération à la fois (coalescence).
+    fn spawn_diagnostic(&mut self) {
+        if self
+            .diagnostic_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            info!(target: "app::session", "rapport de diagnostic déjà en cours");
+            return;
+        }
+        // Instantané santé + protocoles, sérialisé MAINTENANT (le thread ne
+        // touche jamais à l'état de la session).
+        let sys = self.health.as_ref().map(|h| h.latest()).unwrap_or_default();
+        let counters: Vec<(OutputId, &FpsCounter)> =
+            self.fps.iter().map(|(id, c)| (*id, c)).collect();
+        let snapshot = conduite_system::merge(&counters, sys);
+        let proto = self.protocols.status();
+        let health_json = serde_json::to_string_pretty(&json!({
+            "mode": self.mode,
+            "show": self.show_name,
+            "health": snapshot,
+            "protocols": {
+                "osc_in": proto.osc_in,
+                "osc_out": proto.osc_out,
+                "artnet": proto.artnet,
+                "midi": proto.midi,
+            },
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        let input = crate::diagnostic::DiagnosticInput {
+            logs_dir: self.dirs.logs.clone(),
+            base_dir: self.dirs.base.clone(),
+            show_dir: self.dirs.show_dir(&self.show_name),
+            version: format!(
+                "{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CONDUITE_GIT_HASH")
+            ),
+            health_json,
+        };
+        let base = self.dirs.base.clone();
+        let events_tx = self.events_tx.clone();
+        let running = Arc::clone(&self.diagnostic_running);
+        let spawned = std::thread::Builder::new()
+            .name("conduite-diagnostic".into())
+            .spawn(move || {
+                let result = crate::diagnostic::generate(&input);
+                running.store(false, Ordering::SeqCst);
+                let event = match result {
+                    Ok(path) => {
+                        // Chemin relatif au dossier portable ; sinon expurgé.
+                        let shown = path
+                            .strip_prefix(&base)
+                            .map(|p| p.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_else(|_| {
+                                crate::diagnostic::redact(&path.to_string_lossy())
+                            });
+                        info!(target: "app::session", path = %shown,
+                            "rapport de diagnostic prêt");
+                        StateEvent::DiagnosticReady { path: shown }
+                    }
+                    Err(e) => {
+                        error!(target: "app::session", error = %e,
+                            "rapport de diagnostic impossible");
+                        StateEvent::Warning {
+                            message: format!("Rapport de diagnostic impossible : {e}"),
+                        }
+                    }
+                };
+                if let Ok(v) = serde_json::to_value(&event) {
+                    let _ = events_tx.send(v);
+                }
+            });
+        if let Err(e) = spawned {
+            self.diagnostic_running.store(false, Ordering::SeqCst);
+            warn!(target: "app::session", error = %e, "thread de diagnostic impossible");
+        }
+    }
+
     fn publish_health(&mut self) {
         // Dernier échantillon du thread santé (verrou court, jamais de
         // sysinfo/WMI sur le tick — à-coup 1 Hz supprimé).
@@ -2080,8 +2209,9 @@ impl Session {
             master: self.registry.value_f32("master/intensity"),
             dbo: self.dbo_level > 0.001,
             mod_levels: self.modul.levels().collect(),
-            // Renseigné par la vérification de mise à jour opt-in (P2-3).
-            update: None,
+            // Renseigné par la vérification de mise à jour opt-in (thread
+            // `conduite-update`, ramassé sur le tick).
+            update: self.update_info.clone(),
         }
     }
 

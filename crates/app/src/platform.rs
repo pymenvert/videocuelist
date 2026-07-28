@@ -36,6 +36,38 @@ mod imp {
     /// État courant de l'anti-veille (évite les appels répétés par frame).
     static AWAKE: AtomicBool = AtomicBool::new(false);
 
+    /// État courant du boost de priorité process (évite les appels répétés).
+    static BOOSTED: AtomicBool = AtomicBool::new(false);
+
+    /// Priorité process en OPTION (`ShowSettings::boost_priority`, défaut
+    /// faux) : ABOVE_NORMAL au passage en mode Show, retour à Normal en mode
+    /// Edit. Filet de sécurité machine partagée — HIGH est volontairement
+    /// évité (affame l'OS en continu). Dégradation silencieuse si refusé.
+    pub fn boost_process_priority(boost: bool) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
+            NORMAL_PRIORITY_CLASS,
+        };
+        if BOOSTED.swap(boost, Ordering::Relaxed) == boost {
+            return; // pas de changement
+        }
+        let class = if boost {
+            ABOVE_NORMAL_PRIORITY_CLASS
+        } else {
+            NORMAL_PRIORITY_CLASS
+        };
+        let ok = unsafe { SetPriorityClass(GetCurrentProcess(), class) };
+        if ok == 0 {
+            warn!(target: "app::platform", boost,
+                "SetPriorityClass refusé : priorité process inchangée");
+        } else if boost {
+            info!(target: "app::platform",
+                "priorité process ABOVE_NORMAL (mode Show, option boost_priority)");
+        } else {
+            info!(target: "app::platform", "priorité process Normal (mode Edit)");
+        }
+    }
+
     /// Anti-veille : dès qu'au moins une sortie vidéo est active, l'écran et
     /// le système ne doivent JAMAIS s'endormir (cause n°1 d'écran noir en
     /// salle : veille écran après 10-15 min sans souris). Relâché quand plus
@@ -134,6 +166,10 @@ mod imp {
     /// no-op documenté, équivalents macOS/Linux à venir.
     pub fn keep_awake(_active: bool) {}
 
+    /// Boost de priorité process : réglage Windows uniquement (no-op ici,
+    /// documenté — `nice`/scheduling Unix demanderait des droits).
+    pub fn boost_process_priority(_boost: bool) {}
+
     /// No-op hors Windows.
     pub struct TimerResolution;
 
@@ -168,6 +204,8 @@ mod imp {
 mod imp {
     pub fn keep_awake(_active: bool) {}
 
+    pub fn boost_process_priority(_boost: bool) {}
+
     pub struct TimerResolution;
 
     impl TimerResolution {
@@ -181,4 +219,7 @@ mod imp {
     pub fn install_quit_handler() {}
 }
 
-pub use imp::{install_quit_handler, keep_awake, promote_render_thread, TimerResolution};
+pub use imp::{
+    boost_process_priority, install_quit_handler, keep_awake, promote_render_thread,
+    TimerResolution,
+};

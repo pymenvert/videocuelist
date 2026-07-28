@@ -5,6 +5,8 @@
 
 mod audio;
 mod config;
+mod crash;
+mod diagnostic;
 mod dirs;
 mod gfx;
 mod logsetup;
@@ -16,9 +18,15 @@ mod saver;
 mod session;
 mod shaderwatch;
 mod undo;
+mod update;
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+/// Allocateur global : mimalloc (P2 endurance — RSS qui redescend après un
+/// pic, fragmentation maîtrisée sur 8 h de show, support x86_64/ARM/RPi).
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use conduite_control_http::{HttpDeps, HttpServer, HttpServerHandle};
 use serde_json::json;
@@ -101,6 +109,12 @@ fn version_string() -> String {
 }
 
 fn main() {
+    // Mode serveur de crash hors-process (`--crash-server <nom> <dossier>`,
+    // usage interne) : traité AVANT TOUT — pas de verrou mono-instance, pas
+    // de ports, pas de fichier de log.
+    if let Some(code) = crash::maybe_run_server() {
+        std::process::exit(code);
+    }
     // Tout vit dans `run` : les gardes (verrou, logs, timer) sont relâchées
     // AVANT `process::exit` (qui n'exécute aucun destructeur).
     let code = run();
@@ -164,6 +178,11 @@ fn run() -> i32 {
             None
         }
     };
+
+    // Capture de crash hors-process : notre propre exe relancé en serveur
+    // de minidump (logs/crash/, rétention 5, aucun envoi réseau). L'app
+    // démarre normalement si la capture est indisponible.
+    let _crash_guard = crash::spawn(&dirs.logs);
 
     let mut config = AppConfig::load(&dirs.base);
     if let Some(p) = cli.port {

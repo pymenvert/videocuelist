@@ -124,7 +124,73 @@ Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 - **Mode Show** avant le public : édition verrouillée, fermeture double-confirmée.
 - Les logs (`logs/`) horodatent tout : GO, erreurs, protocoles — utile au débrief.
 
-## 9. Raccourcis
+## 9. Checklist « machine de spectacle »
+
+À dérouler sur la machine qui joue, avant la première. Conduite empêche
+déjà la veille pendant le show, mais en salle on met **ceinture et
+bretelles** — et l'application ne modifie jamais vos réglages système :
+c'est vous qui décidez.
+
+- [ ] **Windows Update en pause** pendant la période d'exploitation
+      (Paramètres → Windows Update → Suspendre). Un redémarrage forcé à
+      l'entracte est le pire scénario.
+- [ ] **Veille et écran de veille désactivés** (Alimentation : écran
+      « jamais », veille « jamais »). L'app l'empêche pendant le show,
+      mais un réglage propre couvre aussi l'avant-spectacle.
+- [ ] **Mode d'alimentation « Performances élevées »** (et sur un
+      portable : secteur branché, jamais sur batterie).
+- [ ] **Driver GPU figé** : pas de mise à jour automatique du pilote en
+      exploitation ; on ne change pas un pilote qui marche la veille
+      d'une première.
+- [ ] **Notifications coupées** (Assistant de concentration / Ne pas
+      déranger) : aucun toast Windows par-dessus une sortie.
+- [ ] **Antivirus : exclure le dossier de Conduite** (l'exe scanne à
+      chaque lancement sinon, et un scan planifié en plein show coûte des
+      frames). L'exécutable n'est pas encore signé — l'exclusion évite
+      aussi les faux positifs SmartScreen ; la signature Authenticode est
+      prévue.
+- [ ] **Réseau** : Wi-Fi coupé si la régie est câblée ; pare-feu : autoriser
+      conduite.exe (ports 9820 web, 9000 OSC, 6454 Art-Net).
+- [ ] **Un GO de contrôle** : dérouler la conduite complète une fois
+      (les médias se préchargent, les erreurs se voient dans « État du
+      show », pas devant le public).
+
+## 10. Sécurité en conduite
+
+Ce que Conduite fait pour que la fausse manip ou le pépin technique ne
+se voie pas depuis la salle — chaque garde-fou existe parce qu'un
+incident réel l'a rendu nécessaire quelque part :
+
+- **Anti double-GO** : après un GO, tout GO reçu pendant le délai minimal
+  (réglable, 300 ms par défaut, `min_go_interval_ms`) est **ignoré**,
+  quelle que soit la source — clic, Espace, OSC, MIDI, MSC. Le bouton
+  montre le délai ; un GO refusé produit un avertissement, jamais une
+  cue sautée deux fois.
+- **Échap = panic universel** : un appui = fondu au noir de conduite
+  (durée réglable), double appui = arrêt sec. Jamais désactivable, même
+  en mode Show. Le GO suivant reprend la conduite.
+- **DBO (dead blackout)** : touche **B maintenue** (l'appui maintenu
+  empêche le coude sur le clavier) — voile noir maître par-dessus tout,
+  relâché sans toucher à la conduite. C'est le « noir salle » d'urgence.
+- **Cues armées/désarmées** : une cue désarmée est grisée et **sautée**
+  au GO et au follow — on retire un tableau en répétition sans détruire
+  la conduite.
+- **Mode Show** : toute édition verrouillée (UI, OSC, MIDI), fermeture
+  double-confirmée, sortie du mode par geste volontaire. Restent actifs :
+  GO/BACK/GOTO, master, DBO, panic, sauvegarde.
+- **Récupération** : autosave permanent + backups rotatifs par show ;
+  après un arrêt sale, la version récupérable est **proposée** au
+  démarrage (jamais imposée). Toutes les écritures disque sont atomiques.
+- **Un média manquant n'annule jamais un show** : damier + alerte, le
+  reste de la cue joue.
+- **Verrou mono-instance** : un deuxième lancement s'arrête net avec un
+  message clair — jamais deux moteurs qui se disputent le MIDI.
+- **Supervision** : `GET /health` répond `ok`/`stalled` (moteur « vivant
+  mais figé » détecté), codes de sortie documentés (0 = quitté, 10 =
+  déjà lancé, 11 = perte GPU) — de quoi brancher un watchdog qui relance
+  en quelques secondes.
+
+## 11. Raccourcis
 
 | Touche | Action |
 |---|---|
@@ -135,7 +201,12 @@ Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 | Flèches | Nudge du coin sélectionné (Maj ×10, Alt ×0,1) |
 | 1–9, 0 | Onglets (0 = Réglages) |
 
-## 10. Dépannage rapide
+Les raccourcis de conduite se remappent dans **Patch → Clavier** (cliquer
+un raccourci, presser la touche voulue). Les raccourcis **système** —
+Espace (GO), Échap (panic), B (DBO) — restent prioritaires et ne sont pas
+remappables : ce sont des organes de sécurité.
+
+## 12. Dépannage rapide
 
 | Symptôme | Piste |
 |---|---|
@@ -144,3 +215,49 @@ Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 | L'UI ne répond plus | La page se reconnecte seule (bandeau). Sinon : recharger le navigateur — le moteur, lui, n'a pas bougé. |
 | Vidéo saccadée | Transcoder en HAP ; vérifier le disque (SSD conseillé) ; fps affichés dans Santé. |
 | Port déjà pris | `conduite --port 9821`, ou libérer 9820. |
+
+## 13. Rapport de diagnostic
+
+Pour joindre à un mail de support : **Réglages → Rapport de diagnostic**
+(ou commande `diagnostic_report`). Conduite écrit un zip horodaté dans
+`logs/diagnostic-<date>.zip`.
+
+**Ce qu'il contient** : les 500 dernières lignes de chaque fichier de
+journal, `config.toml`, le `show.json` courant, les versions (Conduite,
+`ffmpeg -version`) et l'instantané santé.
+
+**Vie privée** : les chemins personnels sont expurgés avant écriture
+(`C:\Users\<votre-nom>` devient `~`), et **rien n'est envoyé nulle part** —
+le fichier reste sur votre disque, c'est vous qui l'attachez (ou pas) à
+votre message. Vous pouvez l'ouvrir pour vérifier son contenu : c'est un
+zip ordinaire.
+
+## 14. Diagnostic avancé (optionnel) : crash dumps Windows
+
+Si un crash reproductible résiste au support, Windows peut conserver un
+*dump* du process au moment du crash (WER LocalDumps). C'est une
+procédure **système, volontaire et réversible** : Conduite ne modifie
+JAMAIS le registre — c'est vous qui exécutez ceci, dans un PowerShell
+**administrateur** :
+
+```powershell
+# Activer les dumps locaux pour conduite.exe (dans logs\crash du dossier portable)
+$k = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\conduite.exe"
+New-Item -Path $k -Force | Out-Null
+Set-ItemProperty $k -Name DumpFolder -Value "C:\chemin\vers\Conduite\logs\crash" -Type ExpandString
+Set-ItemProperty $k -Name DumpCount  -Value 5 -Type DWord   # rétention : 5 dumps
+Set-ItemProperty $k -Name DumpType   -Value 1 -Type DWord   # 1 = minidump
+```
+
+Après le crash suivant, un fichier `.dmp` apparaît dans `logs\crash` —
+joignez-le au rapport de diagnostic. Pour tout désactiver :
+
+```powershell
+Remove-Item "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\conduite.exe" -Recurse
+```
+
+Les dumps restent **100 % locaux** (ce sont des extraits mémoire :
+ne les publiez pas). Même famille de réglages avancés, même principe :
+la désactivation des MPO (`OverlayTestMode`) ou le `TdrDelay` peuvent
+aider sur certains pilotes GPU capricieux, mais ne les touchez qu'en
+dépannage accompagné — jamais la veille d'une première.

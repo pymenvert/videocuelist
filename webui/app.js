@@ -163,6 +163,21 @@
 
   function defaultPlayback() { return { in_s: 0, out_s: null, speed: 1, end: 'loop' }; }
 
+  /* Mires disponibles (PatternKind serde snake_case — variantes additives
+     grid4/grid16/color_bars comprises). */
+  var PATTERNS = [
+    ['ident', 'Identification'],
+    ['grid', 'Grille'],
+    ['grid4', 'Grille 4'],
+    ['grid16', 'Grille 16'],
+    ['checker', 'Damier'],
+    ['bars', 'Barres'],
+    ['color_bars', 'Barres SMPTE']
+  ];
+
+  /* Palette de couleurs de cue (pastille dans la conduite) + « sans ». */
+  var CUE_COLORS = ['#e5484d', '#f0b232', '#43c47f', '#4da3ff', '#c678dd', '#ff8fab', null];
+
   function newCue(number) {
     return {
       number: number, name: 'Cue ' + cnStr(number), color: null, notes: '', armed: true,
@@ -540,6 +555,7 @@
     patch_midi_add: 'ajout de binding MIDI', patch_midi_remove: 'suppression de binding MIDI',
     patch_midi_update: 'modification de binding MIDI',
     patch_osc_out_set: 'réglage OSC sortant',
+    key_binding_add: 'ajout de raccourci clavier', key_binding_remove: 'suppression de raccourci clavier',
     show_rename: 'renommage du show', settings_update: 'modification des réglages'
   };
 
@@ -673,6 +689,8 @@
       case 'patch_midi_remove': if (patch().midi) { patch().midi.splice(o.index, 1); } break;
       case 'patch_midi_update': if (patch().midi && patch().midi[o.index]) { patch().midi[o.index] = o.binding; } break;
       case 'patch_osc_out_set': patch().osc_out = o.cfg; break;
+      case 'key_binding_add': (patch().keys = patch().keys || []).push(o.binding); break;
+      case 'key_binding_remove': if (patch().keys) { patch().keys.splice(o.index, 1); } break;
       case 'show_rename': sh.name = o.name; break;
       case 'settings_update': sh.settings = o.settings; break;
       default: break;
@@ -715,6 +733,101 @@
       hideTip();
     });
     document.addEventListener('mousedown', hideTip);
+  }
+
+  /* ======================================================== menu contextuel
+     UN composant réutilisable pour tous les clics droits (cue, slice, média,
+     paramètre). Entrées : {kind:'head'|'sep'|'swatches'|item}. Un item
+     désactivé est grisé avec la RAISON en infobulle. Fermeture : Échap,
+     clic ailleurs, action choisie. Position clampée au viewport. */
+
+  var CTX = { el: null, x: 0, y: 0 };
+
+  function closeCtxMenu() {
+    if (!CTX.el) { return false; }
+    if (CTX.el.parentNode) { CTX.el.parentNode.removeChild(CTX.el); }
+    CTX.el = null;
+    return true;
+  }
+
+  function openCtxMenu(x, y, items) {
+    closeCtxMenu();
+    CTX.x = x; CTX.y = y;
+    var menu = el('div', { class: 'ctx-menu', role: 'menu' });
+    (items || []).forEach(function (it) {
+      if (!it) { return; }
+      if (it.kind === 'sep') { menu.appendChild(el('div', { class: 'ctx-sep' })); return; }
+      if (it.kind === 'head') { menu.appendChild(el('div', { class: 'ctx-head' }, it.label)); return; }
+      if (it.kind === 'swatches') {
+        var row = el('div', { class: 'ctx-swatches' });
+        (it.colors || []).forEach(function (c) {
+          var sw = el('span', {
+            class: 'ctx-swatch' + (c ? '' : ' none'),
+            role: 'menuitem',
+            style: c ? 'background:' + c : null,
+            'data-tip': c || 'Sans couleur'
+          });
+          sw.addEventListener('click', function () {
+            closeCtxMenu();
+            if (it.pick) { it.pick(c); }
+          });
+          row.appendChild(sw);
+        });
+        menu.appendChild(row);
+        return;
+      }
+      var node = el('div', {
+        class: 'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : ''),
+        role: 'menuitem',
+        'aria-disabled': it.disabled ? 'true' : null,
+        'data-tip': it.disabled ? (it.reason || 'Indisponible') : (it.tip || null)
+      }, it.label, it.sub ? el('span', { class: 'ctx-sub-arrow' }, '▸') : null);
+      if (!it.disabled) {
+        node.addEventListener('click', function () {
+          if (it.sub) {
+            /* sous-menu : remplace le menu courant, même position */
+            openCtxMenu(CTX.x, CTX.y, it.sub());
+            return;
+          }
+          closeCtxMenu();
+          if (it.action) { it.action(); }
+        });
+      }
+      menu.appendChild(node);
+    });
+    document.body.appendChild(menu);
+    var mw = menu.offsetWidth, mh = menu.offsetHeight;
+    menu.style.left = clamp(x, 8, Math.max(8, window.innerWidth - mw - 8)) + 'px';
+    menu.style.top = clamp(y, 8, Math.max(8, window.innerHeight - mh - 8)) + 'px';
+    CTX.el = menu;
+  }
+
+  /* Branche un menu contextuel sur un nœud. `build(e)` retourne la liste
+     d'entrées (ou null/[] pour laisser le menu natif). */
+  function onCtx(node, build) {
+    node.addEventListener('contextmenu', function (e) {
+      var items = build(e);
+      if (!items || !items.length) { return; }
+      e.preventDefault();
+      e.stopPropagation();
+      openCtxMenu(e.clientX, e.clientY, items);
+    });
+  }
+
+  /* Marque une entrée « édition » : grisée avec raison en mode Show. */
+  function ctxEdit(it) {
+    if (isShowMode()) {
+      it.disabled = true;
+      it.reason = 'Mode Show — édition verrouillée';
+    }
+    return it;
+  }
+
+  function installCtxMenuClose() {
+    document.addEventListener('pointerdown', function (e) {
+      if (CTX.el && !CTX.el.contains(e.target)) { closeCtxMenu(); }
+    });
+    window.addEventListener('resize', closeCtxMenu);
   }
 
   /* ======================================================== onglets & rendu */
@@ -827,12 +940,10 @@
     /* --- colonne droite --- */
     var right = el('div', { id: 'live-right' });
 
-    right.appendChild(el('div', { class: 'preview-wrap' },
-      el('span', { class: 'preview-label' }, 'PROGRAM'),
-      previewImg('/preview.mjpeg', 'Préview program : ce qui sort réellement (~8 img/s)')));
-    right.appendChild(el('div', { class: 'preview-wrap' },
-      el('span', { class: 'preview-label' }, 'PRÉVIEW (STANDBY)'),
-      previewImg('/preview-b.mjpeg', 'Préview de la cue en standby, rendue à blanc')));
+    right.appendChild(previewMonitor('PROGRAM', '/preview.mjpeg',
+      'Préview program : ce qui sort réellement', true));
+    right.appendChild(previewMonitor('PRÉVIEW (STANDBY)', '/preview-b.mjpeg',
+      'Préview de la cue en standby, rendue à blanc', false));
 
     var gotoInput = el('input', {
       type: 'text', placeholder: 'n° de cue (ex. 12.5)',
@@ -966,6 +1077,160 @@
     return img;
   }
 
+  /* ------------------------------------------- moniteur de préview complet
+     Placeholder élégant tant qu'aucune frame n'est arrivée, puis flux MJPEG ;
+     si `tryH264` et WebCodecs disponibles : tentative de flux H.264
+     (WS /preview.h264), repli MJPEG automatique. Le mode réel du flux est
+     indiqué dans l'infobulle du moniteur. */
+  function previewMonitor(label, src, tip, tryH264) {
+    var wrap = el('div', { class: 'preview-wrap empty' },
+      el('span', { class: 'preview-label' }, label));
+    var img = previewImg(src, tip + ' — flux MJPEG');
+    img.addEventListener('load', function () { wrap.classList.remove('empty'); });
+    wrap.appendChild(img);
+    var ph = el('div', { class: 'preview-empty' });
+    var ic = el('span', { 'aria-hidden': 'true' });
+    ic.innerHTML = ICONS.screen;
+    ph.appendChild(ic);
+    ph.appendChild(el('span', null, 'En attente du flux vidéo…'));
+    wrap.appendChild(ph);
+    if (tryH264) { attachH264(wrap, img, src, tip); }
+    return wrap;
+  }
+
+  /* Frame Annex-B : true si elle contient un NAL IDR (keyframe H.264). */
+  function annexbIsKey(u8) {
+    for (var i = 0; i + 3 < u8.length; i++) {
+      if (u8[i] === 0 && u8[i + 1] === 0 &&
+          (u8[i + 2] === 1 || (u8[i + 2] === 0 && u8[i + 3] === 1))) {
+        var off = u8[i + 2] === 1 ? i + 3 : i + 4;
+        if (off >= u8.length) { break; }
+        var t = u8[off] & 0x1f;
+        if (t === 5) { return true; }   /* IDR */
+        if (t === 1) { return false; }  /* premier VCL non-IDR : delta */
+        i = off;                        /* SPS/PPS/SEI : NAL suivant */
+      }
+    }
+    return false;
+  }
+
+  /* Un seul toast de repli H.264 par chargement de page (discret). */
+  var H264 = { toasted: false };
+
+  /* Préview H.264/WebCodecs : 1er message JSON {codec,format,width,height,
+     fps} puis frames binaires Annex-B. Décodage vers un canvas qui remplace
+     l'img MJPEG ; toute panne (pas de config, pas de frame décodée en 3 s,
+     socket fermée, erreur décodeur) rebranche le MJPEG. */
+  function attachH264(wrap, img, src, tip) {
+    if (typeof window.VideoDecoder !== 'function' ||
+        typeof window.EncodedVideoChunk !== 'function') { return; }
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var ws;
+    try { ws = new WebSocket(proto + location.host + '/preview.h264'); }
+    catch (e) { return; }
+    ws.binaryType = 'arraybuffer';
+    var dec = null, cfg = null, canvas = null, cctx = null;
+    var n = 0, gotKey = false, gotFrame = false, dead = false;
+    var watchdog = null;
+
+    function cleanup() {
+      dead = true;
+      if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+      try { ws.close(); } catch (e) { /* déjà fermée */ }
+      if (dec) { try { dec.close(); } catch (e2) { /* déjà fermé */ } dec = null; }
+    }
+
+    /* Repli MJPEG. `msg` : toast discret (une seule fois par page). */
+    function fail(msg) {
+      if (dead) { return; }
+      cleanup();
+      if (canvas && canvas.parentNode) { canvas.parentNode.removeChild(canvas); }
+      if (!img.parentNode) {
+        /* l'img avait été retirée au profit du canvas : on la remet */
+        wrap.classList.add('empty');
+        img = previewImg(src, tip + ' — flux MJPEG');
+        img.addEventListener('load', function () { wrap.classList.remove('empty'); });
+        wrap.insertBefore(img, wrap.querySelector('.preview-empty'));
+      }
+      img.setAttribute('data-tip', tip + ' — flux MJPEG');
+      if (msg && !H264.toasted) {
+        H264.toasted = true;
+        toast(msg);
+        pushLog('info', 'ui', msg);
+      }
+    }
+
+    /* le moniteur a quitté le DOM (changement d'onglet) : tout couper */
+    var alive = setInterval(function () {
+      if (!document.contains(wrap)) {
+        clearInterval(alive);
+        cleanup();
+      }
+    }, 2000);
+
+    ws.addEventListener('error', function () { fail(null); });
+    ws.addEventListener('close', function () {
+      if (dead) { return; }
+      fail(gotFrame ? 'Flux H.264 interrompu — retour au MJPEG.' : null);
+    });
+    ws.addEventListener('open', function () {
+      /* aucune frame décodée en 3 s => repli + toast discret (contrat) */
+      watchdog = setTimeout(function () {
+        if (!gotFrame) { fail('Préview H.264 indisponible — affichage MJPEG.'); }
+      }, 3000);
+    });
+    ws.addEventListener('message', function (ev) {
+      if (dead) { return; }
+      if (typeof ev.data === 'string') {
+        /* 1er message : configuration du flux */
+        try { cfg = JSON.parse(ev.data); } catch (e) { fail(null); return; }
+        try {
+          dec = new VideoDecoder({
+            output: function (frame) {
+              if (dead) { frame.close(); return; }
+              if (!canvas) {
+                canvas = el('canvas', {
+                  class: 'preview-stream',
+                  'data-tip': tip + ' — flux H.264 (WebCodecs)'
+                });
+                canvas.width = frame.displayWidth || (cfg && cfg.width) || 640;
+                canvas.height = frame.displayHeight || (cfg && cfg.height) || 360;
+                cctx = canvas.getContext('2d');
+                wrap.insertBefore(canvas, img);
+                /* l'img MJPEG est retirée : son flux HTTP s'arrête */
+                if (img.parentNode === wrap) { wrap.removeChild(img); }
+              }
+              gotFrame = true;
+              wrap.classList.remove('empty');
+              try { cctx.drawImage(frame, 0, 0, canvas.width, canvas.height); }
+              catch (e) { /* frame fermée entre-temps */ }
+              frame.close();
+            },
+            error: function () { fail('Décodeur H.264 en erreur — retour au MJPEG.'); }
+          });
+          dec.configure({
+            codec: (cfg && cfg.codec) || 'avc1.42E01E',
+            optimizeForLatency: true
+          });
+        } catch (e2) { fail(null); }
+        return;
+      }
+      /* frames binaires Annex-B */
+      if (!dec || dec.state !== 'configured') { return; }
+      var u8 = new Uint8Array(ev.data);
+      var key = annexbIsKey(u8);
+      if (!gotKey && !key) { return; }   /* on attend la 1re keyframe */
+      gotKey = true;
+      try {
+        dec.decode(new EncodedVideoChunk({
+          type: key ? 'key' : 'delta',
+          timestamp: Math.round(n++ * 1e6 / ((cfg && cfg.fps) || 30)),
+          data: ev.data
+        }));
+      } catch (e3) { fail('Décodage H.264 impossible — retour au MJPEG.'); }
+    });
+  }
+
   /* Recharge tous les flux MJPEG (cache-bust) — à chaque (re)connexion WS,
      car un flux mort sans coupure WS ne se répare pas tout seul. */
   function refreshPreviews() {
@@ -995,6 +1260,110 @@
       if (list[i].number > n) { return list[i].number; }
     }
     return null;
+  }
+
+  /* ------------------------------------------ actions de cue (partagées
+     entre la barre d'outils de l'onglet Cues et les menus contextuels). */
+
+  function commitCue(c, mut) {
+    var copy = JSON.parse(JSON.stringify(c));
+    mut(copy);
+    sendEdit({ op: 'cue_update', cue: copy });
+  }
+
+  function duplicateCue(c) {
+    var copy = JSON.parse(JSON.stringify(c));
+    var next = nextCueAfter(c.number);
+    copy.number = next === null ? c.number + 1000 : Math.floor((c.number + next) / 2);
+    if (copy.number === c.number) {
+      uiWarn('Pas de place entre ' + cnStr(c.number) + ' et la suivante.');
+      return;
+    }
+    copy.name += ' (copie)';
+    if (sendEdit({ op: 'cue_add', cue: copy })) {
+      toast('Cue ' + cnStr(c.number) + ' dupliquée en ' + cnStr(copy.number), 'ok');
+    }
+  }
+
+  function renumberCue(c, n) {
+    if (n === null) { uiWarn('Numéro invalide (ex. 12.5).'); return false; }
+    if (n === c.number) { return false; }
+    if (cues().some(function (x) { return x.number === n; })) {
+      uiWarn('Le numéro ' + cnStr(n) + ' existe déjà.');
+      return false;
+    }
+    var copy = JSON.parse(JSON.stringify(c));
+    copy.number = n;
+    sendEdit({ op: 'cue_remove', number: c.number });
+    sendEdit({ op: 'cue_add', cue: copy });
+    if (S.sel.cue === c.number) { S.sel.cue = n; }
+    return true;
+  }
+
+  function deleteCueConfirm(c) {
+    confirmDialog({
+      title: 'Supprimer la cue ' + cnStr(c.number) + ' ?',
+      message: (c.name ? '« ' + c.name + ' »' : 'Cue sans nom') +
+        ' — annulable ensuite avec Ctrl+Z.',
+      confirm: 'Supprimer',
+      onConfirm: function () {
+        sendEdit({ op: 'cue_remove', number: c.number });
+        if (S.sel.cue === c.number) { S.sel.cue = null; }
+      }
+    });
+  }
+
+  /* Menu contextuel d'une cue (cuelist Live + table de l'onglet Cues). */
+  function cueCtxItems(c) {
+    var r = rt();
+    var isStandby = r.standby === c.number;
+    var items = [
+      { kind: 'head', label: 'Cue ' + cnStr(c.number) + (c.name ? ' — ' + c.name : '') },
+      {
+        label: 'Armer (standby)', disabled: isStandby, reason: 'Déjà en standby',
+        tip: 'Place cette cue en standby — le prochain GO la lance',
+        action: function () { sendCmd({ cmd: 'cue_standby', cue: c.number }); }
+      },
+      {
+        label: 'Lancer (GOTO)', tip: 'Saute immédiatement à cette cue',
+        action: function () { sendCmd({ cmd: 'cue_goto', cue: c.number }); }
+      },
+      { kind: 'sep' },
+      ctxEdit({
+        label: (c.armed === false) ? 'Ré-armer la cue' : 'Désarmer la cue',
+        tip: 'Désarmée : sautée par GO/follow (GOTO la joue quand même)',
+        action: function () { commitCue(c, function (x) { x.armed = !(c.armed !== false); }); }
+      }),
+      ctxEdit({ label: 'Dupliquer', action: function () { duplicateCue(c); } }),
+      ctxEdit({
+        label: 'Renuméroter…',
+        action: function () {
+          var v = window.prompt('Nouveau numéro pour la cue ' + cnStr(c.number) + ' :', cnStr(c.number));
+          if (v === null) { return; }
+          renumberCue(c, cnParse(v.trim()));
+        }
+      }),
+      ctxEdit({
+        label: 'Notes…', tip: 'Notes de régie, visibles en Live sous le transport',
+        action: function () {
+          var v = window.prompt('Notes de régie de la cue ' + cnStr(c.number) + ' :', c.notes || '');
+          if (v !== null) { commitCue(c, function (x) { x.notes = v; }); }
+        }
+      })
+    ];
+    if (!isShowMode()) {
+      items.push({ kind: 'head', label: 'Couleur' });
+      items.push({
+        kind: 'swatches', colors: CUE_COLORS,
+        pick: function (col) { commitCue(c, function (x) { x.color = col; }); }
+      });
+    }
+    items.push({ kind: 'sep' });
+    items.push(ctxEdit({
+      label: 'Supprimer', danger: true,
+      action: function () { deleteCueConfirm(c); }
+    }));
+    return items;
   }
 
   function cuelistDom() {
@@ -1027,6 +1396,7 @@
         el('div', { class: 'cue-progress' }, el('div')));
       row.addEventListener('click', function () { sendCmd({ cmd: 'cue_standby', cue: c.number }); });
       row.addEventListener('dblclick', function () { sendCmd({ cmd: 'cue_goto', cue: c.number }); });
+      onCtx(row, function () { return cueCtxItems(c); });
       /* Entrée = standby (Espace reste le GO global, jamais intercepté) */
       row.addEventListener('keydown', function (e) {
         if (e.key === 'Enter' && !e.repeat) {
@@ -1161,6 +1531,7 @@
     updateRemaining(r);
     updateActiveCues(r);
     updateStatusBar(r);
+    updateUpdateBadge();
     var bpm = byId('bpm-val');
     if (bpm) { bpm.textContent = fmtF(r.bpm, 1); }
     (r.mod_levels || []).forEach(function (pair) {
@@ -1465,6 +1836,52 @@
     });
   }
 
+  /* ----------------------- mise à jour disponible (runtime.update, opt-in)
+     Le moteur ne vérifie qu'avec settings.update_check = true (une requête
+     au démarrage, mode Édition, jamais de téléchargement). S'il publie
+     runtime.update = {version, url, notes} : badge discret dans le footer,
+     clic = panneau détaillé avec lien. */
+
+  var UPD = { pop: null, sig: null };
+
+  function updateUpdateBadge() {
+    var b = byId('update-badge');
+    if (!b) { return; }
+    var u = rt().update || null;
+    var sig = u ? (u.version + '|' + u.url) : null;
+    if (sig === UPD.sig) { return; }
+    UPD.sig = sig;
+    b.classList.toggle('hidden', !u);
+    if (u) {
+      b.textContent = 'Mise à jour ' + (u.version || '?');
+    } else {
+      closeUpdatePop();
+    }
+  }
+
+  function closeUpdatePop() {
+    if (!UPD.pop) { return false; }
+    if (UPD.pop.parentNode) { UPD.pop.parentNode.removeChild(UPD.pop); }
+    UPD.pop = null;
+    return true;
+  }
+
+  function toggleUpdatePop() {
+    if (UPD.pop) { closeUpdatePop(); return; }
+    var u = rt().update;
+    if (!u) { return; }
+    UPD.pop = el('div', { id: 'update-pop', role: 'dialog', 'aria-label': 'Mise à jour disponible' },
+      el('h3', null, 'Conduite ' + (u.version || '?') + ' disponible'),
+      el('div', { class: 'muted' },
+        'Rien n’est téléchargé automatiquement — la mise à jour reste à votre main, après le spectacle.'),
+      u.notes ? el('div', { class: 'update-notes' }, u.notes) : null,
+      el('div', { class: 'toolbar', style: 'margin:10px 0 0' },
+        u.url ? el('a', { href: u.url, target: '_blank', rel: 'noopener noreferrer' }, 'Page de téléchargement') : null,
+        el('span', { class: 'spacer' }),
+        el('button', { class: 'ghost', onclick: closeUpdatePop }, 'Fermer')));
+    document.body.appendChild(UPD.pop);
+  }
+
   /* GET /about : version + crédits pour le footer, l'infobulle du wordmark
      et le panneau « À propos » des Réglages. Best-effort, jamais bloquant. */
   function loadAbout() {
@@ -1504,35 +1921,11 @@
       }, 'Ajouter'),
       el('button', {
         disabled: !selCue, 'data-tip': 'Duplique la cue sélectionnée (numéro intercalé)',
-        onclick: function () {
-          if (!selCue) { return; }
-          var copy = JSON.parse(JSON.stringify(selCue));
-          var next = nextCueAfter(selCue.number);
-          copy.number = next === null ? selCue.number + 1000
-            : Math.floor((selCue.number + next) / 2);
-          if (copy.number === selCue.number) {
-            uiWarn('Pas de place entre ' + cnStr(selCue.number) + ' et la suivante.');
-            return;
-          }
-          copy.name += ' (copie)';
-          sendEdit({ op: 'cue_add', cue: copy });
-        }
+        onclick: function () { if (selCue) { duplicateCue(selCue); } }
       }, 'Dupliquer'),
       el('button', {
         class: 'danger', disabled: !selCue, 'data-tip': 'Supprime la cue sélectionnée (confirmation demandée)',
-        onclick: function () {
-          if (!selCue) { return; }
-          confirmDialog({
-            title: 'Supprimer la cue ' + cnStr(selCue.number) + ' ?',
-            message: (selCue.name ? '« ' + selCue.name + ' »' : 'Cue sans nom') +
-              ' — annulable ensuite avec Ctrl+Z.',
-            confirm: 'Supprimer',
-            onConfirm: function () {
-              sendEdit({ op: 'cue_remove', number: selCue.number });
-              S.sel.cue = null;
-            }
-          });
-        }
+        onclick: function () { if (selCue) { deleteCueConfirm(selCue); } }
       }, 'Supprimer'),
       el('span', { class: 'spacer' }),
       el('button', {
@@ -1592,27 +1985,16 @@
       S.sel.cue = c.number;
       renderMain();
     });
+    onCtx(tr, function () { return cueCtxItems(c); });
 
-    function commit(mut) {
-      var copy = JSON.parse(JSON.stringify(c));
-      mut(copy);
-      sendEdit({ op: 'cue_update', cue: copy });
-    }
+    function commit(mut) { commitCue(c, mut); }
 
     var num = el('input', { type: 'text', value: cnStr(c.number), style: 'width:60px', 'data-tip': 'Renuméroter la cue (déplace dans la liste)' });
     num.addEventListener('change', function () {
       var n = cnParse(num.value);
-      if (n === null || n === c.number) { num.value = cnStr(c.number); return; }
-      if (cues().some(function (x) { return x.number === n; })) {
-        uiWarn('Le numéro ' + cnStr(n) + ' existe déjà.');
+      if (n === null || n === c.number || !renumberCue(c, n)) {
         num.value = cnStr(c.number);
-        return;
       }
-      var copy = JSON.parse(JSON.stringify(c));
-      copy.number = n;
-      sendEdit({ op: 'cue_remove', number: c.number });
-      sendEdit({ op: 'cue_add', cue: copy });
-      S.sel.cue = n;
     });
     tr.appendChild(el('td', null, num));
 
@@ -1690,6 +2072,82 @@
   /* ============================================================== MAPPING */
 
   var MAP = { throttleTs: 0 };
+
+  /* Mire choisie dans les sélecteurs (survit aux re-renders). */
+  var MIRE = { kind: 'ident' };
+
+  function patternLabel(kind) {
+    for (var i = 0; i < PATTERNS.length; i++) {
+      if (PATTERNS[i][0] === kind) { return PATTERNS[i][1]; }
+    }
+    return kind;
+  }
+
+  function resetCorners(s) {
+    [[0, 0], [1, 0], [1, 1], [0, 1]].forEach(function (c, i) {
+      sendCornerSet(s.id, i, c[0], c[1]);
+    });
+    drawMapping();
+    toast('Coins de « ' + (s.name || ('slice ' + s.id)) + ' » réinitialisés', 'ok');
+  }
+
+  /* Sous-menu « Mire » d'un slice : toutes les mires + extinction. */
+  function slicePatternSub(s) {
+    return function () {
+      var items = [{ kind: 'head', label: 'Mire sur « ' + (s.name || s.id) + ' » (cue standby/active)' }];
+      PATTERNS.forEach(function (p) {
+        items.push(ctxEdit({
+          label: p[1],
+          action: function () { assignContent(s.id, { pattern: p[0] }); }
+        }));
+      });
+      items.push({ kind: 'sep' });
+      items.push(ctxEdit({
+        label: 'Éteindre (aucun contenu)',
+        action: function () { assignContent(s.id, 'none'); }
+      }));
+      return items;
+    };
+  }
+
+  /* Menu contextuel d'un slice (liste Mapping + canvas). */
+  function sliceCtxItems(s) {
+    return [
+      { kind: 'head', label: s.name || ('Slice ' + s.id) },
+      ctxEdit({
+        label: 'Réinitialiser les coins',
+        tip: 'Repose les 4 coins plein cadre (0,0 → 1,1)',
+        action: function () { resetCorners(s); }
+      }),
+      ctxEdit({ label: 'Mire', sub: slicePatternSub(s) }),
+      ctxEdit({
+        label: 'Renommer…',
+        action: function () {
+          var v = window.prompt('Nom du slice :', s.name || '');
+          if (v === null || !v.trim()) { return; }
+          var copy = JSON.parse(JSON.stringify(s));
+          copy.name = v.trim();
+          sendEdit({ op: 'slice_update', slice: copy });
+        }
+      }),
+      { kind: 'sep' },
+      ctxEdit({
+        label: 'Supprimer', danger: true,
+        action: function () {
+          confirmDialog({
+            title: 'Supprimer le slice « ' + (s.name || ('slice ' + s.id)) + ' » ?',
+            message: 'Son calage et ses contenus assignés dans les cues seront perdus — annulable ensuite avec Ctrl+Z.',
+            confirm: 'Supprimer',
+            onConfirm: function () {
+              sendEdit({ op: 'slice_remove', id: s.id });
+              if (S.sel.slice === s.id) { S.sel.slice = null; }
+              renderMain();
+            }
+          });
+        }
+      })
+    ];
+  }
 
   RENDERERS.mapping = function () {
     var root = el('section', { class: 'tab-panel', id: 'mapping' });
@@ -1769,6 +2227,7 @@
       item.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') { e.preventDefault(); S.sel.slice = s.id; S.sel.corner = null; renderMain(); }
       });
+      onCtx(item, function () { return sliceCtxItems(s); });
       slicePanel.appendChild(item);
     });
     if (!slicesOfOutput().length) {
@@ -1776,20 +2235,27 @@
     }
     side.appendChild(slicePanel);
 
-    /* mires */
+    /* mires — sélecteur enrichi (grilles 4/16, barres SMPTE…) */
+    var mireSel = sel(
+      PATTERNS.map(function (p) { return p[0]; }),
+      PATTERNS.map(function (p) { return p[1]; }),
+      MIRE.kind,
+      function (v) { MIRE.kind = v; });
+    mireSel.setAttribute('data-tip', 'Mire à poser : identification (nom + résolution de la sortie), grilles de convergence 4/8/16, damier, barres.');
     side.appendChild(el('div', { class: 'panel edit-only' },
       el('h2', null, 'Mires'),
       el('div', { class: 'toolbar' },
+        mireSel,
         el('button', {
-          disabled: !selSlice, 'data-tip': 'Pose la mire d’identification sur le slice sélectionné (dans la cue standby/active)',
-          onclick: function () { if (selSlice) { assignContent(selSlice.id, { pattern: 'ident' }); } }
+          disabled: !selSlice, 'data-tip': 'Pose la mire choisie sur le slice sélectionné (dans la cue standby/active)',
+          onclick: function () { if (selSlice) { assignContent(selSlice.id, { pattern: MIRE.kind }); } }
         }, 'Mire slice'),
         el('button', {
-          'data-tip': 'Pose la grille de convergence sur tous les slices de la sortie',
+          'data-tip': 'Pose la mire choisie sur tous les slices de la sortie',
           onclick: function () {
             var ok = 0;
-            slicesOfOutput().forEach(function (s) { if (assignContent(s.id, { pattern: 'grid' }, null, true)) { ok++; } });
-            if (ok) { toast('Mire posée sur ' + ok + ' slice(s) (cue ' + cnStr(targetCueNumber()) + ')', 'ok'); }
+            slicesOfOutput().forEach(function (s) { if (assignContent(s.id, { pattern: MIRE.kind }, null, true)) { ok++; } });
+            if (ok) { toast('Mire « ' + patternLabel(MIRE.kind) + ' » posée sur ' + ok + ' slice(s) (cue ' + cnStr(targetCueNumber()) + ')', 'ok'); }
           }
         }, 'Mire globale'),
         el('button', {
@@ -1829,7 +2295,45 @@
       sendParam(addr, { f: v });
     });
     enhanceSlider(input, val, def);
-    return el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
+    var row = el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
+    attachParamCtx(row, addr, def, input);
+    return row;
+  }
+
+  /* Menu contextuel d'un curseur de paramètre : réinitialiser, saisir une
+     valeur exacte, ouvrir le popover d'animation. Réinitialiser/Saisir sont
+     des param_set runtime (autorisés même en mode Show) ; Animer édite une
+     route (grisé en Show). */
+  function attachParamCtx(row, addr, def, input) {
+    onCtx(row, function () {
+      return [
+        { kind: 'head', label: addr },
+        {
+          label: 'Réinitialiser (' + fmtF(def) + ')',
+          tip: 'Repose la valeur par défaut (équivaut au double-clic sur le curseur)',
+          action: function () { sliderSet(input, def); }
+        },
+        {
+          label: 'Saisir une valeur…',
+          tip: 'Valeur exacte au clavier (équivaut au clic sur la valeur affichée)',
+          action: function () {
+            var v = window.prompt('Valeur pour ' + addr + ' (' + input.min + ' à ' + input.max + ') :', input.value);
+            if (v === null) { return; }
+            var f = parseFloat(String(v).replace(',', '.'));
+            if (!isFinite(f)) { uiWarn('Valeur invalide : ' + v); return; }
+            sliderSet(input, f);
+          }
+        },
+        ctxEdit({
+          label: 'Animer…',
+          tip: 'Brancher un LFO ou une bande FFT sur ce paramètre (icône ⟳)',
+          action: function () {
+            var anchor = row.querySelector('.anim-btn') || row;
+            openAnimPopover(addr, anchor);
+          }
+        })
+      ];
+    });
   }
 
   function currentOutput() {
@@ -1941,6 +2445,20 @@
     cv.addEventListener('pointerup', endDrag);
     cv.addEventListener('pointercancel', endDrag);
 
+    /* clic droit : menu contextuel du slice sous le curseur */
+    onCtx(cv, function (e) {
+      var p = pos(e);
+      var s = slicesOfOutput().slice().sort(function (a, b) { return b.z - a.z; })
+        .find(function (x) { return pointInQuad(p, x, cv); });
+      if (!s) { return null; }
+      if (S.sel.slice !== s.id) {
+        S.sel.slice = s.id;
+        S.sel.corner = null;
+        drawMapping();
+      }
+      return sliceCtxItems(s);
+    });
+
     function hitCorner(p, s) {
       if (!s) { return null; }
       for (var i = 0; i < 4; i++) {
@@ -2000,6 +2518,68 @@
 
   /* =============================================================== MÉDIAS */
 
+  /* Menu contextuel d'une carte média. */
+  function mediaCtxItems(m) {
+    var sliceOk = S.sel.slice !== null;
+    var sliceName = sliceOk ? ((currentSlice() || {}).name || ('slice ' + S.sel.slice)) : '';
+    return [
+      { kind: 'head', label: m.name || m.path },
+      ctxEdit({
+        label: 'Assigner au slice' + (sliceOk ? ' « ' + sliceName + ' »' : ''),
+        disabled: !sliceOk,
+        reason: 'Sélectionnez d’abord un slice (onglet Mapping)',
+        tip: 'Pose ce média sur le slice sélectionné, dans la cue standby/active',
+        action: function () {
+          S.sel.media = m.id;
+          assignContent(S.sel.slice, { media: m.id }, defaultPlayback());
+        }
+      }),
+      { kind: 'sep' },
+      ctxEdit({
+        label: 'Relocaliser…',
+        tip: m.missing
+          ? 'Le fichier est introuvable — indiquer son nouveau chemin (relatif à media/)'
+          : 'Modifier le chemin du fichier (relatif à media/)',
+        action: function () {
+          var v = window.prompt('Chemin du fichier, relatif au dossier media/ :', m.path || '');
+          if (v === null) { return; }
+          v = v.trim();
+          if (!v || v === m.path) { return; }
+          var copy = JSON.parse(JSON.stringify(m));
+          copy.path = v;
+          if (sendEdit({ op: 'media_update', media: copy })) {
+            uiInfo('Chemin mis à jour — « Re-scanner » vérifie le fichier et régénère la vignette.');
+          }
+        }
+      }),
+      ctxEdit({
+        label: 'Régénérer la vignette',
+        tip: 'Relance le scan de media/ : vignettes et états manquants sont rafraîchis',
+        action: function () {
+          if (sendCmd({ cmd: 'media_rescan' })) {
+            uiInfo('Re-scan lancé — vignettes en cours de régénération.');
+          }
+        }
+      }),
+      { kind: 'sep' },
+      ctxEdit({
+        label: 'Retirer du pool', danger: true,
+        tip: 'Retire le média du show (le fichier reste sur disque)',
+        action: function () {
+          confirmDialog({
+            title: 'Retirer « ' + (m.name || m.path) + ' » du pool ?',
+            message: 'Le fichier reste dans media/ ; les cues qui l’utilisent afficheront un contenu manquant. Annulable avec Ctrl+Z.',
+            confirm: 'Retirer',
+            onConfirm: function () {
+              sendEdit({ op: 'media_remove', id: m.id });
+              if (S.sel.media === m.id) { S.sel.media = null; }
+            }
+          });
+        }
+      })
+    ];
+  }
+
   RENDERERS.medias = function () {
     var root = el('section', { class: 'tab-panel' });
     var panel = el('div', { class: 'panel' }, el('h2', null, 'Pool de médias'));
@@ -2007,7 +2587,11 @@
     panel.appendChild(el('div', { class: 'toolbar' },
       el('button', {
         class: 'edit-only', 'data-tip': 'Re-scanne le dossier media/ : nouveaux fichiers, vignettes, état manquant',
-        onclick: function () { sendCmd({ cmd: 'media_rescan' }); }
+        onclick: function () {
+          if (sendCmd({ cmd: 'media_rescan' })) {
+            uiInfo('Re-scan des dossiers media/ et shaders/ lancé.');
+          }
+        }
       }, 'Re-scanner'),
       el('button', {
         class: 'primary edit-only',
@@ -2050,6 +2634,7 @@
       card.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') { e.preventDefault(); S.sel.media = m.id; renderMain(); }
       });
+      onCtx(card, function () { return mediaCtxItems(m); });
       grid.appendChild(card);
     });
     if (!medias().length) {
@@ -2068,6 +2653,14 @@
 
     var left = el('div', { class: 'panel' }, el('h2', null, 'Matériaux (ISF / GLSL)'));
     left.appendChild(el('div', { class: 'toolbar edit-only' },
+      el('button', {
+        'data-tip': 'Re-scanne shaders/ (et media/) : nouveaux .fs, matériaux disparus, vignettes',
+        onclick: function () {
+          if (sendCmd({ cmd: 'media_rescan' })) {
+            uiInfo('Re-scan des dossiers media/ et shaders/ lancé.');
+          }
+        }
+      }, 'Re-scanner'),
       el('button', {
         class: 'primary', disabled: S.sel.material === null || S.sel.slice === null,
         'data-tip': S.sel.slice === null
@@ -2117,9 +2710,31 @@
       var prefix = 'material/' + matId + '/';
       var found = specs().filter(function (sp) { return sp && sp.addr && sp.addr.indexOf(prefix) === 0; });
       if (!found.length) {
-        right.appendChild(el('div', { class: 'muted' },
-          'Spécifications ISF indisponibles pour ce matériau (le moteur ne les publie pas encore). ' +
-          'Adresses : ' + prefix + '<input>.'));
+        /* message orienté utilisateur ; le détail technique (fichier,
+           adresses, dernières erreurs ISF du journal) reste repliable */
+        var mat = materials().find(function (x) { return x.id === matId; }) || null;
+        var isfLogs = S.logs.filter(function (l) {
+          var lvl = (l.level || '').toLowerCase();
+          if (lvl !== 'error' && lvl !== 'warn') { return false; }
+          var hay = (l.target || '') + ' ' + (l.message || '');
+          return /isf|shader/i.test(hay) || (mat && mat.path && hay.indexOf(mat.path) >= 0);
+        }).slice(-5);
+        right.appendChild(el('div', { class: 'isf-banner' },
+          el('div', { class: 'isf-title' }, 'Réglages du shader indisponibles'),
+          el('div', null,
+            isfLogs.length
+              ? 'Ce shader semble poser problème au chargement : il peut s’afficher avec ses valeurs par défaut, ou pas du tout. Corrigez le fichier puis « Re-scanner ».'
+              : 'Le moteur n’a pas (encore) publié les réglages de ce matériau. Il s’affiche avec ses valeurs par défaut ; si le fichier vient d’être ajouté, « Re-scanner ».')));
+        right.appendChild(el('details', { class: 'tech' },
+          el('summary', null, 'Détail technique'),
+          el('pre', null,
+            'Fichier : shaders/' + (mat ? mat.path : '?') + '\n' +
+            'Adresses de paramètres attendues : ' + prefix + '<input>\n' +
+            (isfLogs.length
+              ? ('Journal (dernières lignes ISF/shader) :\n' + isfLogs.map(function (l) {
+                  return '[' + l.level + '] ' + (l.target || '') + ' — ' + (l.message || '');
+                }).join('\n'))
+              : 'Aucune erreur ISF/shader dans le journal récent.'))));
       } else {
         found.forEach(function (sp) { right.appendChild(specControl(sp)); });
       }
@@ -2196,7 +2811,9 @@
       sendParam(addr, { f: v });
     });
     enhanceSlider(input, val, def);
-    return el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
+    var row = el('div', { class: 'param-row' }, el('span', null, label), input, val, animButton(addr));
+    attachParamCtx(row, addr, def, input);
+    return row;
   }
 
   /* =========================================================== MODULATION */
@@ -3143,6 +3760,9 @@
     }
     root.appendChild(art);
 
+    /* --- Clavier remappable --- */
+    root.appendChild(renderKeyPanel());
+
     return root;
   };
 
@@ -3303,18 +3923,38 @@
       en.addEventListener('change', function () { commit(function (x) { x.enabled = en.checked; }); });
       tr.appendChild(el('td', null, en));
 
+      /* mires : identification en un clic + sélecteur enrichi (grilles
+         4/16, damier, barres SMPTE, extinction) */
+      function applyOutputPattern(kind) {
+        var ok = 0;
+        slices().filter(function (s) { return s.output === o.id; })
+          .forEach(function (s) {
+            var content = kind === 'none' ? 'none' : { pattern: kind };
+            if (assignContent(s.id, content, null, true)) { ok++; }
+          });
+        if (!ok) { uiWarn('Aucun slice sur cette sortie — rien à afficher.'); return; }
+        toast(kind === 'none'
+          ? 'Contenu retiré de « ' + (o.name || o.id) + ' » (' + ok + ' slice(s))'
+          : 'Mire « ' + patternLabel(kind) + ' » posée sur « ' + (o.name || o.id) + ' » (' + ok + ' slice(s))', 'ok');
+      }
+      var mireOutSel = sel(
+        ['', 'ident', 'grid', 'grid4', 'grid16', 'checker', 'bars', 'color_bars', 'none'],
+        ['Mire…', 'Identification', 'Grille', 'Grille 4', 'Grille 16', 'Damier', 'Barres', 'Barres SMPTE', 'Éteindre'],
+        '',
+        function (v) {
+          mireOutSel.value = '';
+          if (v) { applyOutputPattern(v); }
+        });
+      mireOutSel.className = 'edit-only';
+      mireOutSel.setAttribute('data-tip', 'Pose une mire sur tous les slices de cette sortie (cue standby/active) — « Éteindre » retire le contenu');
       tr.appendChild(el('td', null,
-        el('button', {
-          class: 'edit-only',
-          'data-tip': 'Affiche la mire d’identification (nom + numéro) sur tous les slices de cette sortie',
-          onclick: function () {
-            var ok = 0;
-            slices().filter(function (s) { return s.output === o.id; })
-              .forEach(function (s) { if (assignContent(s.id, { pattern: 'ident' }, null, true)) { ok++; } });
-            if (ok) { toast('Mire d’identification posée sur « ' + (o.name || o.id) + ' » (' + ok + ' slice(s))', 'ok'); }
-            else { uiWarn('Aucun slice sur cette sortie — rien à identifier.'); }
-          }
-        }, 'Identifier')));
+        el('span', { class: 'toolbar', style: 'margin:0;flex-wrap:nowrap' },
+          el('button', {
+            class: 'edit-only',
+            'data-tip': 'Affiche la mire d’identification (nom + résolution de la sortie) sur tous ses slices',
+            onclick: function () { applyOutputPattern('ident'); }
+          }, 'Identifier'),
+          mireOutSel)));
 
       tr.appendChild(el('td', { class: 'edit-only' },
         el('button', {
@@ -3509,8 +4149,14 @@
       }, 'Nouveau'),
       el('button', {
         class: 'edit-only',
-        'data-tip': 'Collecter le show : copie tous les médias dans un dossier autonome (clé USB, autre machine)',
-        onclick: function () { sendCmd({ cmd: 'show_collect' }); }
+        'data-tip': 'Collecter le show : copie médias et shaders dans un dossier autonome shows/<nom>-collecte (clé USB, autre machine)',
+        onclick: function () {
+          if (sendCmd({ cmd: 'show_collect' })) {
+            toast(el('span', null, 'Collecte en cours vers ',
+              el('code', null, 'shows/' + (show().name || 'show') + '-collecte'),
+              ' — un toast confirmera la fin.'));
+          }
+        }
       }, 'Collecter le show')));
     root.appendChild(showPanel);
 
@@ -3571,14 +4217,40 @@
         x.panic_fade_s = clamp(parseFloat(panicFade.value) || 0, 0, 30);
       });
     });
+    /* mise à jour : opt-in, désactivée par défaut, libellé honnête */
+    var updChk = el('input', {
+      type: 'checkbox', checked: !!st.update_check,
+      'data-tip': 'Une seule requête vers latest.json au démarrage, en mode Édition uniquement (timeout 3 s). Ne télécharge jamais rien : un badge discret signale la version, c’est tout. Décochée par défaut.'
+    });
+    updChk.addEventListener('change', function () {
+      commitSettings(function (x) { x.update_check = updChk.checked; });
+    });
     cfgPanel.appendChild(el('div', { class: 'settings-grid' },
       el('span', null, 'Port OSC entrant'), portInput('osc_in_port', 'Port UDP d’écoute OSC (défaut 9000) — redémarrage du service OSC'),
       el('span', null, 'Port OSC sortant'), portInput('osc_out_port', 'Port de feedback OSC par défaut'),
       el('span', null, 'Langue'), lang,
       el('span', null, 'Préview (img/s)'), fps,
       el('span', null, 'Anti double-GO (ms)'), goMs,
-      el('span', null, 'Fondu du panic (s)'), panicFade));
+      el('span', null, 'Fondu du panic (s)'), panicFade,
+      el('span', null, 'Vérifier les mises à jour'),
+      el('span', { class: 'toolbar', style: 'margin:0' }, updChk,
+        el('span', { class: 'muted' }, 'vérifie une fois au démarrage, ne télécharge rien'))));
     root.appendChild(cfgPanel);
+
+    /* maintenance : rapport de diagnostic (zip anonymisé pour le support) */
+    root.appendChild(el('div', { class: 'panel' },
+      el('h2', null, 'Maintenance'),
+      el('div', { class: 'toolbar' },
+        el('button', {
+          'data-tip': 'Génère logs/diagnostic-<date>.zip : derniers logs, config, show, versions (app + ffmpeg), santé — chemins personnels expurgés (C:\\Users\\<vous> → ~). À joindre à une demande de support.',
+          onclick: function () {
+            if (sendCmd({ cmd: 'diagnostic_report' })) {
+              uiInfo('Génération du rapport de diagnostic…');
+            }
+          }
+        }, 'Rapport de diagnostic'),
+        el('span', { class: 'muted' },
+          'Zip anonymisé (logs, config, show, versions) — un toast donnera son chemin.'))));
 
     /* quitter proprement (sauvegarde si modifié, flush des logs, sorties) */
     root.appendChild(el('div', { class: 'panel' },
@@ -3633,10 +4305,296 @@
     return root;
   };
 
+  /* ============================================== clavier remappable (Patch)
+     Contrat KeyBinding : { key: "F5" | "Ctrl+3" | "Shift+G", command:
+     CommandTemplate }. Le moteur ne fait que persister (EditOp
+     key_binding_add/remove) — l'exécution est ICI : keydown global hors
+     champs de saisie => touche → CommandTemplate → commande runtime.
+     Les raccourcis SYSTÈME (Espace GO, Échap panic, B DBO, T tap, chiffres
+     onglets, flèches nudge) restent prioritaires et non remappables. */
+
+  var LEARN = { btn: null, done: null, prev: '' };
+  var KEYS = { cmdKind: 'go', cueStr: '' };   /* état du formulaire (survit aux re-renders) */
+
+  /* Chaîne humaine d'un keydown : "F5", "Ctrl+3", "Shift+G"… (null si
+     modificateur seul). e.key est dépendant de la disposition clavier —
+     c'est voulu : « la touche que vous tapez », AZERTY compris. */
+  function keyToString(e) {
+    var k = e.key;
+    if (k === 'Control' || k === 'Shift' || k === 'Alt' || k === 'Meta' || k === 'AltGraph' || k === 'Dead') { return null; }
+    var mods = '';
+    if (e.ctrlKey) { mods += 'Ctrl+'; }
+    if (e.altKey) { mods += 'Alt+'; }
+    if (e.metaKey) { mods += 'Meta+'; }
+    if (e.shiftKey) { mods += 'Shift+'; }
+    if (k === ' ' || k === 'Spacebar') { k = 'Space'; }
+    else if (k.length === 1) { k = k.toUpperCase(); }
+    return mods + k;
+  }
+
+  /* Touche refusée en learn (réservée au système) => raison, sinon null. */
+  var RESERVED_BARE = {
+    Space: 'Espace = GO', Escape: 'Échap = Panic', B: 'B = DBO',
+    T: 'T = Tap tempo', O: 'O = Notes de la cue en standby',
+    Enter: 'Entrée est réservée (validation)', Tab: 'Tab est réservée (navigation)'
+  };
+
+  function reservedReason(ks) {
+    if (ks.indexOf('+') >= 0) { return null; }   /* avec modificateur : libre */
+    if (RESERVED_BARE[ks]) {
+      return 'Touche réservée : ' + RESERVED_BARE[ks] + ' (raccourci système, non remappable).';
+    }
+    if (/^[0-9]$/.test(ks)) {
+      return 'Touche réservée : les chiffres changent d’onglet. Ajoutez un modificateur (ex. Ctrl+' + ks + ').';
+    }
+    if (ks.indexOf('Arrow') === 0) {
+      return 'Touche réservée : les flèches font le nudge des coins (Mapping).';
+    }
+    return null;
+  }
+
+  /* Libellé humain d'un CommandTemplate. */
+  function cmdTemplateLabel(t) {
+    if (!t || !t.cmd) { return '?'; }
+    switch (t.cmd) {
+      case 'go': return 'GO';
+      case 'back': return 'Back';
+      case 'goto': return 'GOTO ' + cnStr(t.cue);
+      case 'standby': return 'Standby ' + cnStr(t.cue);
+      case 'dbo': return 'DBO' + (t.fade_s ? ' (fondu ' + fmtF(t.fade_s, 1) + ' s)' : '');
+      case 'dbo_release': return 'DBO release';
+      case 'tap_tempo': return 'Tap tempo';
+      case 'panic': return 'Panic (fondu ' + fmtF(t.fade_s || 0, 1) + ' s)';
+      case 'bpm_set': return 'BPM ' + t.bpm;
+      case 'param_set': return 'Param ' + t.addr;
+      case 'mode_set': return 'Mode ' + t.mode;
+      default: return t.cmd;
+    }
+  }
+
+  /* CommandTemplate → commande runtime (miroir de to_command côté Rust). */
+  function runTemplate(t) {
+    if (!t || !t.cmd) { return; }
+    switch (t.cmd) {
+      case 'go': go(); return;                                   /* garde anti double-GO */
+      case 'back': back(); return;
+      case 'goto': sendCmd({ cmd: 'cue_goto', cue: t.cue }); return;
+      case 'standby': sendCmd({ cmd: 'cue_standby', cue: t.cue }); return;
+      case 'panic': sendCmd({ cmd: 'cue_panic', fade_s: t.fade_s || 0 }); return;
+      case 'dbo': sendCmd({ cmd: 'dbo', fade_s: t.fade_s || 0 }); return;
+      case 'dbo_release': sendCmd({ cmd: 'dbo_release' }); return;
+      case 'tap_tempo': sendCmd({ cmd: 'tap_tempo' }); return;
+      case 'bpm_set': sendCmd({ cmd: 'bpm_set', bpm: t.bpm }); return;
+      case 'mode_set': sendCmd({ cmd: 'mode_set', mode: t.mode }); return;
+      case 'param_set': sendCmd({ cmd: 'param_set', addr: t.addr, value: t.value, source: 'ui' }); return;
+      default: return;
+    }
+  }
+
+  /* --- mode learn : capture de la prochaine touche --- */
+
+  function cancelLearn() {
+    if (!LEARN.btn) { return false; }
+    LEARN.btn.classList.remove('key-learning');
+    LEARN.btn.textContent = LEARN.prev;
+    LEARN.btn = null;
+    LEARN.done = null;
+    return true;
+  }
+
+  function startLearn(btn, done) {
+    cancelLearn();
+    LEARN.btn = btn;
+    LEARN.done = done;
+    LEARN.prev = btn.textContent;
+    btn.classList.add('key-learning');
+    btn.textContent = 'Appuyez sur une touche… (Échap : annuler)';
+  }
+
+  /* Écouteur en phase de CAPTURE : pendant le learn, la frappe est absorbée
+     avant les raccourcis globaux (pas de GO/panic en plein apprentissage). */
+  function installKeyLearn() {
+    document.addEventListener('keydown', function (e) {
+      if (!LEARN.btn) { return; }
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') { cancelLearn(); return; }
+      var ks = keyToString(e);
+      if (!ks) { return; }   /* modificateur seul : on attend la suite */
+      var reason = reservedReason(ks);
+      if (reason) { toast(reason, 'warn'); return; }   /* on reste en learn */
+      var done = LEARN.done;
+      cancelLearn();
+      if (done) { done(ks); }
+    }, true);
+    document.addEventListener('pointerdown', function (e) {
+      if (LEARN.btn && e.target !== LEARN.btn) { cancelLearn(); }
+    }, true);
+  }
+
+  /* Ajout avec détection de conflit : touche déjà prise => remplacer ? */
+  function addKeyBinding(ks, command) {
+    var keys = patch().keys || [];
+    var idx = -1;
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].key === ks) { idx = i; break; }
+    }
+    function doAdd() {
+      if (sendEdit({ op: 'key_binding_add', binding: { key: ks, command: command } })) {
+        toast(el('span', null, el('kbd', null, ks), ' → ' + cmdTemplateLabel(command)), 'ok');
+      }
+    }
+    if (idx >= 0) {
+      confirmDialog({
+        title: 'Touche déjà affectée',
+        message: '« ' + ks + ' » déclenche déjà : ' + cmdTemplateLabel(keys[idx].command) +
+          '.\nRemplacer par : ' + cmdTemplateLabel(command) + ' ?',
+        confirm: 'Remplacer', danger: false,
+        onConfirm: function () {
+          sendEdit({ op: 'key_binding_remove', index: idx });
+          doAdd();
+        }
+      });
+      return;
+    }
+    doAdd();
+  }
+
+  /* Re-capture de la touche d'un binding existant (bouton Learn de la ligne). */
+  function replaceKeyBinding(index, ks) {
+    var keys = patch().keys || [];
+    var b = keys[index];
+    if (!b) { return; }
+    if (b.key === ks) { return; }
+    var other = -1;
+    for (var i = 0; i < keys.length; i++) {
+      if (i !== index && keys[i].key === ks) { other = i; break; }
+    }
+    function apply(removeOther) {
+      var command = b.command;
+      if (removeOther) {
+        var hi = Math.max(index, other), lo = Math.min(index, other);
+        sendEdit({ op: 'key_binding_remove', index: hi });
+        sendEdit({ op: 'key_binding_remove', index: lo });
+      } else {
+        sendEdit({ op: 'key_binding_remove', index: index });
+      }
+      if (sendEdit({ op: 'key_binding_add', binding: { key: ks, command: command } })) {
+        toast(el('span', null, el('kbd', null, ks), ' → ' + cmdTemplateLabel(command)), 'ok');
+      }
+    }
+    if (other >= 0) {
+      confirmDialog({
+        title: 'Touche déjà affectée',
+        message: '« ' + ks + ' » déclenche déjà : ' + cmdTemplateLabel(keys[other].command) +
+          '.\nRemplacer par : ' + cmdTemplateLabel(b.command) + ' ?',
+        confirm: 'Remplacer', danger: false,
+        onConfirm: function () { apply(true); }
+      });
+      return;
+    }
+    apply(false);
+  }
+
+  /* CommandTemplate depuis le formulaire « nouveau raccourci ». */
+  function buildKeyTemplate(kind, cueStr) {
+    if (kind === 'goto' || kind === 'standby') {
+      var n = cnParse(cueStr);
+      if (n === null) { return null; }
+      return { cmd: kind, cue: n };
+    }
+    if (kind === 'dbo') { return { cmd: 'dbo', fade_s: 0 }; }
+    if (kind === 'panic') { return { cmd: 'panic', fade_s: 2 }; }
+    return { cmd: kind };
+  }
+
+  /* Panneau Patch > Clavier. */
+  function renderKeyPanel() {
+    var panel = el('div', { class: 'panel' }, el('h2', null, 'Clavier'));
+
+    /* raccourcis système, lecture seule */
+    panel.appendChild(el('div', { class: 'muted', style: 'margin-bottom:6px' },
+      'Raccourcis système — prioritaires, non remappables :'));
+    var sys = el('div', { class: 'key-sys-list', style: 'margin-bottom:12px' });
+    [['Espace', 'GO'], ['Échap', 'Panic (double appui : arrêt sec)'],
+     ['B', 'DBO (maintien / double frappe)'], ['T', 'Tap tempo'],
+     ['O', 'Notes de la cue en standby'], ['1–9, 0', 'Onglets'],
+     ['Flèches', 'Nudge des coins (Mapping)'], ['Ctrl+Z', 'Annuler / rétablir']]
+      .forEach(function (p) {
+        sys.appendChild(el('span', null, el('kbd', null, p[0]), ' ' + p[1]));
+      });
+    panel.appendChild(sys);
+
+    /* bindings personnalisés */
+    var keys = patch().keys || [];
+    var table = el('table', { class: 'grid' },
+      el('tr', null,
+        el('th', null, 'Touche'),
+        el('th', null, 'Commande'),
+        el('th', { class: 'edit-only' }, ''),
+        el('th', { class: 'edit-only' }, '')));
+    keys.forEach(function (b, i) {
+      var tr = el('tr');
+      tr.appendChild(el('td', null, el('kbd', null, b.key || '?')));
+      tr.appendChild(el('td', null, cmdTemplateLabel(b.command)));
+      var learnBtn = el('button', {
+        class: 'edit-only',
+        'data-tip': 'Capture la prochaine touche pour remplacer « ' + b.key + ' » (Échap : annuler)'
+      }, 'Learn');
+      learnBtn.addEventListener('click', function () {
+        startLearn(learnBtn, function (ks) { replaceKeyBinding(i, ks); });
+      });
+      tr.appendChild(el('td', { class: 'edit-only' }, learnBtn));
+      tr.appendChild(el('td', { class: 'edit-only' },
+        el('button', {
+          class: 'danger', 'data-tip': 'Supprime ce raccourci',
+          onclick: function () { sendEdit({ op: 'key_binding_remove', index: i }); }
+        }, '✕')));
+      table.appendChild(tr);
+    });
+    panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
+    if (!keys.length) {
+      panel.appendChild(el('div', { style: 'padding:8px 0 0' },
+        emptyState('plug', 'Aucun raccourci personnalisé — choisissez une commande puis « Learn » pour capturer une touche.')));
+    }
+
+    /* nouveau binding : commande + (cue) + Learn */
+    var kinds = ['go', 'back', 'goto', 'standby', 'dbo', 'dbo_release', 'tap_tempo', 'panic'];
+    var klabels = ['GO', 'Back', 'GOTO cue…', 'Standby cue…', 'DBO (sec)', 'DBO release', 'Tap tempo', 'Panic (fondu 2 s)'];
+    var cueIn = el('input', {
+      type: 'text', placeholder: 'n° de cue', value: KEYS.cueStr,
+      style: 'width:90px;' + ((KEYS.cmdKind === 'goto' || KEYS.cmdKind === 'standby') ? '' : 'display:none'),
+      'data-tip': 'Numéro de la cue visée (ex. 12.5)'
+    });
+    cueIn.addEventListener('input', function () { KEYS.cueStr = cueIn.value; });
+    var csel = sel(kinds, klabels, KEYS.cmdKind, function (v) {
+      KEYS.cmdKind = v;
+      cueIn.style.display = (v === 'goto' || v === 'standby') ? '' : 'none';
+    });
+    csel.setAttribute('data-tip', 'Commande à déclencher par la touche');
+    var learnNew = el('button', {
+      class: 'primary',
+      'data-tip': 'Capture la prochaine touche ou combinaison (ex. F5, Ctrl+3) — Échap pour annuler'
+    }, 'Learn — capturer la touche');
+    learnNew.addEventListener('click', function () {
+      var tpl = buildKeyTemplate(KEYS.cmdKind, cueIn.value);
+      if (!tpl) { uiWarn('Numéro de cue invalide (ex. 12.5).'); return; }
+      startLearn(learnNew, function (ks) { addKeyBinding(ks, tpl); });
+    });
+    panel.appendChild(el('div', { class: 'toolbar edit-only', style: 'margin:10px 0 0' },
+      el('span', { class: 'muted' }, 'Nouveau raccourci :'),
+      csel, cueIn, learnNew));
+
+    return panel;
+  }
+
   /* ============================================================== clavier */
 
   function installKeyboard() {
     document.addEventListener('keydown', function (e) {
+      /* --- mode learn actif : la capture (phase capture) a déjà tout
+         absorbé — ceinture au cas où. --- */
+      if (LEARN.btn) { return; }
       /* --- dialogue de confirmation ouvert : modal, il capte tout ---
          (Entrée = confirmer, Échap = annuler ; surtout PAS de GO sur
          Espace pendant qu'un dialogue est affiché). */
@@ -3648,11 +4606,15 @@
       var t = e.target;
       var editing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
       /* --- Échap = panic universel, JAMAIS désactivé (même mode Show).
-         Dans un champ : le 1er Échap sort du champ, le 2e déclenche. --- */
+         Dans un champ : le 1er Échap sort du champ, le 2e déclenche.
+         Exception : un menu contextuel ouvert consomme l'Échap (on ferme
+         le menu, pas le plateau). --- */
       if (e.key === 'Escape') {
+        if (closeCtxMenu()) { return; }
         if (editing) { t.blur(); return; }
         closeAnimPopover();   /* les popovers se ferment au passage */
         closeStatusPanel();
+        closeUpdatePop();
         if (!e.repeat) { escPanic(); }
         return;
       }
@@ -3669,12 +4631,25 @@
       if (e.key === 'b' || e.key === 'B') { if (!e.repeat) { dboKeyDown(); } return; }
       if (e.key === 't' || e.key === 'T') { if (!e.repeat) { sendCmd({ cmd: 'tap_tempo' }); } return; }
       if (e.key === 'o' || e.key === 'O') { if (!e.repeat) { editStandbyNotes(); } return; }
-      if (/^[1-9]$/.test(e.key)) {
+      /* --- raccourcis remappables (patch.keys) — APRÈS les raccourcis
+         système, AVANT les onglets (le learn refuse de toute façon les
+         touches réservées nues). Actifs aussi en mode Show : c'est fait
+         pour conduire. --- */
+      var ks = keyToString(e);
+      if (ks) {
+        var kb = (patch().keys || []).find(function (b) { return b && b.key === ks; });
+        if (kb) {
+          e.preventDefault();
+          if (!e.repeat) { runTemplate(kb.command); }
+          return;
+        }
+      }
+      if (/^[1-9]$/.test(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) {
         var tab = visibleTabs()[parseInt(e.key, 10) - 1];
         if (tab) { setTab(tab.id); }
         return;
       }
-      if (e.key === '0') {
+      if (e.key === '0' && !e.ctrlKey && !e.altKey && !e.metaKey) {
         var last = visibleTabs()[9];
         if (last) { setTab(last.id); }
         return;
@@ -3724,7 +4699,16 @@
         renderAll();
         break;
       case 'health_tick': S.health = ev.snapshot; updateHealth(); break;
-      case 'log_line': pushLog(ev.level, ev.target, ev.message); break;
+      case 'log_line':
+        pushLog(ev.level, ev.target, ev.message);
+        reactToLog(ev);
+        break;
+      case 'diagnostic_ready':
+        /* zip prêt (chemins expurgés) — chemin cliquable dans le toast */
+        toast(el('span', null, 'Rapport de diagnostic prêt : ',
+          el('code', null, String(ev.path || ''))), 'ok');
+        pushLog('info', 'ui', 'Rapport de diagnostic : ' + (ev.path || ''));
+        break;
       case 'warning':
         /* avertissement de conduite non bloquant (GO refusé par l'anti
            double-GO, commande impossible…) — throttlé côté moteur */
@@ -3775,6 +4759,22 @@
       }
       default:
         break;
+    }
+  }
+
+  /* Réactions UI à certaines lignes de journal du moteur : la collecte de
+     show et le diagnostic tournent en tâche de fond et ne publient (pour
+     l'instant) que des logs — on en fait des toasts de fin d'opération. */
+  function reactToLog(ev) {
+    var msg = String(ev.message || '');
+    if (String(ev.target || '').indexOf('app::session') < 0) { return; }
+    if (msg.indexOf('show collecté') >= 0) {
+      toast(el('span', null, 'Collecte terminée — dossier ',
+        el('code', null, 'shows/' + (show().name || 'show') + '-collecte')), 'ok');
+    } else if (msg.indexOf('collecte impossible') >= 0) {
+      toast('Collecte du show impossible — détail dans le Journal.', 'err');
+    } else if (msg.indexOf('rapport de diagnostic : pas encore disponible') >= 0) {
+      toast('Rapport de diagnostic indisponible dans cette version du moteur.', 'warn');
     }
   }
 
@@ -3831,9 +4831,11 @@
 
   document.addEventListener('DOMContentLoaded', function () {
     installTooltips();
+    installKeyLearn();     /* AVANT installKeyboard : capture prioritaire */
     installKeyboard();
     installDeferredRender();
     installAnimPopoverClose();
+    installCtxMenuClose();
     startClock();
     var badge = byId('mode-badge');
     if (badge) {
@@ -3849,6 +4851,8 @@
     }
     var warnChip = byId('warn-chip');
     if (warnChip) { warnChip.addEventListener('click', toggleStatusPanel); }
+    var updBadge = byId('update-badge');
+    if (updBadge) { updBadge.addEventListener('click', toggleUpdatePop); }
     loadAbout();
     Conduite.ws.on('open', function () { S.connected = true; refreshPreviews(); updateHealth(); loadAbout(); });
     Conduite.ws.on('close', function () { S.connected = false; updateHealth(); });

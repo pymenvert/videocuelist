@@ -236,3 +236,55 @@ fn segment_in_out_respecte_hold() {
     assert!(p.eof(), "Black doit finir en eof à la fin du segment");
     assert!(t < 1.4, "le segment 0.25..0.75 ne doit pas durer 1 s complète");
 }
+
+#[test]
+#[ignore = "exige ffmpeg + h264_mf (Windows) : encodeur de préview réel"]
+fn preview_encoder_produit_des_access_units() {
+    use conduite_engine::{h264_mf_available, PreviewEncoder};
+
+    if !h264_mf_available() {
+        eprintln!("SKIP : h264_mf indisponible dans ce ffmpeg");
+        return;
+    }
+    let (w, h, fps) = (128u32, 72u32, 15u32);
+    let mut enc = PreviewEncoder::new(w, h, fps).expect("lancement de l'encodeur");
+
+    // ~2 s de frames RGBA (dégradé animé pour donner du grain à encoder).
+    let mut frame = vec![0u8; (w * h * 4) as usize];
+    let mut pushed = 0u32;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut aus = Vec::new();
+    while pushed < 30 && std::time::Instant::now() < deadline {
+        for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+            let v = ((i as u32).wrapping_mul(7).wrapping_add(pushed * 31) & 0xFF) as u8;
+            px.copy_from_slice(&[v, 255 - v, (pushed * 8) as u8, 255]);
+        }
+        if enc.push_frame(&frame) {
+            pushed += 1;
+        }
+        while let Some(au) = enc.poll_access_unit() {
+            aus.push(au);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1000 / fps as u64));
+    }
+    // Laisse l'encodeur cracher ce qui reste en file.
+    let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < settle && aus.len() < 8 {
+        if let Some(au) = enc.recv_access_unit(std::time::Duration::from_millis(200)) {
+            aus.push(au);
+        }
+    }
+    assert!(enc.is_alive(), "l'encodeur doit tourner tant qu'on le nourrit");
+    assert!(
+        aus.len() >= 8,
+        "au moins ~8 access units pour 30 frames poussées, obtenu {}",
+        aus.len()
+    );
+    assert!(aus[0].keyframe, "le flux commence par un keyframe (SPS/PPS/IDR)");
+    assert!(
+        aus[0].data.windows(4).any(|w| w == [0, 0, 0, 1]) || aus[0].data.windows(3).any(|w| w == [0, 0, 1]),
+        "les access units gardent leurs start codes Annex-B"
+    );
+    // Drop : kill + wait + join — le test se termine sans process orphelin.
+    drop(enc);
+}

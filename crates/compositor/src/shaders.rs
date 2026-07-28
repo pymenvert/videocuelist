@@ -11,6 +11,11 @@
 //! contenus A/B AVANT correction couleur), `u_black` (through-black),
 //! `u_master` (intensity × DBO), `u_blend_mode`, mires `bars` et `ident`
 //! (damier + numéro du slice en 7 segments).
+//!
+//! Mires P2 (contrat Mires) : grilles 4/8/16 (pas paramétré), barres SMPTE
+//! simplifiées 8 colonnes, et libellé « nom — résolution » de la sortie sur
+//! la mire ident (fonte bitmap 5×7 générée depuis `font.rs`, uniforms
+//! `u_ident_text`/`u_ident_len`/`u_pattern_px`).
 
 use conduite_core::PatternKind;
 
@@ -45,6 +50,9 @@ pub const PATTERN_GRID: i32 = 1;
 pub const PATTERN_CHECKER: i32 = 2;
 pub const PATTERN_BARS: i32 = 3;
 pub const PATTERN_IDENT: i32 = 4;
+pub const PATTERN_GRID4: i32 = 5;
+pub const PATTERN_GRID16: i32 = 6;
+pub const PATTERN_COLORBARS: i32 = 7;
 
 /// Traduit une [`PatternKind`] du modèle en code `u_pattern`.
 pub fn pattern_code(kind: Option<PatternKind>) -> i32 {
@@ -54,11 +62,9 @@ pub fn pattern_code(kind: Option<PatternKind>) -> i32 {
         Some(PatternKind::Checker) => PATTERN_CHECKER,
         Some(PatternKind::Bars) => PATTERN_BARS,
         Some(PatternKind::Ident) => PATTERN_IDENT,
-        // Variantes P2 additives : repli provisoire sur la mire la plus
-        // proche tant que le shader dédié n'est pas implémenté (contrat
-        // Mires — voir docs/INTERFACES.md).
-        Some(PatternKind::Grid4) | Some(PatternKind::Grid16) => PATTERN_GRID,
-        Some(PatternKind::ColorBars) => PATTERN_BARS,
+        Some(PatternKind::Grid4) => PATTERN_GRID4,
+        Some(PatternKind::Grid16) => PATTERN_GRID16,
+        Some(PatternKind::ColorBars) => PATTERN_COLORBARS,
     }
 }
 
@@ -116,17 +122,25 @@ uniform float u_opacity;        // opacité du slice 0..1
 uniform float u_black;          // through-black : 1 = noir complet
 uniform float u_master;         // master intensity × (1 - DBO)
 
-// Mire : 0 = média, 1 = grille, 2 = damier, 3 = barres, 4 = ident.
+// Mire : 0 = média, 1 = grille 8, 2 = damier, 3 = barres, 4 = ident,
+// 5 = grille 4, 6 = grille 16, 7 = barres SMPTE.
 uniform int u_pattern;
 uniform int u_slice_num;        // numéro affiché par la mire ident
+
+// Libellé de la mire ident (nom + résolution de la sortie), en indices de
+// glyphes (table GLYPH_LO/GLYPH_HI générée côté Rust — voir font.rs).
+uniform int u_ident_len;              // 0 = pas de libellé
+uniform int u_ident_text[IDENT_MAX];  // indices de glyphes
+uniform vec2 u_pattern_px;            // taille en pixels de la surface mire
 
 // 0 = normal, 1 = add, 2 = screen, 3 = multiply (glBlendFunc côté CPU).
 uniform int u_blend_mode;
 
-// Grille de convergence 8×8 : lignes blanches d'~2 px sur fond sombre.
-vec3 pattern_grid(vec2 uv) {
-    vec2 cell = fract(uv * 8.0);
-    vec2 width = fwidth(uv) * 8.0 * 1.5;
+// Grille de convergence n×n : lignes blanches d'~2 px sur fond sombre
+// (le pas est paramétré : 4, 8 ou 16 cases par côté).
+vec3 pattern_grid(vec2 uv, float n) {
+    vec2 cell = fract(uv * n);
+    vec2 width = fwidth(uv) * n * 1.5;
     vec2 line = step(cell, width) + step(1.0 - width, cell);
     float on = clamp(line.x + line.y, 0.0, 1.0);
     return mix(vec3(0.08), vec3(1.0), on);
@@ -150,6 +164,25 @@ vec3 pattern_bars(vec2 uv) {
     if (i == 5) { return vec3(1.0, 0.0, 0.0); }
     if (i == 6) { return vec3(0.0, 0.0, 1.0); }
     return vec3(0.05);
+}
+
+// Barres SMPTE simplifiées, 8 colonnes : blanc 100 %, six couleurs à 75 %
+// (jaune, cyan, vert, magenta, rouge, bleu), noir ; bande basse = rampe de
+// gris en 8 paliers (contrôle niveaux/gamma au calage).
+vec3 pattern_colorbars(vec2 uv) {
+    int i = int(floor(clamp(uv.x, 0.0, 0.999) * 8.0));
+    if (uv.y > 0.78) {
+        return vec3(float(i) / 7.0);
+    }
+    if (i <= 0) { return vec3(1.0); }
+    float c = 0.75;
+    if (i == 1) { return vec3(c, c, 0.0); }
+    if (i == 2) { return vec3(0.0, c, c); }
+    if (i == 3) { return vec3(0.0, c, 0.0); }
+    if (i == 4) { return vec3(c, 0.0, c); }
+    if (i == 5) { return vec3(c, 0.0, 0.0); }
+    if (i == 6) { return vec3(0.0, 0.0, c); }
+    return vec3(0.0);
 }
 
 // Rectangle plein : 1.0 si p est dans le rectangle centré en c.
@@ -182,8 +215,32 @@ float digit_7seg(int d, vec2 p) {
     return on;
 }
 
+// Libellé de la mire ident (nom + résolution de la sortie) : fonte bitmap
+// 5×7 tracée en espace PIXEL (ratio des glyphes préservé quel que soit le
+// format de la surface), centrée, ~1/19e de la hauteur en cible (lisible en
+// 1080p comme en 4K), réduite si le libellé ne tient pas en largeur.
+float ident_text_mask(vec2 uv) {
+    if (u_ident_len <= 0 || u_pattern_px.x < 1.0 || u_pattern_px.y < 1.0) {
+        return 0.0;
+    }
+    vec2 pix = uv * u_pattern_px;
+    // Échelle : pixels écran par pixel fonte (glyphe = 5×7, avance = 6).
+    float s = u_pattern_px.y / 135.0;
+    float fit = 0.92 * u_pattern_px.x / (6.0 * float(u_ident_len));
+    s = max(min(s, fit), 1.0);
+    float text_w = (float(u_ident_len) * 6.0 - 1.0) * s;
+    vec2 rel = (pix - vec2(0.5 * (u_pattern_px.x - text_w), 0.74 * u_pattern_px.y)) / s;
+    if (rel.x < 0.0 || rel.y < 0.0 || rel.y >= 7.0) { return 0.0; }
+    int ci = int(floor(rel.x / 6.0));
+    if (ci >= u_ident_len) { return 0.0; }
+    float fx = rel.x - float(ci) * 6.0;
+    if (fx >= 5.0) { return 0.0; } // colonne d'espacement entre glyphes
+    return glyph_bit(u_ident_text[ci], int(floor(fx)), int(floor(rel.y)));
+}
+
 // Mire d'identification : damier atténué + numéro du slice en 7 segments
-// (jusqu'à 3 chiffres, centrés). Le nom du slice est affiché par l'UI.
+// (jusqu'à 3 chiffres, centrés) + libellé « nom — résolution » de la sortie
+// en fonte bitmap (si fourni via u_ident_text ; sinon numéro seul).
 vec3 pattern_ident(vec2 uv, int num) {
     vec3 base = pattern_checker(uv) * 0.35;
     int n = (num >= 100) ? 3 : ((num >= 10) ? 2 : 1);
@@ -198,6 +255,7 @@ vec3 pattern_ident(vec2 uv, int num) {
         int d = (num / div) % 10;
         if (digit_7seg(d, p) > 0.5) { return vec3(1.0, 0.85, 0.1); }
     }
+    if (ident_text_mask(uv) > 0.5) { return vec3(1.0); }
     return base;
 }
 
@@ -212,13 +270,19 @@ void main() {
 
     vec3 color;
     if (u_pattern == 1) {
-        color = pattern_grid(uv);
+        color = pattern_grid(uv, 8.0);
     } else if (u_pattern == 2) {
         color = pattern_checker(uv);
     } else if (u_pattern == 3) {
         color = pattern_bars(uv);
     } else if (u_pattern == 4) {
         color = pattern_ident(uv, u_slice_num);
+    } else if (u_pattern == 5) {
+        color = pattern_grid(uv, 4.0);
+    } else if (u_pattern == 6) {
+        color = pattern_grid(uv, 16.0);
+    } else if (u_pattern == 7) {
+        color = pattern_colorbars(uv);
     } else {
         // Fenêtre source puis crossfade des contenus AVANT la correction.
         vec2 suv = u_src_rect.xy + uv * u_src_rect.zw;
@@ -263,9 +327,13 @@ pub fn composite_vertex_source(version: GlslVersion) -> String {
 }
 
 /// Source du fragment shader de composition pour le dialecte donné.
+/// La table de glyphes de la mire ident (fonte bitmap 5×7, générée depuis
+/// `font.rs`) est injectée avant le corps.
 pub fn composite_fragment_source(version: GlslVersion) -> String {
-    let mut s = String::with_capacity(FRAGMENT_BODY.len() + 64);
+    let glyphs = crate::font::glyph_table_glsl();
+    let mut s = String::with_capacity(FRAGMENT_BODY.len() + glyphs.len() + 64);
     s.push_str(version.fragment_header());
+    s.push_str(&glyphs);
     s.push_str(FRAGMENT_BODY);
     s
 }
@@ -317,6 +385,18 @@ mod tests {
                 "pattern_bars",
                 "pattern_ident",
                 "digit_7seg",
+                // Mires P2 : grilles paramétrées, barres SMPTE, libellé ident.
+                "pattern_grid(uv, 8.0)",
+                "pattern_grid(uv, 4.0)",
+                "pattern_grid(uv, 16.0)",
+                "pattern_colorbars",
+                "uniform int u_ident_len;",
+                "uniform int u_ident_text[IDENT_MAX];",
+                "uniform vec2 u_pattern_px;",
+                "ident_text_mask",
+                "glyph_bit",
+                "const int GLYPH_LO[",
+                "const int GLYPH_HI[",
                 // Crossfade avant correction couleur.
                 "mix(a, b, u_mix)",
                 "in vec3 v_texcoord;",
@@ -353,6 +433,9 @@ mod tests {
         assert_eq!(pattern_code(Some(PatternKind::Checker)), PATTERN_CHECKER);
         assert_eq!(pattern_code(Some(PatternKind::Bars)), PATTERN_BARS);
         assert_eq!(pattern_code(Some(PatternKind::Ident)), PATTERN_IDENT);
+        assert_eq!(pattern_code(Some(PatternKind::Grid4)), PATTERN_GRID4);
+        assert_eq!(pattern_code(Some(PatternKind::Grid16)), PATTERN_GRID16);
+        assert_eq!(pattern_code(Some(PatternKind::ColorBars)), PATTERN_COLORBARS);
         // Les codes sont distincts (dispatch du shader).
         let codes = [
             PATTERN_NONE,
@@ -360,11 +443,27 @@ mod tests {
             PATTERN_CHECKER,
             PATTERN_BARS,
             PATTERN_IDENT,
+            PATTERN_GRID4,
+            PATTERN_GRID16,
+            PATTERN_COLORBARS,
         ];
         for (i, a) in codes.iter().enumerate() {
             for b in codes.iter().skip(i + 1) {
                 assert_ne!(a, b);
             }
+        }
+    }
+
+    #[test]
+    fn dispatch_du_shader_couvre_les_nouvelles_mires() {
+        // Chaque code de mire P2 a sa branche dans le main() du fragment.
+        let f = composite_fragment_source(GlslVersion::Core330);
+        for expected in [
+            "if (u_pattern == 5)",
+            "if (u_pattern == 6)",
+            "if (u_pattern == 7)",
+        ] {
+            assert!(f.contains(expected), "branche absente : {expected}");
         }
     }
 

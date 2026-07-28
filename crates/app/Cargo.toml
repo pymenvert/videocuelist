@@ -31,11 +31,14 @@ conduite-modulation = { version = "0.1.0", path = "../modulation" }
 conduite-params = { version = "0.1.0", path = "../params" }
 conduite-system = { version = "0.1.0", path = "../system" }
 cpal = "0.15.3"
+crash-handler = "0.8.0"
 crossbeam-channel = "0.5.16"
 glow = "0.18.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+mimalloc = "0.1.52"
+minidumper = "0.11.0"
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 raw-window-handle = "0.6.2"
 ringbuf = "0.3.3"
@@ -47,7 +50,9 @@ toml = "0.8.23"
 tracing = "0.1.44"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+ureq = "3.3.0"
 winit = "0.30.12"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

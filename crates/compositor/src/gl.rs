@@ -212,6 +212,10 @@ struct CompositeLocs {
     pattern: Option<GlUniformLocation>,
     slice_num: Option<GlUniformLocation>,
     blend_mode: Option<GlUniformLocation>,
+    /// Mire ident : libellé « nom — résolution » de la sortie.
+    pattern_px: Option<GlUniformLocation>,
+    ident_len: Option<GlUniformLocation>,
+    ident_text: Option<GlUniformLocation>,
 }
 
 /// Le compositor : tout le GL du produit. Créé avec un contexte partagé
@@ -250,6 +254,11 @@ pub struct Compositor {
     frames_in_flight: usize,
     /// Frame BGRA reçue sans support GL_BGRA : loggé une seule fois.
     bgra_mismatch_logged: bool,
+    /// Libellé de la mire ident (« nom — résolution » de la sortie), en
+    /// indices de glyphes — posé par [`Compositor::set_ident_label`] avant le
+    /// rendu de chaque sortie ; 0 glyphe = numéro seul (compat).
+    ident_text: [i32; crate::font::IDENT_TEXT_MAX],
+    ident_len: i32,
 }
 
 impl Compositor {
@@ -305,6 +314,12 @@ impl Compositor {
                 pattern: gl.get_uniform_location(composite, "u_pattern"),
                 slice_num: gl.get_uniform_location(composite, "u_slice_num"),
                 blend_mode: gl.get_uniform_location(composite, "u_blend_mode"),
+                pattern_px: gl.get_uniform_location(composite, "u_pattern_px"),
+                ident_len: gl.get_uniform_location(composite, "u_ident_len"),
+                // Certains drivers exposent les tableaux sous "nom[0]".
+                ident_text: gl
+                    .get_uniform_location(composite, "u_ident_text")
+                    .or_else(|| gl.get_uniform_location(composite, "u_ident_text[0]")),
             }
         };
 
@@ -341,7 +356,22 @@ impl Compositor {
             fence_broken: false,
             frames_in_flight: 0,
             bgra_mismatch_logged: false,
+            ident_text: [0; crate::font::IDENT_TEXT_MAX],
+            ident_len: 0,
         })
+    }
+
+    /// Pose le libellé de la mire [`PatternKind::Ident`] : nom + résolution
+    /// de la SORTIE (ex. « PRINCIPAL — 1920×1080 »). À appeler avant le rendu
+    /// de chaque sortie qui affiche une mire ident (encodage pur, zéro
+    /// allocation) ; sans appel, la mire n'affiche que le numéro (compat).
+    pub fn set_ident_label(&mut self, name: &str, width: u32, height: u32) {
+        self.ident_len = crate::font::encode_output_ident(name, width, height, &mut self.ident_text);
+    }
+
+    /// Efface le libellé de la mire ident (retour au numéro seul).
+    pub fn clear_ident_label(&mut self) {
+        self.ident_len = 0;
     }
 
     /// Dialecte GLSL sélectionné à l'init.
@@ -747,6 +777,29 @@ impl Compositor {
             gl.use_program(Some(self.composite));
         }
 
+        // Libellé de la mire ident : uniforms posés une fois par sortie,
+        // SEULEMENT si une mire ident est affichée (jamais de coût sur le
+        // chemin nominal). Toujours reposés quand elle l'est : le programme
+        // est partagé entre les sorties (libellés différents).
+        if out
+            .slices
+            .iter()
+            .any(|s| s.pattern == Some(PatternKind::Ident))
+        {
+            let gl = &self.gl;
+            unsafe {
+                gl.uniform_2_f32(
+                    self.locs.pattern_px.as_ref(),
+                    out.output_size.0 as f32,
+                    out.output_size.1 as f32,
+                );
+                gl.uniform_1_i32(self.locs.ident_len.as_ref(), self.ident_len);
+                if self.ident_len > 0 {
+                    gl.uniform_1_i32_slice(self.locs.ident_text.as_ref(), &self.ident_text);
+                }
+            }
+        }
+
         // 2. Tri par z (scratch réutilisé — pas d'allocation par frame).
         sort_indices_by_z(&mut self.z_indices, out.slices);
 
@@ -863,7 +916,8 @@ impl Compositor {
 
     /// Rend une mire plein cadre dans le framebuffer courant (calage global,
     /// bouton « identifier » d'une sortie). `ident_num` est le numéro affiché
-    /// par la mire [`PatternKind::Ident`].
+    /// par la mire [`PatternKind::Ident`] ; son libellé « nom — résolution »
+    /// est celui posé par [`Compositor::set_ident_label`].
     pub fn render_pattern(
         &mut self,
         output_size: (u32, u32),
@@ -899,6 +953,15 @@ impl Compositor {
             gl.uniform_1_i32(locs.pattern.as_ref(), shaders::pattern_code(Some(pattern)));
             gl.uniform_1_i32(locs.slice_num.as_ref(), ident_num as i32);
             gl.uniform_1_i32(locs.blend_mode.as_ref(), shaders::BLEND_NORMAL);
+            gl.uniform_2_f32(
+                locs.pattern_px.as_ref(),
+                output_size.0 as f32,
+                output_size.1 as f32,
+            );
+            gl.uniform_1_i32(locs.ident_len.as_ref(), self.ident_len);
+            if self.ident_len > 0 {
+                gl.uniform_1_i32_slice(locs.ident_text.as_ref(), &self.ident_text);
+            }
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.black_tex));

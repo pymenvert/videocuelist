@@ -4,13 +4,14 @@
 //!
 //! Le serveur HTTP vit dans `main` (port machine, pas un réglage du show).
 
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 
 use conduite_control_artnet::{smoothing_overrides, ArtnetNode};
 use conduite_control_midi::{HubEvent, MidiHub};
 use conduite_control_osc::{FeedbackEvent, OscFeedback, OscFeedbackHandle, OscServer, OscServerHandle};
 use conduite_core::{Command, PatchTable, ShowSettings, Source};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -60,11 +61,26 @@ impl Default for ProtocolStatus {
     }
 }
 
+/// Résultat de la résolution DNS + spawn du feedback OSC (thread dédié).
+type FeedbackSpawn = Result<(SocketAddr, OscFeedbackHandle), String>;
+
 /// L'ensemble des surfaces actives. Drop = arrêt propre de tous les threads.
 pub struct Protocols {
     cmd_tx: Sender<(Source, Command)>,
     osc_in: Option<OscServerHandle>,
-    feedback: Option<(OscFeedbackHandle, Sender<FeedbackEvent>)>,
+    /// Émetteur vers le thread de feedback OSC. Disponible dès le respawn
+    /// (les événements s'accumulent dans le canal pendant la résolution DNS).
+    feedback_tx: Option<Sender<FeedbackEvent>>,
+    /// Poignée du thread de feedback (None tant que la résolution est en vol).
+    feedback_handle: Option<OscFeedbackHandle>,
+    /// Résolution DNS + spawn en cours sur le thread `conduite-osc-resolve` :
+    /// le résultat est ramassé par [`Protocols::poll_feedback_resolution`]
+    /// (appelé à chaque tick) — la résolution d'un hôte NE TOURNE JAMAIS sur
+    /// le thread de tick (gel de plusieurs secondes si le DNS est lent).
+    pending_feedback: Option<Receiver<FeedbackSpawn>>,
+    /// Cache hôte résolu → adresse : les respawns suivants (édition d'un
+    /// réglage réseau, rechargement de show) repartent sans requête DNS.
+    dns_cache: HashMap<(String, u16), SocketAddr>,
     midi: Option<MidiHub>,
     artnet: Option<(ArtnetNode, Sender<PatchTable>)>,
     /// Configuration réseau des surfaces vivantes (None avant le 1er spawn).
@@ -83,7 +99,10 @@ impl Protocols {
         let mut p = Protocols {
             cmd_tx,
             osc_in: None,
-            feedback: None,
+            feedback_tx: None,
+            feedback_handle: None,
+            pending_feedback: None,
+            dns_cache: HashMap::new(),
             midi: None,
             artnet: None,
             sig: None,
@@ -117,8 +136,12 @@ impl Protocols {
     pub fn respawn(&mut self, settings: &ShowSettings, patch: &PatchTable) {
         self.sig = Some(proto_sig(settings, patch));
         // Drop des anciennes poignées = arrêt propre (drapeaux + join).
+        // `feedback_tx` d'abord : le canal fermé arrête aussi un thread de
+        // feedback dont la résolution serait encore en vol.
         self.osc_in = None;
-        self.feedback = None;
+        self.feedback_tx = None;
+        self.feedback_handle = None;
+        self.pending_feedback = None;
         self.midi = None;
         self.artnet = None;
 
@@ -138,28 +161,65 @@ impl Protocols {
         }
 
         // --- Feedback OSC sortant (si une cible est configurée).
+        // IP littérale ou hôte déjà résolu (cache) : spawn immédiat. Sinon,
+        // la résolution DNS part sur un thread dédié — JAMAIS sur le thread
+        // de tick (un DNS lent gèlerait la boucle de rendu plusieurs
+        // secondes) ; les événements s'accumulent dans le canal en attendant.
         self.status.osc_out = "inactif".to_string();
         if let Some(cfg) = &patch.osc_out {
-            match resolve_host(&cfg.host, cfg.port) {
-                Some(target) => {
-                    let (fb_tx, fb_rx) = crossbeam_channel::unbounded::<FeedbackEvent>();
-                    match OscFeedback::spawn(target, fb_rx) {
-                        Ok(handle) => {
-                            self.feedback = Some((handle, fb_tx));
-                            self.status.osc_out = "ok".to_string();
+            let (fb_tx, fb_rx) = crossbeam_channel::unbounded::<FeedbackEvent>();
+            let cache_key = (cfg.host.clone(), cfg.port);
+            let known = cfg
+                .host
+                .parse::<IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, cfg.port))
+                .or_else(|| self.dns_cache.get(&cache_key).copied());
+            match known {
+                Some(target) => match OscFeedback::spawn(target, fb_rx) {
+                    Ok(handle) => {
+                        self.feedback_tx = Some(fb_tx);
+                        self.feedback_handle = Some(handle);
+                        self.dns_cache.insert(cache_key, target);
+                        self.status.osc_out = "ok".to_string();
+                    }
+                    Err(e) => {
+                        warn!(target: "app::protocols", %target, error = %e,
+                            "feedback OSC impossible");
+                        self.status.osc_out = format!("erreur: {e}");
+                    }
+                },
+                None => {
+                    let (res_tx, res_rx) = crossbeam_channel::bounded::<FeedbackSpawn>(1);
+                    let host = cfg.host.clone();
+                    let port = cfg.port;
+                    let spawned = std::thread::Builder::new()
+                        .name("conduite-osc-resolve".into())
+                        .spawn(move || {
+                            let outcome = match resolve_host(&host, port) {
+                                Some(target) => OscFeedback::spawn(target, fb_rx)
+                                    .map(|handle| (target, handle))
+                                    .map_err(|e| format!("erreur: {e}")),
+                                None => Err(format!("erreur: hôte {host} irrésoluble")),
+                            };
+                            // Réception fermée (respawn entre-temps) : la
+                            // poignée est droppée ICI, sur ce thread — arrêt
+                            // propre du feedback fraîchement démarré.
+                            let _ = res_tx.send(outcome);
+                        });
+                    match spawned {
+                        Ok(_) => {
+                            self.feedback_tx = Some(fb_tx);
+                            self.pending_feedback = Some(res_rx);
+                            self.status.osc_out =
+                                format!("résolution de {} en cours…", cfg.host);
                         }
                         Err(e) => {
-                            warn!(target: "app::protocols", %target, error = %e,
-                                "feedback OSC impossible");
+                            warn!(target: "app::protocols", error = %e,
+                                "thread de résolution DNS impossible");
                             self.status.osc_out = format!("erreur: {e}");
                         }
                     }
-                }
-                None => {
-                    warn!(target: "app::protocols", host = %cfg.host, port = cfg.port,
-                        "hôte de feedback OSC irrésoluble");
-                    self.status.osc_out =
-                        format!("erreur: hôte {} irrésoluble", cfg.host);
                 }
             }
         }
@@ -215,7 +275,7 @@ impl Protocols {
 
         info!(target: "app::protocols",
             osc_in = self.osc_in.is_some(),
-            osc_out = self.feedback.is_some(),
+            osc_out = self.feedback_tx.is_some(),
             artnet = self.artnet.is_some(),
             "surfaces de contrôle (re)démarrées");
     }
@@ -233,9 +293,46 @@ impl Protocols {
     }
 
     /// Émet un événement de feedback OSC (état ou statut périodique).
+    /// Pendant une résolution DNS en vol, les événements s'accumulent dans
+    /// le canal et partent dès que le thread de feedback démarre.
     pub fn osc_feedback(&self, event: FeedbackEvent) {
-        if let Some((_, tx)) = &self.feedback {
+        if let Some(tx) = &self.feedback_tx {
             let _ = tx.send(event);
+        }
+    }
+
+    /// Ramasse le résultat d'une résolution DNS en vol (appelé à chaque tick
+    /// via [`Protocols::drain_midi_events`] — coût d'un `try_recv`).
+    fn poll_feedback_resolution(&mut self) {
+        let Some(rx) = &self.pending_feedback else { return };
+        match rx.try_recv() {
+            Ok(Ok((target, handle))) => {
+                self.pending_feedback = None;
+                self.feedback_handle = Some(handle);
+                if let Some((host, port)) =
+                    self.sig.as_ref().and_then(|s| s.osc_out.clone())
+                {
+                    self.dns_cache.insert((host, port), target);
+                }
+                self.status.osc_out = "ok".to_string();
+                info!(target: "app::protocols", %target,
+                    "retour d'état OSC actif (hôte résolu en tâche de fond)");
+            }
+            Ok(Err(msg)) => {
+                self.pending_feedback = None;
+                // Personne ne consommera le canal : on le ferme pour ne pas
+                // accumuler des événements sans fin.
+                self.feedback_tx = None;
+                warn!(target: "app::protocols", "feedback OSC : {msg}");
+                self.status.osc_out = msg;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                // Thread de résolution mort sans réponse (panique ?).
+                self.pending_feedback = None;
+                self.feedback_tx = None;
+                self.status.osc_out = "erreur: résolution interrompue".to_string();
+            }
         }
     }
 
@@ -258,8 +355,10 @@ impl Protocols {
     }
 
     /// Draine les événements du hub MIDI vers le canal d'événements UI
-    /// (et met à jour le statut réel du protocole MIDI).
+    /// (et met à jour le statut réel du protocole MIDI). Ramasse aussi le
+    /// résultat d'une résolution DNS de feedback OSC en vol.
     pub fn drain_midi_events(&mut self, events_tx: &broadcast::Sender<Value>) {
+        self.poll_feedback_resolution();
         let Some(hub) = &self.midi else { return };
         let rx = hub.events();
         while let Ok(ev) = rx.try_recv() {
@@ -326,5 +425,50 @@ mod tests {
         let mut p2 = p.clone();
         p2.osc_out = Some(OscOutCfg { host: "10.0.0.2".into(), port: 9001 });
         assert_ne!(proto_sig(&s, &p), proto_sig(&s, &p2), "cible de feedback");
+    }
+
+    /// Une IP littérale ne passe JAMAIS par le DNS : `parse::<IpAddr>()`
+    /// suffit (spawn synchrone immédiat) ; un nom d'hôte n'est pas littéral
+    /// (il part sur le thread de résolution).
+    #[test]
+    fn ip_literals_bypass_dns() {
+        assert!("192.168.1.50".parse::<IpAddr>().is_ok());
+        assert!("::1".parse::<IpAddr>().is_ok());
+        assert!("regie-son.local".parse::<IpAddr>().is_err());
+        assert!("localhost".parse::<IpAddr>().is_err());
+    }
+
+    /// La machinerie de résolution asynchrone : le thread résout et SPAWNE
+    /// le feedback, le résultat est ramassé par `try_recv` (jamais d'attente
+    /// bloquante sur le tick). `localhost` se résout localement, sans réseau.
+    #[test]
+    fn feedback_resolution_runs_off_thread() {
+        let (fb_tx, fb_rx) = crossbeam_channel::unbounded::<FeedbackEvent>();
+        let (res_tx, res_rx) = crossbeam_channel::bounded::<FeedbackSpawn>(1);
+        std::thread::spawn(move || {
+            let outcome = match resolve_host("localhost", 0) {
+                Some(target) => OscFeedback::spawn(target, fb_rx)
+                    .map(|handle| (target, handle))
+                    .map_err(|e| format!("erreur: {e}")),
+                None => Err("erreur: hôte localhost irrésoluble".to_string()),
+            };
+            let _ = res_tx.send(outcome);
+        });
+        // Poll borné (comme le tick : try_recv, jamais recv bloquant).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let outcome = loop {
+            match res_rx.try_recv() {
+                Ok(o) => break o,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    assert!(std::time::Instant::now() < deadline, "résolution jamais rendue");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("canal de résolution fermé : {e}"),
+            }
+        };
+        let (target, handle) = outcome.expect("localhost doit se résoudre et spawner");
+        assert!(target.ip().is_loopback(), "{target}");
+        handle.stop();
+        drop(fb_tx);
     }
 }

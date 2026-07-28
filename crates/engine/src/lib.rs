@@ -24,6 +24,7 @@ use conduite_core::Playback;
 
 pub mod pacing;
 mod pool;
+pub mod preview_encoder;
 mod probe;
 mod ring;
 
@@ -32,6 +33,10 @@ mod test_player;
 
 pub use ffmpeg::FfmpegPlayer;
 pub use pool::FrameData;
+pub use preview_encoder::{
+    h264_mf_available, AccessUnit, AnnexBSplitter, PreviewEncoder, PreviewEncoderError,
+    PREVIEW_CODEC_STRING,
+};
 pub use probe::{probe, resolve_ffmpeg, resolve_ffprobe};
 pub use ring::{FrameRing, RING_CAPACITY};
 pub use test_player::TestPlayer;

@@ -1,0 +1,5 @@
+{
+  "version": "0.1.0",
+  "url": "https://github.com/pymenvert/videocuelist/releases/latest",
+  "notes": "Version initiale de Conduite : cues, mapping, ISF, MIDI/OSC/Art-Net, web UI."
+}
