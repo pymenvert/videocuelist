@@ -16,7 +16,7 @@
 pub mod assets;
 mod server;
 
-pub use server::{HttpDeps, HttpServer, HttpServerHandle};
+pub use server::{epoch_ms, HttpDeps, HttpServer, HttpServerHandle};
 
 #[cfg(test)]
 mod tests {
@@ -44,6 +44,8 @@ mod tests {
         preview_tx: broadcast::Sender<Bytes>,
         preview_b_tx: broadcast::Sender<Bytes>,
         thumb_dir: PathBuf,
+        tick_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        early_log: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
     fn harness(name: &str) -> Harness {
@@ -61,6 +63,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&thumb_dir);
         std::fs::create_dir_all(&thumb_dir).expect("mkdir vignettes");
+        let tick_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            server::epoch_ms(),
+        ));
+        let early_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let deps = HttpDeps {
             cmd_tx,
@@ -69,6 +75,14 @@ mod tests {
             preview_rx,
             preview_b_rx,
             thumb_dir: thumb_dir.clone(),
+            about: json!({
+                "name": "Conduite",
+                "version": "0.0.0-test",
+                "license": "MIT"
+            }),
+            tick_ms: tick_ms.clone(),
+            version: "0.0.0-test".to_string(),
+            early_log: early_log.clone(),
         };
         let handle = HttpServer::spawn("127.0.0.1:0".parse().expect("addr"), deps).expect("spawn");
         Harness {
@@ -79,6 +93,8 @@ mod tests {
             preview_tx,
             preview_b_tx,
             thumb_dir,
+            tick_ms,
+            early_log,
         }
     }
 
@@ -145,6 +161,18 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("--accent"));
         let (head, _) = http_get(&h, "/assets/nimporte.quoi");
         assert!(head.starts_with("HTTP/1.1 404"), "en-têtes : {head}");
+    }
+
+    #[test]
+    fn about_served_as_json() {
+        let h = harness("about");
+        let (head, body) = http_get(&h, "/about");
+        assert!(head.starts_with("HTTP/1.1 200"), "en-têtes : {head}");
+        assert!(head.to_lowercase().contains("application/json"));
+        let v: Value = serde_json::from_slice(&body).expect("JSON /about");
+        assert_eq!(v["name"], "Conduite");
+        assert_eq!(v["version"], "0.0.0-test");
+        assert_eq!(v["license"], "MIT");
     }
 
     // -------------------------------------------------------------- thumbs
@@ -389,6 +417,58 @@ mod tests {
             b"JPGSTBY",
         )
         .await;
+    }
+
+    // -------------------------------------------------------------- health
+
+    /// Contrat /health : `{ status, tick_age_ms, version }` — `ok` quand le
+    /// tick est frais, `stalled` quand il date de plus de 2 s.
+    #[test]
+    fn health_reports_ok_then_stalled() {
+        let h = harness("health");
+        h.tick_ms
+            .store(server::epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+        let (head, body) = http_get(&h, "/health");
+        assert!(head.starts_with("HTTP/1.1 200"), "en-têtes : {head}");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], "0.0.0-test");
+        assert!(v["tick_age_ms"].as_u64().expect("age") < 2000);
+
+        // Tick vieux de 10 s : moteur « vivant mais figé ».
+        h.tick_ms.store(
+            server::epoch_ms().saturating_sub(10_000),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let (_, body) = http_get(&h, "/health");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["status"], "stalled");
+        assert!(v["tick_age_ms"].as_u64().expect("age") >= 10_000);
+    }
+
+    /// Les erreurs de démarrage (early_log) sont rejouées à la connexion WS,
+    /// juste après le hello.
+    #[tokio::test]
+    async fn ws_replays_early_log_after_hello() {
+        let h = harness("ws-replay");
+        {
+            let mut log = h.early_log.lock().expect("lock");
+            log.push(json!({
+                "type": "log_line", "level": "ERROR",
+                "target": "app::protocols",
+                "message": "serveur OSC impossible (port occupé ?)"
+            }));
+        }
+        let mut ws = ws_connect(&h).await;
+        let hello = next_json(&mut ws).await;
+        assert_eq!(hello["type"], "hello");
+        let replayed = next_json(&mut ws).await;
+        assert_eq!(replayed["type"], "event");
+        assert_eq!(replayed["event"]["level"], "ERROR");
+        assert!(replayed["event"]["message"]
+            .as_str()
+            .expect("msg")
+            .contains("OSC"));
     }
 
     // ------------------------------------------------------------ shutdown

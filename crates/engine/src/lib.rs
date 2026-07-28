@@ -18,6 +18,7 @@
 //!   automatique au pool au drop de la frame, sur n'importe quel thread.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use conduite_core::Playback;
 
@@ -35,6 +36,43 @@ pub use probe::{probe, resolve_ffmpeg, resolve_ffprobe};
 pub use ring::{FrameRing, RING_CAPACITY};
 pub use test_player::TestPlayer;
 
+/// Ordre des canaux d'une frame décodée (toujours 4 octets par pixel).
+///
+/// `Bgra` n'est produit que si [`set_decode_bgra`] a été activé (par le
+/// compositor, quand le contexte GL accepte `GL_BGRA` en format client —
+/// format natif des drivers Windows, upload sans swizzle). Chaque frame
+/// PORTE son ordre ([`FrameRgba::pixel_order`]) : un changement de réglage
+/// en cours de route ne peut pas produire de frame mal interprétée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PixelOrder {
+    #[default]
+    Rgba,
+    Bgra,
+}
+
+/// Demande à ffmpeg de sortir du BGRA (`-pix_fmt bgra`) au lieu du RGBA.
+/// À appeler UNE FOIS à l'initialisation (le compositor le fait quand le
+/// contexte GL supporte `GL_BGRA`). Pris en compte à chaque (re)lancement
+/// de process ffmpeg ; les frames déjà décodées gardent leur ordre.
+static DECODE_BGRA: AtomicBool = AtomicBool::new(false);
+
+pub fn set_decode_bgra(enabled: bool) {
+    let previous = DECODE_BGRA.swap(enabled, Ordering::Relaxed);
+    if previous != enabled {
+        tracing::info!(
+            target: "engine",
+            bgra = enabled,
+            "format de décodage ffmpeg : {}",
+            if enabled { "bgra (upload GL direct)" } else { "rgba" }
+        );
+    }
+}
+
+/// Ordre de canaux demandé aux prochains process ffmpeg.
+pub fn decode_bgra() -> bool {
+    DECODE_BGRA.load(Ordering::Relaxed)
+}
+
 /// Métadonnées d'un média vidéo (issues de ffprobe).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaInfo {
@@ -45,7 +83,9 @@ pub struct MediaInfo {
     pub height: u32,
 }
 
-/// Une frame décodée, RGBA 8 bits, lignes de haut en bas.
+/// Une frame décodée, 4 octets par pixel, lignes de haut en bas. L'ordre des
+/// canaux (RGBA par défaut, BGRA si [`set_decode_bgra`] est actif) est porté
+/// par le buffer : voir [`FrameRgba::pixel_order`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameRgba {
     pub width: u32,
@@ -56,6 +96,13 @@ pub struct FrameRgba {
     pub data: FrameData,
     /// Position de la frame sur la ligne de temps média (s).
     pub pts_s: f64,
+}
+
+impl FrameRgba {
+    /// Ordre des canaux du buffer (RGBA sauf décodage BGRA activé).
+    pub fn pixel_order(&self) -> PixelOrder {
+        self.data.pixel_order()
+    }
 }
 
 /// Lecteur vidéo abstrait (ffmpeg, mire de test…).

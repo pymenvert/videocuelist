@@ -1,0 +1,37 @@
+FFmpeg — notice de licence
+==========================
+
+Conduite utilise FFmpeg (ffmpeg.exe et ffprobe.exe, dans le dossier bin\)
+pour décoder les fichiers vidéo. FFmpeg est un PROGRAMME SÉPARÉ, développé
+par le projet FFmpeg (https://ffmpeg.org) : Conduite l'appelle en
+sous-processus via sa ligne de commande et n'est pas lié à ses
+bibliothèques. Conduite lui-même est distribué sous licence MIT.
+
+Ce logiciel utilise le code de FFmpeg (http://ffmpeg.org), sous licence
+GNU Lesser General Public License (LGPL) version 3.
+
+Build embarqué
+--------------
+- Binaires : build officiel « BtbN FFmpeg-Builds », variante win64 **LGPL**
+  (sans aucun composant GPL : ni x264, ni x265, ni xvid).
+  Version : n8.1 (ffmpeg version n8.1.2, asset ffmpeg-n8.1-latest-win64-lgpl-8.1.zip).
+- Téléchargement des builds : https://github.com/BtbN/FFmpeg-Builds/releases
+- Le texte complet de la licence LGPL v3 est fourni dans ce dossier :
+  LICENSE-FFMPEG-LGPLv3.txt
+
+Code source
+-----------
+Conformément à la LGPL, le code source complet de FFmpeg est disponible :
+- Sources officielles FFmpeg : https://ffmpeg.org/download.html
+  (dépôt git : https://git.ffmpeg.org/ffmpeg.git, tag n8.1.2)
+- Scripts de build exacts utilisés par BtbN (reproductibles) :
+  https://github.com/BtbN/FFmpeg-Builds
+
+Remplacement
+------------
+Vous pouvez remplacer librement bin\ffmpeg.exe et bin\ffprobe.exe par toute
+autre version de FFmpeg (par exemple un build plus récent) : Conduite les
+invoque par leur chemin, sans dépendance à une version précise. Si bin\ est
+vide, Conduite cherche ffmpeg/ffprobe dans le PATH du système.
+
+FFmpeg est une marque de Fabrice Bellard, initiateur du projet FFmpeg.

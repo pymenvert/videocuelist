@@ -97,6 +97,17 @@ pub enum Command {
     ModeSet {
         mode: AppMode,
     },
+    /// Charge le fichier de récupération proposé au démarrage
+    /// (`StateEvent::RecoveryAvailable`). Le chemin est validé côté session :
+    /// uniquement un `recover-*.json` du dossier `shows/`.
+    RecoveryLoad {
+        path: String,
+    },
+    /// Écarte la proposition de récupération.
+    RecoveryDismiss,
+    /// Arrêt propre : flush des journaux, sauvegarde si le show est
+    /// modifié, sortie code 0.
+    Quit,
 }
 
 /// Mutation du modèle de show — undo-able, refusée en mode Show.

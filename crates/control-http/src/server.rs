@@ -8,7 +8,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -51,6 +52,30 @@ pub struct HttpDeps {
     pub preview_b_rx: broadcast::Receiver<Bytes>,
     /// Dossier du cache de vignettes (`<id>.jpg`).
     pub thumb_dir: PathBuf,
+    /// Bloc « À propos » statique servi sur `GET /about` : version, licence,
+    /// crédits, liens — construit par `app` au démarrage.
+    pub about: Value,
+    /// Horodatage (millisecondes UNIX) du dernier tick de rendu, mis à jour
+    /// par la session à chaque frame — `GET /health` détecte « vivant mais
+    /// figé ».
+    pub tick_ms: Arc<AtomicU64>,
+    /// Version de l'application (CARGO_PKG_VERSION du binaire).
+    pub version: String,
+    /// Lignes de journal WARN/ERROR capturées depuis le démarrage (borné) :
+    /// rejouées à chaque nouvelle connexion WS pour que les erreurs émises
+    /// AVANT la connexion (bind OSC raté…) apparaissent dans le journal web.
+    pub early_log: Arc<Mutex<Vec<Value>>>,
+}
+
+/// Âge de tick au-delà duquel `/health` répond `stalled` (moteur figé).
+const HEALTH_STALL_MS: u64 = 2_000;
+
+/// Millisecondes UNIX courantes (horloge système).
+pub fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// État partagé du routeur (cloné par connexion, tout est `Arc`).
@@ -170,7 +195,30 @@ fn router(state: AppState) -> Router {
         .route("/preview.mjpeg", get(preview_program))
         .route("/preview-b.mjpeg", get(preview_standby))
         .route("/thumb/{file}", get(thumb))
+        .route("/about", get(about))
+        .route("/health", get(health))
         .with_state(state)
+}
+
+/// `GET /health` — contrat supervision : `{ status, tick_age_ms, version }`.
+/// `status` passe à `"stalled"` quand le tick de rendu n'a pas avancé depuis
+/// plus de 2 s (le pire mode de panne : « vivant mais figé »).
+async fn health(State(st): State<AppState>) -> Response {
+    let last = st.inner.tick_ms.load(Ordering::Relaxed);
+    let age = epoch_ms().saturating_sub(last);
+    let status = if age <= HEALTH_STALL_MS { "ok" } else { "stalled" };
+    axum::Json(json!({
+        "status": status,
+        "tick_age_ms": age,
+        "version": st.inner.version,
+    }))
+    .into_response()
+}
+
+/// `GET /about` — données « À propos » (JSON statique) : version, licence,
+/// crédits tiers, liens. L'affichage est fait par la webui (Réglages).
+async fn about(State(st): State<AppState>) -> Response {
+    axum::Json(st.inner.about.clone()).into_response()
 }
 
 /* ------------------------------------------------------------ assets */
@@ -330,6 +378,19 @@ async fn handle_ws(socket: WebSocket, st: AppState) {
     if send_json(&mut tx, &hello).await.is_err() {
         return;
     }
+    // Rejoue les WARN/ERROR émis avant cette connexion (bind OSC raté au
+    // démarrage…) : sans cela le journal web ne voit jamais les erreurs
+    // antérieures à l'ouverture de la page.
+    let replay: Vec<Value> = match st.inner.early_log.lock() {
+        Ok(lines) => lines.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    for line in replay {
+        let msg = json!({ "type": "event", "event": line });
+        if send_json(&mut tx, &msg).await.is_err() {
+            return;
+        }
+    }
     tracing::debug!(target: "control_http", "client WS connecté");
 
     let mut tick = tokio::time::interval(DYN_PERIOD);
@@ -427,8 +488,16 @@ async fn handle_client_text(
             let cmd_value = value.get("cmd").cloned().unwrap_or(Value::Null);
             match serde_json::from_value::<Command>(cmd_value) {
                 Ok(cmd) => {
-                    if let Err(e) = st.inner.cmd_tx.send((Source::Ui, cmd)) {
-                        tracing::error!(target: "control_http", error = %e, "canal de commandes fermé");
+                    // try_send : le bus est borné et ce handler tourne sur le
+                    // runtime mono-thread du serveur — un send bloquant sur
+                    // bus plein gèlerait TOUTE la web UI. Erreur throttlée.
+                    if let Err(e) = st.inner.cmd_tx.try_send((Source::Ui, cmd)) {
+                        static LAST_WARN_S: AtomicU64 = AtomicU64::new(0);
+                        let now_s = epoch_ms() / 1000;
+                        if LAST_WARN_S.swap(now_s, Ordering::Relaxed) != now_s {
+                            tracing::warn!(target: "control_http", error = %e,
+                                "bus de commandes saturé ou fermé : commande WS perdue");
+                        }
                     }
                 }
                 Err(e) => {

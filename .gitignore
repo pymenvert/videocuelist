@@ -19,10 +19,12 @@ dist/
 
 # Packaging
 /dist/
+/tools/ffmpeg-lgpl/
 
-# Shaders perso de l'utilisateur (les exemples restent versionnés)
+# Shaders perso de l'utilisateur (les exemples et crédits restent versionnés)
 /shaders/*
 !/shaders/examples/
+!/shaders/CREDITS.txt
 
 # OS
 .DS_Store

@@ -218,10 +218,14 @@ pub fn open_ffmpeg(path: &Path, pb: &Playback) -> anyhow::Result<Box<dyn Player>
 pub fn resolve_ffmpeg() -> PathBuf;   // ordre : ./bin/ffmpeg(.exe) portable, puis PATH
 ```
 Backend ffmpeg : process `ffmpeg -ss <in> -i <file> [-to <out>] [-stream_loop -1 pour Loop]
--f rawvideo -pix_fmt rgba pipe:1`, thread lecteur → ring buffer borné (4 frames, SPSC),
+-f rawvideo -pix_fmt rgba|bgra pipe:1`, thread lecteur → ring buffer borné (4 frames, SPSC),
 vitesse = cadence de consommation (dup/skip), pause = on arrête de consommer (backpressure),
 seek = relance du process. `preload` = process lancé + première frame en buffer. EOF = pipe fermé.
 Redémarrage automatique si le process meurt (log + compteur santé). Zéro zombie (kill on drop).
+**Ordre des canaux** : `set_decode_bgra(bool)` (activé par le compositor si `GL_BGRA` est supporté)
+fait sortir ffmpeg en BGRA ; chaque frame porte son ordre (`FrameRgba::pixel_order() -> PixelOrder`).
+**D3D11VA (Windows)** : `-hwaccel d3d11va` tenté pour H.264/HEVC ≥ ~720p ; échec du process ⇒
+repli logiciel immédiat + mémorisation pour la session (log clair, une fois).
 
 ## isf
 
@@ -256,10 +260,17 @@ impl Compositor {
     pub fn render_output(&mut self, out: &OutputView) -> Result<()>;
     pub fn render_pattern(&mut self, ...);                        // mires
     pub fn read_preview_rgba(&mut self, w: u32, h: u32) -> Vec<u8>; // pour MJPEG (FBO dédié)
+    /// Rendus de sortie soumis au GPU non terminés (0..=2) — HUD santé.
+    /// La latence de présentation est bornée à 2 frames par fences (pattern mpv).
+    pub fn frames_in_flight(&self) -> usize;
 }
 ```
 Homographie : reprendre le calcul 3×3 de Lanterne (`crates/render`) avec provenance.
 Blend modes : Normal, Add, Screen, Multiply (dans le shader de composition).
+Capacités détectées à l'init (chaque chemin garde son repli, GL 3.3/GLES 3.0 restent servis) :
+upload `GL_BGRA` (desktop seulement — active `engine::set_decode_bgra`), `glTexStorage2D`
+(textures persistantes immuables), PBO persistant mappé 3 tranches + fences (sinon orphaning,
+sinon copie synchrone), fences de latence de présentation.
 
 ## control-osc / control-midi / control-artnet
 
@@ -285,6 +296,9 @@ Art-Net : socket UDP 6454, réponse ArtPoll, réception ArtDMX multi-univers ; `
   niveaux modulateurs, valeurs params changées). Client → `{"type":"cmd", ...Command JSON}`.
 - `GET /preview.mjpeg` : multipart/x-mixed-replace, ~8 fps, 640×360, program (+ `?deck=preview` pour la cue standby).
 - `GET /thumb/{media_id}.jpg`.
+- `GET /about` : JSON statique « À propos » construit par `app` — `{ name, description,
+  version, git, license, copyright, website, credits: [{ name, role, license, url?, notice }] }`.
+  L'affichage (Réglages) est à la charge de la webui.
 - UI (français, sombre, tooltips partout via un système central `data-tip`) : onglets
   **Live** (cuelist + progress + program/preview + GO/BACK/GOTO + master + DBO + santé),
   **Cues** (édition), **Mapping** (canvas coins/nudge/mires), **Médias**, **Matériaux** (params ISF),

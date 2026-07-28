@@ -51,6 +51,7 @@ fn cue(
         name: name.to_string(),
         color: color.map(str::to_string),
         notes: String::new(),
+        armed: true,
         transition,
         follow: FollowMode::Manual,
         goto_after: None,

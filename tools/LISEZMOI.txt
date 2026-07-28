@@ -1,0 +1,59 @@
+﻿Conduite {VERSION} — régie vidéo de spectacle (version portable Windows)
+=========================================================================
+
+DÉMARRAGE
+---------
+1. Lancer conduite.exe
+2. Ouvrir http://localhost:9820 dans un navigateur : c'est l'interface de
+   régie (utilisable aussi depuis une tablette ou un autre poste du même
+   réseau : http://<ip-de-cette-machine>:9820)
+3. Déposer vos vidéos dans media\, vos shaders ISF dans shaders\
+4. Vos conduites sont enregistrées dans shows\ (avec backups automatiques)
+
+PREMIER LANCEMENT — PARE-FEU WINDOWS
+------------------------------------
+Au premier lancement, Windows peut afficher « Le Pare-feu Windows Defender
+a bloqué certaines fonctionnalités ». C'est l'interface web et les
+protocoles de pilotage (OSC, Art-Net) qui écoutent sur le réseau :
+autorisez l'accès sur les réseaux privés. Sans cette autorisation,
+l'interface reste accessible sur la machine elle-même (localhost), mais
+pas depuis une tablette, et les commandes OSC/Art-Net n'arrivent pas.
+
+RACCOURCIS ESSENTIELS
+---------------------
+  Espace          GO (envoie la cue en standby)
+  B (maintenu)    Noir d'urgence (DBO)
+  T               Tap tempo
+  O               Notes de régie de la cue en standby
+  1–9, 0          Changer d'onglet (0 = Réglages)
+Le reste : onglet Réglages et manuel (MANUEL.md, aussi dans le dépôt docs/).
+
+MODE SHOW
+---------
+Dans Réglages, le mode Show verrouille toute l'édition pour le spectacle :
+seuls le GO, le retour, le master, le noir d'urgence et la sauvegarde
+restent actifs. La fermeture demande une double confirmation.
+
+FFMPEG (décodage vidéo)
+-----------------------
+bin\ffmpeg.exe et bin\ffprobe.exe assurent le décodage vidéo. Ce sont des
+programmes du projet FFmpeg (licence LGPL v3), appelés en sous-processus —
+voir licenses\FFMPEG.txt. S'ils sont absents, Conduite les cherche dans le
+PATH du système.
+
+EN CAS DE PROBLÈME
+------------------
+- Le dossier logs\ contient les journaux horodatés : joignez le fichier du
+  jour à toute demande de support, c'est le premier élément utile.
+- « Port déjà pris » au lancement : Conduite est probablement déjà ouvert
+  (http://localhost:9820), sinon lancez : conduite.exe --port 9821
+- Un média manquant n'empêche jamais un show de se charger : il apparaît
+  en damier, à relier depuis l'onglet Médias.
+
+LICENCES
+--------
+Conduite © 2026 Pym — licence MIT (licenses\LICENSE-CONDUITE.txt).
+Composants tiers : licenses\THIRD-PARTY-NOTICES.html (bibliothèques Rust),
+licenses\FFMPEG.txt (FFmpeg), shaders\CREDITS.txt (matériaux ISF livrés).
+
+Aucune installation, aucun registre : ce dossier se copie sur une clé USB.

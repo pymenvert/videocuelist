@@ -7,7 +7,7 @@
 //! sorties → préview → santé (ordre normatif, INTERFACES §app).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,9 +15,9 @@ use bytes::Bytes;
 use conduite_compositor::{BlendMode, SliceDraw};
 use conduite_control_osc::FeedbackEvent;
 use conduite_core::{
-    AppMode, Command, Content, CoreError, Cue, CueNumber, EditOp, LoadWarning, MaterialId,
-    MaterialRef, MediaRef, OutputCfg, OutputId, ParamValue, PatternKind, RuntimeStatus, Show,
-    ShowSettings, SliceId, Source, StateEvent,
+    AppMode, Command, Content, CoreError, Cue, CueDefaults, CueNumber, EditOp, FollowMode,
+    LoadWarning, MaterialId, MaterialRef, MediaId, MediaRef, OutputCfg, OutputId, ParamValue,
+    PatternKind, RuntimeStatus, Show, ShowSettings, SliceId, Source, StateEvent, Transition,
 };
 use conduite_cue::{CueEngine, CueEvent, CueFrame, EngineTick, SceneTarget};
 use conduite_isf::{IsfInputKind, IsfSources};
@@ -41,6 +41,7 @@ use crate::players::{Deck, Players};
 use crate::preview::{placeholder_jpeg, PreviewJob, PreviewWorker};
 use crate::protocols::Protocols;
 use crate::saver::{SaveJob, Saver};
+use crate::shaderwatch::ShaderWatch;
 use crate::undo::UndoStack;
 
 /// Cadence des trames d'état vers l'UI et le feedback OSC.
@@ -55,6 +56,18 @@ const CMD_BUDGET_PER_TICK: usize = 256;
 const RECOVER_PUSH_PERIOD: Duration = Duration::from_secs(1);
 /// Nombre de fichiers `recover-*.json` conservés au démarrage.
 const RECOVER_KEEP: usize = 5;
+/// Coalescing d'undo : deux édits de même (type, cible) espacés de moins
+/// que ce délai appartiennent au même GESTE — un seul snapshot est pris
+/// (un drag de coin émettait ~37 snapshots complets du Show en 3 s).
+const UNDO_COALESCE: Duration = Duration::from_millis(500);
+/// Saut d'horloge (veille machine, gel système) au-delà duquel les horloges
+/// de conduite sont RÉ-ANCRÉES : au réveil, les waits/transitions ne tirent
+/// pas en rafale.
+const TICK_REANCHOR_GAP: Duration = Duration::from_secs(3);
+/// Période de rafraîchissement de la liste `runtime.shows` (mode Edit).
+const SHOWS_REFRESH_PERIOD: Duration = Duration::from_secs(10);
+/// Nombre maximal d'entrées « média manquant » dans `runtime.warnings`.
+const WARN_MEDIA_MAX: usize = 20;
 
 /// Résultat d'un re-scan des médias/matériaux (worker `conduite-rescan`).
 struct RescanResult {
@@ -70,6 +83,8 @@ pub struct SessionChannels {
     pub events_tx: broadcast::Sender<Value>,
     pub preview_tx: broadcast::Sender<Bytes>,
     pub preview_b_tx: broadcast::Sender<Bytes>,
+    /// Horodatage (ms UNIX) du dernier tick, partagé avec `GET /health`.
+    pub tick_ms: Arc<AtomicU64>,
 }
 
 /// Matériau ISF prêt : sources GLSL + inputs → adresses de paramètres.
@@ -200,6 +215,28 @@ pub struct Session {
     last_cmd_warn: Option<Instant>,
     /// Une génération de vignettes est déjà en cours (coalescence).
     thumbs_running: Arc<AtomicBool>,
+
+    /// Horodatage (ms UNIX) du dernier tick, partagé avec `GET /health`.
+    tick_ms: Arc<AtomicU64>,
+    /// Dernier GO accepté (anti double-GO, toutes sources).
+    last_go: Option<Instant>,
+    /// Throttle du `StateEvent::Warning` de GO refusé.
+    last_go_warn: Option<Instant>,
+    /// `Command::Quit` reçu : l'app sauvegarde et sort proprement (code 0).
+    quit: bool,
+    /// Récupération post-crash proposée au démarrage : (chemin, horodatage).
+    recovery_pending: Option<(String, String)>,
+    /// Coalescing d'undo : clé (type+cible) et instant du dernier édit.
+    undo_last_key: Option<String>,
+    undo_last_edit: Instant,
+    /// Liste des shows de `shows/` publiée dans `runtime.shows`.
+    shows_list: Vec<String>,
+    last_shows_refresh: Instant,
+    /// Sorties actuellement repliées en fenêtré (moniteur perdu) — copie de
+    /// l'état gfx du dernier tick, publiée dans `runtime.warnings`.
+    monitor_fallback: Vec<OutputId>,
+    /// Hot-reload des shaders : watcher de `shaders/` (None si indisponible).
+    shader_watch: Option<ShaderWatch>,
 }
 
 impl Session {
@@ -212,7 +249,7 @@ impl Session {
         for w in &warnings {
             warn!(target: "app::session", "avertissement de chargement : {w}");
         }
-        notice_recover_files(&dirs.shows, &dirs.show_dir(&show_name));
+        let recovery_pending = notice_recover_files(&dirs.shows, &dirs.show_dir(&show_name));
         let audio = AudioInput::new(effective_audio_input(&config, &show.settings));
         let protocols = Protocols::spawn(ch.cmd_tx.clone(), &show.settings, &show.patch);
         let preview = PreviewWorker::spawn(ch.preview_tx.clone(), ch.preview_b_tx.clone());
@@ -288,14 +325,57 @@ impl Session {
             preview_scratch_b: Vec::new(),
             last_cmd_warn: None,
             thumbs_running: Arc::new(AtomicBool::new(false)),
+            tick_ms: ch.tick_ms,
+            last_go: None,
+            last_go_warn: None,
+            quit: false,
+            recovery_pending,
+            undo_last_key: None,
+            undo_last_edit: now,
+            shows_list: Vec::new(),
+            last_shows_refresh: now,
+            monitor_fallback: Vec::new(),
+            shader_watch: None,
         };
+        session.shader_watch = ShaderWatch::spawn(&session.dirs.shaders);
         session.players = Players::new(session.dirs.media.clone());
         session.rebuild_all();
-        session.spawn_thumbs();
+        session.spawn_thumbs(false);
         session.push_recover_snapshot();
+        session.refresh_shows_list();
+        if let Some((path, timestamp)) = session.recovery_pending.clone() {
+            // Contrat : RecoveryAvailable au démarrage. L'information reste
+            // aussi dans `runtime.recovery` pour les clients connectés plus
+            // tard (le broadcast d'événements ne rejoue pas le passé).
+            session.publish_event(&StateEvent::RecoveryAvailable { path, timestamp });
+        }
         info!(target: "app::session", show = %session.show.name,
             cues = session.show.cues.len(), "session prête");
         session
+    }
+
+    /// L'arrêt propre a été demandé (`Command::Quit`) — consommé une fois.
+    pub fn take_quit(&mut self) -> bool {
+        std::mem::take(&mut self.quit)
+    }
+
+    /// Sauvegarde SYNCHRONE de dernier recours (perte GPU, arrêt) : écrite
+    /// directement sur le thread appelant — on est en train de sortir, le
+    /// worker d'écriture ne sera peut-être jamais drainé.
+    pub fn emergency_save(&mut self) {
+        if !self.dirty && !self.save_in_flight {
+            return;
+        }
+        let dir = self.dirs.show_dir(&self.show_name);
+        match conduite_core::save_show_atomic(&dir, &self.show) {
+            Ok(()) => {
+                self.dirty = false;
+                info!(target: "app::session", dir = %dir.display(),
+                    "sauvegarde d'urgence effectuée");
+            }
+            Err(e) => error!(target: "app::session", error = %e,
+                "sauvegarde d'urgence impossible"),
+        }
     }
 
     // ------------------------------------------------------------ accès app
@@ -343,10 +423,24 @@ impl Session {
     /// (headless accepté : uploads et rendus sautés, préview placeholder).
     pub fn tick(&mut self, gfx: &mut Gfx) {
         let now = Instant::now();
-        let dt = (now - self.last_tick).as_secs_f32().clamp(0.0, 0.25);
+        let gap = now - self.last_tick;
+        // Saut d'horloge (veille machine, gel long) : ré-ancrage — l'origine
+        // avance du saut pour que `now_s` reste continu, sinon les waits et
+        // transitions absolus tireraient en rafale au réveil.
+        if gap > TICK_REANCHOR_GAP {
+            self.start += gap - Duration::from_millis(16);
+            warn!(target: "app::session", gap_s = gap.as_secs_f32(),
+                "saut d'horloge détecté (veille ?) : horloges de conduite ré-ancrées");
+        }
+        let dt = gap.as_secs_f32().clamp(0.0, 0.25);
         self.last_tick = now;
         let now_s = (now - self.start).as_secs_f64();
         self.frame_index += 1;
+        // Battement de cœur pour `GET /health` (« vivant mais figé »).
+        self.tick_ms
+            .store(conduite_control_http::epoch_ms(), Ordering::Relaxed);
+        // État des moniteurs (repli fenêtré) publié dans runtime.warnings.
+        self.monitor_fallback = gfx.fallback_outputs();
 
         if gfx.failed && !self.gl_failed_flagged {
             self.gl_failed_flagged = true;
@@ -382,6 +476,24 @@ impl Session {
         // 1 bis. Résultat d'un re-scan média en tâche de fond.
         if let Ok(res) = self.rescan_rx.try_recv() {
             self.apply_rescan(res);
+        }
+
+        // 1 ter. Shaders modifiés sur disque (hot-reload, débounce 150 ms) :
+        // rebranché sur le chemin de recompilation existant. Ignoré en mode
+        // Show (jamais de compilation shader pendant la représentation).
+        if let Some(watch) = &self.shader_watch {
+            let mut changed: Vec<String> = Vec::new();
+            while let Some(batch) = watch.try_recv() {
+                changed.extend(batch);
+            }
+            if !changed.is_empty() {
+                if self.mode == AppMode::Show {
+                    debug!(target: "app::session",
+                        "shaders modifiés ignorés (mode Show) — re-scan en mode Edit");
+                } else {
+                    self.reload_changed_shaders(&changed);
+                }
+            }
         }
 
         // 2. Moteur de cues (l'oracle EOF interroge les players).
@@ -475,6 +587,15 @@ impl Session {
             self.publish_health();
         }
 
+        // 8 bis. Liste des shows (runtime.shows) — rafraîchie en mode Edit
+        // seulement : jamais d'I/O disque sur le tick en mode Show.
+        if self.mode == AppMode::Edit
+            && now - self.last_shows_refresh >= SHOWS_REFRESH_PERIOD
+        {
+            self.last_shows_refresh = now;
+            self.refresh_shows_list();
+        }
+
         // 9. État UI (10 Hz) + feedback OSC + événements de conduite.
         // Seul le runtime (léger) est sérialisé à 10 Hz ; le Show complet
         // n'est re-sérialisé QUE s'il a muté (édition, chargement, rescan) —
@@ -496,6 +617,30 @@ impl Session {
                         "active": self.audio.active_device(),
                     }),
                 );
+                // CONTRAT runtime.protocols : statut RÉEL par protocole
+                // ("ok" | "inactif" | "erreur: <msg>") — le Patch n'affiche
+                // plus jamais un port configuré dont le bind a échoué.
+                let ps = self.protocols.status();
+                map.insert(
+                    "protocols".to_string(),
+                    json!({
+                        "osc_in": ps.osc_in,
+                        "osc_out": ps.osc_out,
+                        "artnet": ps.artnet,
+                        "midi": ps.midi,
+                    }),
+                );
+                // CONTRAT runtime.shows : noms des dossiers de `shows/`.
+                map.insert("shows".to_string(), json!(self.shows_list));
+                // CONTRAT runtime.warnings : [{level, msg, action?}].
+                map.insert("warnings".to_string(), Value::Array(self.build_warnings()));
+                // Récupération post-crash en attente de décision.
+                if let Some((path, timestamp)) = &self.recovery_pending {
+                    map.insert(
+                        "recovery".to_string(),
+                        json!({ "path": path, "timestamp": timestamp }),
+                    );
+                }
             }
             let fft_value = self.fft_state_value(&fft, state_dt);
             let show_value = if self.state_show_dirty {
@@ -537,6 +682,41 @@ impl Session {
                 warn!(target: "app::session", "rapport de diagnostic : pas encore disponible");
             }
             Command::ParamSet { addr, value, source } => self.param_set(&addr, value, source),
+            Command::CueGo => {
+                // Anti double-GO (contrat min_go_interval_ms) : appliqué ICI,
+                // pour TOUTES les sources (UI, OSC, MIDI, MSC) — un doublé
+                // de GO qui grille une cue est l'erreur n°1 de régie.
+                let min = Duration::from_millis(
+                    u64::from(self.show.settings.min_go_interval_ms),
+                );
+                let now = Instant::now();
+                let too_soon = min > Duration::ZERO
+                    && self
+                        .last_go
+                        .map(|t| now.duration_since(t) < min)
+                        .unwrap_or(false);
+                if too_soon {
+                    let throttled = self
+                        .last_go_warn
+                        .map(|t| now.duration_since(t) < Duration::from_secs(1))
+                        .unwrap_or(false);
+                    if !throttled {
+                        self.last_go_warn = Some(now);
+                        warn!(target: "app::session", ?source,
+                            min_ms = self.show.settings.min_go_interval_ms,
+                            "GO refusé : double-GO (délai minimal entre deux GO)");
+                        self.publish_event(&StateEvent::Warning {
+                            message: format!(
+                                "GO refusé : moins de {} ms depuis le GO précédent",
+                                self.show.settings.min_go_interval_ms
+                            ),
+                        });
+                    }
+                    return;
+                }
+                self.last_go = Some(now);
+                self.cue.go();
+            }
             Command::ParamNudge { addr, delta, source } => {
                 // Base du nudge : la CIBLE posée, hors modulation et hors
                 // lissage — nudger la valeur lue cuirait l'offset LFO dans
@@ -554,7 +734,6 @@ impl Session {
                     self.param_set(&addr, v, source);
                 }
             }
-            Command::CueGo => self.cue.go(),
             Command::CueBack => self.cue.back(),
             Command::CueGoto { cue } => self.cue.goto(cue),
             Command::CueStandby { cue } => self.cue.standby(cue),
@@ -595,12 +774,22 @@ impl Session {
                 self.config.last_show = name;
                 self.config.save(&self.dirs.base);
             }
-            Command::ShowLoad { name } => self.load_show(&safe_show_name(&name)),
+            Command::ShowLoad { name } => {
+                if self.mode == AppMode::Show {
+                    warn!(target: "app::session", "chargement refusé : mode Show verrouillé");
+                    return;
+                }
+                // Sauvegarde AVANT opération destructive : le show courant
+                // modifié est écrit avant d'être remplacé.
+                self.save_before_destructive();
+                self.load_show(&safe_show_name(&name));
+            }
             Command::ShowNew => {
                 if self.mode == AppMode::Show {
                     warn!(target: "app::session", "ShowNew refusé en mode Show");
                     return;
                 }
+                self.save_before_destructive();
                 let show = Show::new("Nouveau show");
                 self.install_show(show, "nouveau".to_string());
             }
@@ -617,7 +806,161 @@ impl Session {
                 info!(target: "app::session", ?mode, "mode changé");
                 self.publish_event(&StateEvent::ModeChanged { mode });
             }
+            Command::RecoveryLoad { path } => self.recovery_load(&path),
+            Command::RecoveryDismiss => {
+                if self.recovery_pending.take().is_some() {
+                    info!(target: "app::session", "proposition de récupération écartée");
+                }
+            }
+            Command::Quit => {
+                info!(target: "app::session", ?source, "arrêt demandé (Quit)");
+                self.quit = true;
+            }
         }
+    }
+
+    /// Charge le fichier de récupération proposé au démarrage. Le chemin
+    /// est STRICTEMENT validé (un `recover-*.json` directement sous
+    /// `shows/`) : une commande WS/OSC forgée ne peut pas faire lire un
+    /// fichier arbitraire. Le show récupéré remplace le show courant en
+    /// mémoire (même nom de dossier) et est marqué modifié — l'autosave le
+    /// persiste, le dossier d'origine n'est écrasé qu'au premier save.
+    fn recovery_load(&mut self, path: &str) {
+        if self.mode == AppMode::Show {
+            warn!(target: "app::session", "récupération refusée : mode Show verrouillé");
+            return;
+        }
+        let expected = self.recovery_pending.as_ref().map(|(p, _)| p.as_str());
+        if expected != Some(path) {
+            warn!(target: "app::session", %path,
+                "RecoveryLoad refusé : chemin différent de la proposition");
+            return;
+        }
+        let pb = std::path::Path::new(path);
+        let valid_name = pb
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("recover-") && n.ends_with(".json"))
+            .unwrap_or(false);
+        if !valid_name || pb.parent() != Some(self.dirs.shows.as_path()) {
+            warn!(target: "app::session", %path, "RecoveryLoad refusé : chemin invalide");
+            return;
+        }
+        let bytes = match std::fs::read(pb) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(target: "app::session", %path, error = %e,
+                    "fichier de récupération illisible");
+                return;
+            }
+        };
+        match serde_json::from_slice::<Show>(&bytes) {
+            Ok(show) => {
+                let name = self.show_name.clone();
+                self.recovery_pending = None;
+                self.install_show(show, name);
+                // Le contenu récupéré n'existe que dans ce fichier : marquer
+                // modifié pour que l'autosave l'écrive dans le dossier du show.
+                self.mark_dirty();
+                info!(target: "app::session", %path, "show restauré depuis la récupération");
+            }
+            Err(e) => error!(target: "app::session", %path, error = %e,
+                "récupération illisible (JSON invalide) — show courant conservé"),
+        }
+    }
+
+    /// Sauvegarde synchrone du show courant s'il est modifié, AVANT une
+    /// opération destructive (ShowLoad / ShowNew). Mode Edit uniquement,
+    /// action utilisateur explicite : l'I/O bloquante est acceptable.
+    fn save_before_destructive(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let dir = self.dirs.show_dir(&self.show_name);
+        match conduite_core::save_show_atomic(&dir, &self.show) {
+            Ok(()) => {
+                self.dirty = false;
+                info!(target: "app::session", dir = %dir.display(),
+                    "show sauvegardé avant opération destructive");
+            }
+            Err(e) => error!(target: "app::session", error = %e,
+                "sauvegarde pré-destructive impossible — on continue (backups intacts)"),
+        }
+    }
+
+    /// (Re)liste les dossiers de `shows/` qui contiennent un `show.json`
+    /// (contrat `runtime.shows`). I/O légère, jamais en mode Show.
+    fn refresh_shows_list(&mut self) {
+        let mut names: Vec<String> = std::fs::read_dir(&self.dirs.shows)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().join(conduite_core::SHOW_FILE).is_file())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        if names != self.shows_list {
+            self.shows_list = names;
+        }
+    }
+
+    /// Construit `runtime.warnings` (contrat : [{level, msg, action?}]) :
+    /// médias manquants (action « relink »), protocoles en erreur, MIDI
+    /// déconnecté (action « midi »), moniteurs perdus (action « output »).
+    fn build_warnings(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        let missing: Vec<&MediaRef> = self.show.media.iter().filter(|m| m.missing).collect();
+        for m in missing.iter().take(WARN_MEDIA_MAX) {
+            out.push(json!({
+                "level": "warn",
+                "msg": format!("média manquant : {}", m.path),
+                "action": "relink",
+            }));
+        }
+        if missing.len() > WARN_MEDIA_MAX {
+            out.push(json!({
+                "level": "warn",
+                "msg": format!("… et {} autres médias manquants", missing.len() - WARN_MEDIA_MAX),
+                "action": "relink",
+            }));
+        }
+        let ps = self.protocols.status();
+        for (name, status, action) in [
+            ("OSC entrant", &ps.osc_in, None),
+            ("OSC sortant", &ps.osc_out, None),
+            ("Art-Net", &ps.artnet, None),
+            ("MIDI", &ps.midi, Some("midi")),
+        ] {
+            if let Some(msg) = status.strip_prefix("erreur: ") {
+                let mut w = json!({
+                    "level": "err",
+                    "msg": format!("{name} : {msg}"),
+                });
+                if let Some(a) = action {
+                    w["action"] = json!(a);
+                }
+                out.push(w);
+            }
+        }
+        for output in &self.monitor_fallback {
+            let name = self
+                .show
+                .outputs
+                .iter()
+                .find(|o| o.id == *output)
+                .map(|o| o.name.as_str())
+                .unwrap_or("?");
+            out.push(json!({
+                "level": "err",
+                "msg": format!(
+                    "sortie « {name} » : moniteur perdu, repli fenêtré (rebranchez l'écran)"
+                ),
+                "action": "output",
+            }));
+        }
+        out
     }
 
     fn param_set(&mut self, addr: &str, value: ParamValue, source: Source) {
@@ -680,19 +1023,104 @@ impl Session {
 
     // -------------------------------------------------------------- édition
 
-    fn apply_edit(&mut self, op: EditOp) {
+    fn apply_edit(&mut self, mut op: EditOp) {
         if self.mode == AppMode::Show {
             warn!(target: "app::session", "édition refusée : mode Show verrouillé");
             return;
         }
+        // Gabarits de cue (ShowSettings.cue_defaults) : appliqués aux
+        // nouvelles cues dont les champs sont restés aux défauts de type.
+        if let EditOp::CueAdd { cue } = &mut op {
+            apply_cue_defaults(cue, &self.show.settings.cue_defaults);
+        }
+        // Relocalisation : si l'op change le CHEMIN d'un média, mémoriser
+        // l'ancien chemin pour la cascade (reconnecter les autres manquants
+        // du même dossier) après application.
+        let relocate = match &op {
+            EditOp::MediaUpdate { media } => self
+                .show
+                .media
+                .iter()
+                .find(|m| m.id == media.id)
+                .filter(|old| old.path != media.path)
+                .map(|old| (media.id, old.path.clone(), media.path.clone())),
+            _ => None,
+        };
         // Les réglages d'avant l'op : `after_model_change` ne respawne les
         // surfaces réseau que si la configuration réseau a réellement changé.
         let prev_settings = self.show.settings.clone();
-        self.undo.push(self.show.clone());
+        // Coalescing d'undo : les édits continus de même (type, cible) —
+        // drag de coin, drag de slider — forment UN geste = UN snapshot
+        // (débounce 500 ms). Les Add/Remove ne coalescent jamais.
+        let key = coalesce_key(&op);
+        let now = Instant::now();
+        let coalesced = key.is_some()
+            && key == self.undo_last_key
+            && now.duration_since(self.undo_last_edit) < UNDO_COALESCE;
+        if !coalesced {
+            self.undo.push(self.show.clone());
+        }
+        self.undo_last_key = key;
+        self.undo_last_edit = now;
         op.apply(&mut self.show);
+        if let Some((id, old_path, new_path)) = relocate {
+            self.apply_relocate(id, &old_path, &new_path);
+        }
         self.after_model_change(&op, &prev_settings);
         self.mark_dirty();
         self.publish_event(&StateEvent::EditApplied { op });
+    }
+
+    /// Hot-reload : des fichiers `.fs` ont changé sur disque — re-parse les
+    /// matériaux concernés et pousse leur recompilation à chaud (même chemin
+    /// que `MaterialUpdate`, qui gère déjà l'échec de compilation).
+    fn reload_changed_shaders(&mut self, rels: &[String]) {
+        let ids: Vec<MaterialId> = self
+            .show
+            .materials
+            .iter()
+            .filter(|m| rels.iter().any(|r| r.eq_ignore_ascii_case(&m.path)))
+            .map(|m| m.id)
+            .collect();
+        if ids.is_empty() {
+            return; // fichier hors du pool du show
+        }
+        self.load_materials();
+        self.rebuild_registry();
+        for id in ids {
+            self.materials_failed.remove(&id);
+            if !self.comp_reload.contains(&id) {
+                self.comp_reload.push(id);
+            }
+            info!(target: "app::session", material = id,
+                "shader modifié sur disque : recompilation à chaud");
+        }
+        // Le show lui-même n'a pas changé : pas de mark_dirty.
+    }
+
+    /// Après un changement de chemin de média : re-valide sa présence puis
+    /// reconnecte en CASCADE tous les autres manquants du même dossier
+    /// d'origine (référence Resolume/QLab). Quelques `stat` en mode Edit.
+    fn apply_relocate(&mut self, id: MediaId, old_path: &str, new_path: &str) {
+        let found = conduite_core::validate_relative_path(new_path).is_ok()
+            && self.dirs.media.join(new_path).is_file();
+        if let Some(m) = self.show.media.iter_mut().find(|m| m.id == id) {
+            m.missing = !found;
+        }
+        if !found {
+            return;
+        }
+        let relinked = conduite_media_library::relocate_cascade(
+            &mut self.show.media,
+            &self.dirs.media,
+            old_path,
+            new_path,
+        );
+        if relinked > 0 {
+            info!(target: "app::session", count = relinked,
+                "relocalisation en cascade : {relinked} média(s) du même dossier reconnecté(s)");
+            self.spawn_thumbs(false);
+        }
     }
 
     fn do_undo(&mut self) {
@@ -700,6 +1128,7 @@ impl Session {
             warn!(target: "app::session", "undo refusé : mode Show verrouillé");
             return;
         }
+        self.undo_last_key = None; // le prochain édit ouvre un nouveau geste
         match self.undo.undo(&self.show) {
             Some(prev) => {
                 self.show = prev;
@@ -719,6 +1148,7 @@ impl Session {
             warn!(target: "app::session", "redo refusé : mode Show verrouillé");
             return;
         }
+        self.undo_last_key = None;
         match self.undo.redo(&self.show) {
             Some(next) => {
                 self.show = next;
@@ -866,15 +1296,19 @@ impl Session {
         }
     }
 
-    /// Installe un show (chargé ou neuf) : reconstruction complète.
+    /// Installe un show (chargé ou neuf) : reconstruction complète. Le
+    /// cache de vignettes est PURGÉ (les ids u32 se recouvrent entre shows :
+    /// sans purge, une vignette périmée d'un autre show est servie).
     fn install_show(&mut self, show: Show, name: String) {
         self.show = show;
         self.show_name = name;
         self.undo.clear();
+        self.undo_last_key = None;
         self.dirty = false;
         self.rebuild_all();
-        self.spawn_thumbs();
+        self.spawn_thumbs(true);
         self.push_recover_snapshot();
+        self.refresh_shows_list();
         self.publish_event(&StateEvent::ShowLoaded {
             name: self.show.name.clone(),
         });
@@ -979,7 +1413,7 @@ impl Session {
         self.rebuild_registry();
         if media_changed {
             self.players.clear();
-            self.spawn_thumbs();
+            self.spawn_thumbs(false);
         }
         self.mark_dirty();
         self.publish_event(&StateEvent::ShowLoaded {
@@ -1011,9 +1445,11 @@ impl Session {
     /// Vignettes en tâche de fond (jamais sur le tick). Une génération déjà
     /// en cours ⇒ coalescence : la génération suivante (rescan, nouveau
     /// show) rattrapera ce qui n'est pas frais — pas de threads empilés.
-    fn spawn_thumbs(&self) {
+    /// `purge` : vide d'abord le cache (chargement de show — les ids u32 se
+    /// recouvrent entre shows).
+    fn spawn_thumbs(&self, purge: bool) {
         let media = self.show.media.clone();
-        if media.is_empty() {
+        if media.is_empty() && !purge {
             return;
         }
         if self
@@ -1030,6 +1466,9 @@ impl Session {
         let spawned = std::thread::Builder::new()
             .name("conduite-thumbs".into())
             .spawn(move || {
+                if purge {
+                    purge_thumbs(&thumbs_dir);
+                }
                 let report = conduite_media_library::generate_thumbs(&media, &media_dir, &thumbs_dir);
                 running.store(false, Ordering::SeqCst);
                 info!(target: "app::session", ?report, "vignettes générées");
@@ -1846,16 +2285,21 @@ fn try_backups(dirs: &Dirs, name: &str) -> Option<LoadedShow> {
 
 /// Signale au démarrage un fichier de récupération post-panic plus récent
 /// que le show courant (log ERROR : visible console + UI web), et élague
-/// les `recover-*.json` au-delà de [`RECOVER_KEEP`].
-fn notice_recover_files(shows_dir: &std::path::Path, show_dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(shows_dir) else { return };
+/// les `recover-*.json` au-delà de [`RECOVER_KEEP`]. Retourne
+/// `(chemin, horodatage)` du fichier proposé à la restauration (contrat
+/// `StateEvent::RecoveryAvailable` / `Command::RecoveryLoad`).
+fn notice_recover_files(
+    shows_dir: &std::path::Path,
+    show_dir: &std::path::Path,
+) -> Option<(String, String)> {
+    let entries = std::fs::read_dir(shows_dir).ok()?;
     let mut recovers: Vec<String> = entries
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
         .filter(|n| n.starts_with("recover-") && n.ends_with(".json"))
         .collect();
     if recovers.is_empty() {
-        return;
+        return None;
     }
     recovers.sort(); // horodaté : ordre chrono
     // Élagage : garder les RECOVER_KEEP plus récents.
@@ -1865,7 +2309,8 @@ fn notice_recover_files(shows_dir: &std::path::Path, show_dir: &std::path::Path)
             let _ = std::fs::remove_file(shows_dir.join(n));
         }
     }
-    let newest = shows_dir.join(recovers.last().map(String::as_str).unwrap_or_default());
+    let newest_name = recovers.last().cloned().unwrap_or_default();
+    let newest = shows_dir.join(&newest_name);
     let show_mtime = std::fs::metadata(show_dir.join(conduite_core::SHOW_FILE))
         .and_then(|m| m.modified())
         .ok();
@@ -1878,8 +2323,74 @@ fn notice_recover_files(shows_dir: &std::path::Path, show_dir: &std::path::Path)
     if newer {
         error!(target: "app::session", path = %newest.display(),
             "un fichier de RÉCUPÉRATION post-crash est plus récent que le \
-             show chargé — pour le récupérer : copier ce fichier comme \
-             show.json dans le dossier du show puis recharger");
+             show chargé — restauration proposée dans l'interface web");
+        // Horodatage lisible extrait du nom `recover-YYYYMMDD-HHMMSS.json`.
+        let timestamp = newest_name
+            .strip_prefix("recover-")
+            .and_then(|s| s.strip_suffix(".json"))
+            .unwrap_or(&newest_name)
+            .to_string();
+        return Some((newest.display().to_string(), timestamp));
+    }
+    None
+}
+
+/// Vide le cache de vignettes (fichiers seulement, best-effort).
+fn purge_thumbs(thumbs_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(thumbs_dir) else { return };
+    let mut removed = 0usize;
+    for e in entries.flatten() {
+        if e.path().is_file() && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        debug!(target: "app::session", removed, "cache de vignettes purgé");
+    }
+}
+
+/// Clé de coalescing d'undo : `Some((type, cible))` pour les opérations
+/// CONTINUES (update/drag), `None` pour les structurelles (add/remove) qui
+/// ne coalescent jamais.
+fn coalesce_key(op: &EditOp) -> Option<String> {
+    use EditOp::*;
+    Some(match op {
+        CornerSet { slice, index, .. } => format!("corner/{slice}/{index}"),
+        SliceUpdate { slice } => format!("slice/{}", slice.id),
+        CueUpdate { cue } => format!("cue/{}", cue.number.0),
+        CueUpdateState { number, state } => format!("cuestate/{}/{}", number.0, state.slice),
+        OutputUpdate { output } => format!("output/{}", output.id),
+        MediaUpdate { media } => format!("media/{}", media.id),
+        MaterialUpdate { material } => format!("material/{}", material.id),
+        ModulatorUpdate { modulator } => format!("mod/{}", modulator.id),
+        RouteUpdate { route } => format!("route/{}", route.id),
+        SettingsUpdate { .. } => "settings".to_string(),
+        PatchArtnetUpdate { index, .. } => format!("patch/artnet/{index}"),
+        PatchMidiUpdate { index, .. } => format!("patch/midi/{index}"),
+        PatchOscOutSet { .. } => "patch/oscout".to_string(),
+        ShowRename { .. } => "rename".to_string(),
+        _ => return None,
+    })
+}
+
+/// Applique les gabarits de cue (`ShowSettings.cue_defaults`) à une NOUVELLE
+/// cue : seuls les champs restés à leur valeur de type par défaut sont
+/// remplacés (une valeur posée explicitement par l'UI est respectée).
+fn apply_cue_defaults(cue: &mut Cue, defaults: &CueDefaults) {
+    if let Some(t) = &defaults.transition {
+        if cue.transition == Transition::default() {
+            cue.transition = t.clone();
+        }
+    }
+    if let Some(f) = defaults.follow {
+        if matches!(cue.follow, FollowMode::Manual) {
+            cue.follow = f;
+        }
+    }
+    if let Some(c) = &defaults.color {
+        if cue.color.is_none() {
+            cue.color = Some(c.clone());
+        }
     }
 }
 
@@ -1990,6 +2501,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dirs.base);
     }
 
+    /// Coalescing d'undo : les updates continus portent une clé (type,
+    /// cible), les add/remove jamais.
+    #[test]
+    fn coalesce_keys_continuous_ops_only() {
+        use conduite_core::Slice;
+        let slice = Slice {
+            id: 3,
+            name: "s".into(),
+            output: 1,
+            corners: Slice::default_corners(),
+            src: conduite_core::Rect::full(),
+            z: 0,
+            enabled: true,
+        };
+        assert_eq!(
+            coalesce_key(&EditOp::CornerSet { slice: 3, index: 2, x: 0.1, y: 0.2 }),
+            Some("corner/3/2".to_string())
+        );
+        assert_eq!(
+            coalesce_key(&EditOp::SliceUpdate { slice: slice.clone() }),
+            Some("slice/3".to_string())
+        );
+        // Deux coins différents = deux gestes distincts.
+        assert_ne!(
+            coalesce_key(&EditOp::CornerSet { slice: 3, index: 0, x: 0.0, y: 0.0 }),
+            coalesce_key(&EditOp::CornerSet { slice: 3, index: 1, x: 0.0, y: 0.0 })
+        );
+        // Structurel : jamais coalescé.
+        assert_eq!(coalesce_key(&EditOp::SliceAdd { slice: slice.clone() }), None);
+        assert_eq!(coalesce_key(&EditOp::SliceRemove { id: 3 }), None);
+    }
+
+    /// Gabarits de cue : appliqués seulement aux champs restés aux défauts.
+    #[test]
+    fn cue_defaults_fill_only_type_defaults() {
+        use conduite_core::{Curve, CueTriggers, FollowMode, Transition, TransitionKind};
+        let defaults = CueDefaults {
+            transition: Some(Transition {
+                kind: TransitionKind::Crossfade,
+                dur_s: 2.0,
+                curve: Curve::SCurve,
+            }),
+            follow: Some(FollowMode::Wait(5.0)),
+            color: Some("#ff0000".to_string()),
+        };
+        let mut fresh = Cue {
+            number: CueNumber(1000),
+            name: "n".into(),
+            color: None,
+            notes: String::new(),
+            armed: true,
+            transition: Transition::default(),
+            follow: FollowMode::Manual,
+            goto_after: None,
+            states: Vec::new(),
+            mod_routes: Vec::new(),
+            triggers: CueTriggers::default(),
+        };
+        let mut custom = fresh.clone();
+        custom.transition.dur_s = 9.0;
+        custom.transition.kind = TransitionKind::ThroughBlack;
+        custom.follow = FollowMode::AfterMedia;
+        custom.color = Some("#123456".to_string());
+
+        apply_cue_defaults(&mut fresh, &defaults);
+        assert_eq!(fresh.transition.dur_s, 2.0, "gabarit appliqué");
+        assert!(matches!(fresh.follow, FollowMode::Wait(_)));
+        assert_eq!(fresh.color.as_deref(), Some("#ff0000"));
+
+        apply_cue_defaults(&mut custom, &defaults);
+        assert_eq!(custom.transition.dur_s, 9.0, "valeur explicite respectée");
+        assert!(matches!(custom.follow, FollowMode::AfterMedia));
+        assert_eq!(custom.color.as_deref(), Some("#123456"));
+    }
+
     /// Les `recover-*.json` sont élagués au-delà de [`RECOVER_KEEP`].
     #[test]
     fn recover_files_are_pruned() {
@@ -2008,6 +2594,23 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with("recover-"))
             .count();
         assert_eq!(count, RECOVER_KEEP, "élagage aux {RECOVER_KEEP} plus récents");
+        let _ = std::fs::remove_dir_all(&dirs.base);
+    }
+
+    /// Un recover plus récent que le show est PROPOSÉ (contrat
+    /// RecoveryAvailable) ; un recover plus ancien ne l'est pas.
+    #[test]
+    fn recover_newer_than_show_is_proposed() {
+        let dirs = test_dirs("propose");
+        let dir = dirs.show_dir("gala");
+        conduite_core::save_show_atomic(&dir, &Show::new("Gala")).expect("save");
+        // Recover écrit APRÈS le show : mtime plus récent ⇒ proposé.
+        std::fs::write(dirs.shows.join("recover-20200101-000000.json"), b"{}")
+            .expect("write");
+        let proposed = notice_recover_files(&dirs.shows, &dir);
+        let (path, ts) = proposed.expect("recover plus récent proposé");
+        assert!(path.ends_with("recover-20200101-000000.json"));
+        assert_eq!(ts, "20200101-000000");
         let _ = std::fs::remove_dir_all(&dirs.base);
     }
 }

@@ -38,6 +38,28 @@ fn proto_sig(settings: &ShowSettings, patch: &PatchTable) -> ProtoSig {
     }
 }
 
+/// Statut réel de chaque protocole, publié dans `runtime.protocols`
+/// (contrat : `"ok" | "inactif" | "erreur: <msg>"`). Le Patch de la webui
+/// affiche l'état RÉEL, plus jamais le port configuré d'un bind raté.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolStatus {
+    pub osc_in: String,
+    pub osc_out: String,
+    pub artnet: String,
+    pub midi: String,
+}
+
+impl Default for ProtocolStatus {
+    fn default() -> Self {
+        ProtocolStatus {
+            osc_in: "inactif".to_string(),
+            osc_out: "inactif".to_string(),
+            artnet: "inactif".to_string(),
+            midi: "inactif".to_string(),
+        }
+    }
+}
+
 /// L'ensemble des surfaces actives. Drop = arrêt propre de tous les threads.
 pub struct Protocols {
     cmd_tx: Sender<(Source, Command)>,
@@ -47,6 +69,8 @@ pub struct Protocols {
     artnet: Option<(ArtnetNode, Sender<PatchTable>)>,
     /// Configuration réseau des surfaces vivantes (None avant le 1er spawn).
     sig: Option<ProtoSig>,
+    /// Statut réel par protocole (mis à jour au respawn + événements MIDI).
+    status: ProtocolStatus,
 }
 
 impl Protocols {
@@ -63,9 +87,15 @@ impl Protocols {
             midi: None,
             artnet: None,
             sig: None,
+            status: ProtocolStatus::default(),
         };
         p.respawn(settings, patch);
         p
+    }
+
+    /// Statut réel courant des protocoles (contrat `runtime.protocols`).
+    pub fn status(&self) -> &ProtocolStatus {
+        &self.status
     }
 
     /// Respawn uniquement si la configuration réseau a changé — évite de
@@ -95,24 +125,42 @@ impl Protocols {
         // --- OSC entrant.
         let bind: SocketAddr = SocketAddr::from(([0, 0, 0, 0], settings.osc_in_port));
         match OscServer::spawn(bind, self.cmd_tx.clone()) {
-            Ok(handle) => self.osc_in = Some(handle),
-            Err(e) => warn!(target: "app::protocols", port = settings.osc_in_port, error = %e,
-                "serveur OSC impossible (port occupé ?) — OSC entrant inactif"),
+            Ok(handle) => {
+                self.osc_in = Some(handle);
+                self.status.osc_in = "ok".to_string();
+            }
+            Err(e) => {
+                warn!(target: "app::protocols", port = settings.osc_in_port, error = %e,
+                    "serveur OSC impossible (port occupé ?) — OSC entrant inactif");
+                self.status.osc_in =
+                    format!("erreur: bind du port {} impossible ({e})", settings.osc_in_port);
+            }
         }
 
         // --- Feedback OSC sortant (si une cible est configurée).
+        self.status.osc_out = "inactif".to_string();
         if let Some(cfg) = &patch.osc_out {
             match resolve_host(&cfg.host, cfg.port) {
                 Some(target) => {
                     let (fb_tx, fb_rx) = crossbeam_channel::unbounded::<FeedbackEvent>();
                     match OscFeedback::spawn(target, fb_rx) {
-                        Ok(handle) => self.feedback = Some((handle, fb_tx)),
-                        Err(e) => warn!(target: "app::protocols", %target, error = %e,
-                            "feedback OSC impossible"),
+                        Ok(handle) => {
+                            self.feedback = Some((handle, fb_tx));
+                            self.status.osc_out = "ok".to_string();
+                        }
+                        Err(e) => {
+                            warn!(target: "app::protocols", %target, error = %e,
+                                "feedback OSC impossible");
+                            self.status.osc_out = format!("erreur: {e}");
+                        }
                     }
                 }
-                None => warn!(target: "app::protocols", host = %cfg.host, port = cfg.port,
-                    "hôte de feedback OSC irrésoluble"),
+                None => {
+                    warn!(target: "app::protocols", host = %cfg.host, port = cfg.port,
+                        "hôte de feedback OSC irrésoluble");
+                    self.status.osc_out =
+                        format!("erreur: hôte {} irrésoluble", cfg.host);
+                }
             }
         }
 
@@ -135,8 +183,12 @@ impl Protocols {
         let hub = MidiHub::spawn(None, midi_tx);
         hub.set_bindings(patch.midi.clone());
         self.midi = Some(hub);
+        // MIDI : « inactif » tant qu'aucun périphérique n'est connecté ; le
+        // statut passe à « ok » / « erreur » au fil des HubEvent (drain).
+        self.status.midi = "inactif".to_string();
 
         // --- Art-Net (si activé).
+        self.status.artnet = "inactif".to_string();
         if settings.artnet_enabled {
             let (patch_tx, patch_rx) = crossbeam_channel::unbounded::<PatchTable>();
             let bind = SocketAddr::from(([0, 0, 0, 0], ARTNET_PORT));
@@ -150,9 +202,14 @@ impl Protocols {
                 Ok(node) => {
                     let _ = patch_tx.send(patch.clone());
                     self.artnet = Some((node, patch_tx));
+                    self.status.artnet = "ok".to_string();
                 }
-                Err(e) => warn!(target: "app::protocols", error = %e,
-                    "nœud Art-Net impossible (port 6454 occupé ?)"),
+                Err(e) => {
+                    warn!(target: "app::protocols", error = %e,
+                        "nœud Art-Net impossible (port 6454 occupé ?)");
+                    self.status.artnet =
+                        format!("erreur: bind du port {ARTNET_PORT} impossible ({e})");
+                }
             }
         }
 
@@ -200,18 +257,22 @@ impl Protocols {
         }
     }
 
-    /// Draine les événements du hub MIDI vers le canal d'événements UI.
-    pub fn drain_midi_events(&self, events_tx: &broadcast::Sender<Value>) {
+    /// Draine les événements du hub MIDI vers le canal d'événements UI
+    /// (et met à jour le statut réel du protocole MIDI).
+    pub fn drain_midi_events(&mut self, events_tx: &broadcast::Sender<Value>) {
         let Some(hub) = &self.midi else { return };
         let rx = hub.events();
         while let Ok(ev) = rx.try_recv() {
             let payload = match ev {
                 HubEvent::Connected { port } => {
                     info!(target: "app::protocols", %port, "MIDI connecté");
+                    self.status.midi = "ok".to_string();
                     json!({"type": "midi_connected", "port": port})
                 }
                 HubEvent::Disconnected => {
                     warn!(target: "app::protocols", "MIDI déconnecté (retry en cours)");
+                    self.status.midi =
+                        "erreur: périphérique déconnecté (reconnexion en cours)".to_string();
                     json!({"type": "midi_disconnected"})
                 }
                 HubEvent::Learned(binding) => {

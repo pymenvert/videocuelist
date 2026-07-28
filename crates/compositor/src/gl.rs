@@ -1,16 +1,23 @@
 //! Implémentation GL du [`Compositor`] (glow). Aucune fenêtre ici : le
 //! contexte est injecté par `app` et supposé courant à chaque appel.
 //!
-//! Perf : textures persistantes, buffers réutilisés, uniform locations mises
-//! en cache — zéro allocation dans `render_output` en régime établi.
+//! Perf : textures persistantes (stockage immuable `glTexStorage2D` quand
+//! disponible), buffers réutilisés, uniform locations mises en cache — zéro
+//! allocation dans `render_output` en régime établi. Upload vidéo par PBO
+//! persistant mappé (fences par tranche) avec replis orphaning puis copie
+//! synchrone ; frames BGRA acceptées telles quelles (`GL_BGRA`, format natif
+//! Windows) sur GL desktop. Latence de présentation bornée par fences
+//! ([`MAX_FRAMES_IN_FLIGHT`], métrique [`Compositor::frames_in_flight`]).
+//! Chaque capacité est détectée à l'init ([`caps_from`], pur et testé) et
+//! chaque chemin garde son repli.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use glow::HasContext;
 
 use conduite_core::{MaterialId, ParamValue, PatternKind, SliceId};
-use conduite_engine::FrameRgba;
+use conduite_engine::{FrameRgba, PixelOrder};
 use conduite_isf::IsfSources;
 
 use crate::cache::ProgramCache;
@@ -27,10 +34,61 @@ type GlFramebuffer = <Gl as HasContext>::Framebuffer;
 type GlVertexArray = <Gl as HasContext>::VertexArray;
 type GlUniformLocation = <Gl as HasContext>::UniformLocation;
 type GlBuffer = <Gl as HasContext>::Buffer;
+type GlFence = <Gl as HasContext>::Fence;
 
 /// Taille par défaut du rendu ISF quand `RENDERSIZE` n'a pas (encore) été
 /// fourni par `app`.
 const DEFAULT_MATERIAL_SIZE: (u32, u32) = (1280, 720);
+
+/// Tranches du ring de PBO persistants d'upload (une frame en écriture, une
+/// en transfert driver, une de marge).
+const UPLOAD_RING_SLOTS: usize = 3;
+
+/// Rendus vers une fenêtre de sortie autorisés « en vol » avant d'attendre
+/// le GPU : borne la latence cue→écran à ~2 frames (pattern mpv).
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Attente unitaire sur une fence (2 ms) et nombre maximal d'itérations —
+/// au pire ~16 ms puis on abandonne (jamais de gel du thread de rendu).
+const FENCE_WAIT_NS: i32 = 2_000_000;
+const FENCE_WAIT_TRIES: u32 = 8;
+
+/// Capacités GL détectées à l'init (pur : décision testée sans contexte).
+#[derive(Debug, Clone, Copy)]
+struct GlCaps {
+    /// `GL_BGRA` accepté comme format client d'upload (GL desktop ; absent
+    /// du cœur GLES 3.0 → on reste en RGBA sur ES).
+    bgra_upload: bool,
+    /// `glTexStorage2D` (stockage immuable : anti-fragmentation driver sur
+    /// les longues sessions) — GL ≥ 4.2 / ARB_texture_storage / GLES ≥ 3.0.
+    tex_storage: bool,
+    /// `glBufferStorage` + mapping persistant — GL ≥ 4.4 /
+    /// ARB_buffer_storage / GLES + EXT_buffer_storage.
+    buffer_storage: bool,
+    /// Objets de synchronisation (`glFenceSync`) — GL ≥ 3.2 / GLES ≥ 3.0.
+    fences: bool,
+}
+
+/// Décision de capacités à partir de la version et des extensions (pur).
+fn caps_from(major: u32, minor: u32, embedded: bool, has_ext: &dyn Fn(&str) -> bool) -> GlCaps {
+    let ver = (major, minor);
+    if embedded {
+        GlCaps {
+            bgra_upload: false,
+            tex_storage: ver >= (3, 0),
+            buffer_storage: has_ext("GL_EXT_buffer_storage"),
+            fences: ver >= (3, 0),
+        }
+    } else {
+        GlCaps {
+            // Format client GL_BGRA : présent en GL desktop depuis 1.2.
+            bgra_upload: true,
+            tex_storage: ver >= (4, 2) || has_ext("GL_ARB_texture_storage"),
+            buffer_storage: ver >= (4, 4) || has_ext("GL_ARB_buffer_storage"),
+            fences: ver >= (3, 2) || has_ext("GL_ARB_sync"),
+        }
+    }
+}
 
 /// Texture 2D RGBA8 persistante.
 struct Tex2d {
@@ -54,15 +112,52 @@ struct MaterialSlot {
     uniforms: Vec<(String, ParamValue)>,
 }
 
-/// Ring de 2 PBO `GL_PIXEL_UNPACK_BUFFER` : l'upload d'une frame passe par
-/// un buffer orphané puis rempli (`glBufferData(NULL)` + `glBufferSubData`),
-/// et `glTexSubImage2D` lit depuis le PBO — le transfert vers la texture
-/// devient asynchrone côté driver au lieu d'une copie client synchrone.
-/// Disponible en GL 3.3 core ET GLES 3.0.
-struct UploadRing {
-    bufs: [GlBuffer; 2],
-    /// Index du PBO utilisé pour le prochain upload.
+/// Pointeur vers la zone mappée en persistant d'un PBO. La mémoire
+/// appartient au buffer GL (valide tant que le buffer vit, libérée par
+/// `glDeleteBuffers`) et n'est écrite que depuis le thread de rendu, contexte
+/// courant — le marquage Send/Sync ne fait que préserver les auto-traits du
+/// `Compositor`.
+struct MappedPtr(*mut u8);
+// SAFETY : voir ci-dessus — usage confiné au thread qui détient le contexte.
+unsafe impl Send for MappedPtr {}
+unsafe impl Sync for MappedPtr {}
+
+/// Ring de PBO persistant mappé (`ARB_buffer_storage`) : un seul buffer de
+/// [`UPLOAD_RING_SLOTS`] tranches, mappé UNE FOIS en écriture
+/// (`MAP_PERSISTENT_BIT | MAP_COHERENT_BIT`). La frame est copiée dans la
+/// tranche libre (mémoire visible GPU, zéro allocation driver), puis
+/// `glTexSubImage2D` lit depuis l'offset ; une fence par tranche garantit
+/// que le driver a fini avant réécriture.
+///
+/// NOTE (chemin restant, non fait) : faire écrire le thread LECTEUR ffmpeg
+/// directement dans la tranche mappée (`read_exact` pipe → mémoire visible
+/// GPU, ~1 memcpy de moins par frame) exigerait de casser le découplage
+/// actuel `BufferPool` → `FrameRing` → upload : le lecteur (crate engine,
+/// sans GL) devrait emprunter des tranches au compositor et les rendre
+/// synchronisées par fence à travers `app`, y compris pendant seek/replays
+/// où les frames en vol sont jetées. C'est une refonte du contrat
+/// engine↔app↔compositor — à traiter avec le chantier HAP natif, qui
+/// réécrira de toute façon ce chemin (glCompressedTexSubImage2D + PBO).
+struct PersistentRing {
+    buf: GlBuffer,
+    ptr: MappedPtr,
+    slot_size: usize,
+    fences: [Option<GlFence>; UPLOAD_RING_SLOTS],
+    /// Tranche du prochain upload.
     next: usize,
+}
+
+/// Chemin d'upload d'un deck, par capacité décroissante :
+/// - `Persistent` : PBO persistant mappé + fences (GL 4.4 / ARB_buffer_storage) ;
+/// - `Orphan` : ring de 2 PBO orphanés (`glBufferData(NULL)` + copie), le
+///   chemin historique, disponible en GL 3.3 core ET GLES 3.0.
+enum UploadRing {
+    Persistent(PersistentRing),
+    Orphan {
+        bufs: [GlBuffer; 2],
+        /// Index du PBO utilisé pour le prochain upload.
+        next: usize,
+    },
 }
 
 /// Double PBO `GL_PIXEL_PACK_BUFFER` pour la lecture préview : `glReadPixels`
@@ -125,6 +220,7 @@ struct CompositeLocs {
 pub struct Compositor {
     gl: Arc<Gl>,
     glsl: GlslVersion,
+    caps: GlCaps,
     composite: GlProgram,
     locs: CompositeLocs,
     /// VAO vide requis en core profile pour dessiner via `gl_VertexID`.
@@ -139,10 +235,21 @@ pub struct Compositor {
     readbacks: HashMap<u32, ReadbackChannel>,
     /// Création de PBO en échec : replis synchrones, loggé une seule fois.
     pbo_broken: bool,
+    /// Création de PBO persistant en échec : repli orphané, loggé une fois.
+    persistent_pbo_broken: bool,
     /// Framebuffer cible courant (None = framebuffer par défaut).
     current_target: Option<GlFramebuffer>,
     /// Scratch de tri par z, réutilisé chaque frame.
     z_indices: Vec<usize>,
+    /// Fences des rendus de sortie soumis, plus ancien en tête (borne la
+    /// latence de présentation à [`MAX_FRAMES_IN_FLIGHT`]).
+    frame_fences: VecDeque<GlFence>,
+    /// `glFenceSync` en échec : limiteur désactivé, loggé une seule fois.
+    fence_broken: bool,
+    /// Dernière mesure du nombre de rendus en vol (métrique HUD santé).
+    frames_in_flight: usize,
+    /// Frame BGRA reçue sans support GL_BGRA : loggé une seule fois.
+    bgra_mismatch_logged: bool,
 }
 
 impl Compositor {
@@ -156,14 +263,26 @@ impl Compositor {
         } else {
             GlslVersion::Core330
         };
+        let extensions = gl.supported_extensions();
+        let caps = caps_from(version.major, version.minor, version.is_embedded, &|name| {
+            extensions.contains(name)
+        });
         tracing::info!(
             target: "compositor",
             major = version.major,
             minor = version.minor,
             embedded = version.is_embedded,
             ?glsl,
+            bgra = caps.bgra_upload,
+            tex_storage = caps.tex_storage,
+            buffer_storage = caps.buffer_storage,
+            fences = caps.fences,
             "initialisation du compositor"
         );
+        // Format natif Windows : demande à ffmpeg de sortir du BGRA (upload
+        // GL sans swizzle driver). Sur GLES, GL_BGRA n'existe pas en cœur :
+        // on reste en RGBA. Chaque frame porte son ordre — pas de course.
+        conduite_engine::set_decode_bgra(caps.bgra_upload);
 
         let composite = link_program(
             &gl,
@@ -200,11 +319,12 @@ impl Compositor {
         }
 
         let quad_vao = unsafe { gl.create_vertex_array() }.map_err(CompositorError::Init)?;
-        let black_tex = create_texture_rgba(&gl, 1, 1, Some(&[0, 0, 0, 255]))?;
+        let black_tex = create_texture_rgba(&gl, 1, 1, Some(&[0, 0, 0, 255]), caps.tex_storage)?;
 
         Ok(Self {
             gl,
             glsl,
+            caps,
             composite,
             locs,
             quad_vao,
@@ -214,8 +334,13 @@ impl Compositor {
             preview: None,
             readbacks: HashMap::new(),
             pbo_broken: false,
+            persistent_pbo_broken: false,
             current_target: None,
             z_indices: Vec::with_capacity(32),
+            frame_fences: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 1),
+            fence_broken: false,
+            frames_in_flight: 0,
+            bgra_mismatch_logged: false,
         })
     }
 
@@ -230,7 +355,7 @@ impl Compositor {
         let entry = self.slices.entry(slice).or_default();
         for deck in &mut entry.decks {
             if deck.video.is_none() {
-                match create_texture_rgba(&self.gl, 1, 1, Some(&[0, 0, 0, 255])) {
+                match create_texture_rgba(&self.gl, 1, 1, Some(&[0, 0, 0, 255]), self.caps.tex_storage) {
                     Ok(id) => deck.video = Some(Tex2d { id, w: 1, h: 1 }),
                     Err(e) => {
                         tracing::error!(target: "compositor", slice, %e, "création de texture");
@@ -241,10 +366,12 @@ impl Compositor {
     }
 
     /// Upload d'une frame décodée dans la texture du deck. La texture est
-    /// réutilisée et réallouée seulement si les dimensions changent. Le
-    /// chemin nominal passe par un ring de 2 PBO orphanés (transfert
-    /// asynchrone côté driver, pas de copie client bloquante) ; repli en
-    /// `glTexSubImage2D` direct si les PBO sont indisponibles.
+    /// réutilisée et recréée seulement si les dimensions changent (stockage
+    /// immuable `glTexStorage2D` quand disponible). Chemins d'upload, par
+    /// capacité décroissante : ring de 3 tranches de PBO persistant mappé +
+    /// fences (copie directe en mémoire visible GPU), ring de 2 PBO orphanés,
+    /// `glTexSubImage2D` direct. Le format client suit l'ordre de canaux de
+    /// la frame (`GL_BGRA` natif Windows quand le moteur décode en BGRA).
     pub fn upload_frame(&mut self, slice: SliceId, deck: DeckSlot, f: &FrameRgba) {
         let expected = (f.width as usize) * (f.height as usize) * 4;
         if f.width == 0 || f.height == 0 || f.data.len() < expected {
@@ -255,6 +382,22 @@ impl Compositor {
             );
             return;
         }
+        let src_format = match f.pixel_order() {
+            PixelOrder::Bgra if self.caps.bgra_upload => glow::BGRA,
+            PixelOrder::Bgra => {
+                // Ne devrait pas arriver : le moteur ne produit du BGRA que
+                // si ce compositor l'a activé. Canaux permutés plutôt que rien.
+                if !self.bgra_mismatch_logged {
+                    self.bgra_mismatch_logged = true;
+                    tracing::error!(
+                        target: "compositor",
+                        "frame BGRA sans support GL_BGRA : upload en RGBA (canaux permutés)"
+                    );
+                }
+                glow::RGBA
+            }
+            PixelOrder::Rgba => glow::RGBA,
+        };
         self.ensure_slice_textures(slice);
         let gl = &self.gl;
         let Some(res) = self.slices.get_mut(&slice) else {
@@ -264,65 +407,106 @@ impl Compositor {
         let Some(tex) = deck_res.video.as_mut() else {
             return; // création ratée, déjà loggé
         };
+
+        if tex.w != f.width || tex.h != f.height {
+            // Dimensions changées : chemin rare. Le stockage étant immuable
+            // (tex storage), on RECRÉE la texture ; le ring d'upload est
+            // libéré (tranches dimensionnées pour l'ancienne taille).
+            if let Some(ring) = deck_res.upload.take() {
+                release_upload_ring(gl, ring);
+            }
+            match create_texture_rgba(gl, f.width, f.height, None, self.caps.tex_storage) {
+                Ok(id) => {
+                    unsafe { gl.delete_texture(tex.id) };
+                    *tex = Tex2d { id, w: f.width, h: f.height };
+                }
+                Err(e) => {
+                    tracing::error!(target: "compositor", slice, %e, "recréation de texture");
+                    return;
+                }
+            }
+        }
+
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex.id));
-            if tex.w != f.width || tex.h != f.height {
-                // Réallocation (dimensions changées) : chemin rare, direct.
-                gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::RGBA8 as i32,
-                    f.width as i32,
-                    f.height as i32,
-                    0,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(&f.data[..expected])),
-                );
-                tex.w = f.width;
-                tex.h = f.height;
-            } else if let Some(ring) =
-                ensure_upload_ring(gl, &mut deck_res.upload, &mut self.pbo_broken)
-            {
-                // Chemin nominal : PBO orphané puis rempli, glTexSubImage2D
-                // lit depuis le buffer — le transfert devient asynchrone.
-                let buf = ring.bufs[ring.next];
-                ring.next ^= 1;
-                gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(buf));
-                // Orphaning : stockage neuf sans attendre le transfert du
-                // cycle précédent (le driver recycle en interne).
-                gl.buffer_data_size(
-                    glow::PIXEL_UNPACK_BUFFER,
-                    expected as i32,
-                    glow::STREAM_DRAW,
-                );
-                gl.buffer_sub_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, 0, &f.data[..expected]);
-                gl.tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    f.width as i32,
-                    f.height as i32,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::BufferOffset(0),
-                );
-                gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
-            } else {
-                // Repli sans PBO : copie client synchrone (comportement
-                // historique, toujours correct).
-                gl.tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    f.width as i32,
-                    f.height as i32,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(&f.data[..expected])),
-                );
+            match ensure_upload_ring(
+                gl,
+                &self.caps,
+                &mut deck_res.upload,
+                &mut self.pbo_broken,
+                &mut self.persistent_pbo_broken,
+                expected,
+            ) {
+                Some(UploadRing::Persistent(ring)) => {
+                    // Chemin premium : copie directe dans la tranche mappée
+                    // (mémoire visible GPU), fence par tranche.
+                    let slot = ring.next;
+                    ring.next = (slot + 1) % UPLOAD_RING_SLOTS;
+                    if let Some(fence) = ring.fences[slot].take() {
+                        wait_fence_bounded(gl, fence);
+                    }
+                    std::ptr::copy_nonoverlapping(
+                        f.data.as_ptr(),
+                        ring.ptr.0.add(slot * ring.slot_size),
+                        expected,
+                    );
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(ring.buf));
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        f.width as i32,
+                        f.height as i32,
+                        src_format,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::BufferOffset((slot * ring.slot_size) as u32),
+                    );
+                    ring.fences[slot] = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).ok();
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+                }
+                Some(UploadRing::Orphan { bufs, next }) => {
+                    // PBO orphané puis rempli, glTexSubImage2D lit depuis le
+                    // buffer — le transfert devient asynchrone.
+                    let buf = bufs[*next];
+                    *next ^= 1;
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(buf));
+                    // Orphaning : stockage neuf sans attendre le transfert du
+                    // cycle précédent (le driver recycle en interne).
+                    gl.buffer_data_size(
+                        glow::PIXEL_UNPACK_BUFFER,
+                        expected as i32,
+                        glow::STREAM_DRAW,
+                    );
+                    gl.buffer_sub_data_u8_slice(glow::PIXEL_UNPACK_BUFFER, 0, &f.data[..expected]);
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        f.width as i32,
+                        f.height as i32,
+                        src_format,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::BufferOffset(0),
+                    );
+                    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+                }
+                None => {
+                    // Repli sans PBO : copie client synchrone (comportement
+                    // historique, toujours correct).
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        f.width as i32,
+                        f.height as i32,
+                        src_format,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(&f.data[..expected])),
+                    );
+                }
             }
             gl.bind_texture(glow::TEXTURE_2D, None);
         }
@@ -620,7 +804,61 @@ impl Compositor {
             gl.bind_vertex_array(None);
             gl.use_program(None);
         }
+        if self.current_target.is_none() {
+            self.limit_frame_latency();
+        }
         Ok(())
+    }
+
+    /// Borne la latence de présentation : une fence par rendu vers une
+    /// fenêtre de sortie ; au-delà de [`MAX_FRAMES_IN_FLIGHT`] rendus non
+    /// terminés par le GPU, on attend (court, borné) le plus ancien. Sans
+    /// cela, un driver peut mettre plusieurs frames en file et la latence
+    /// cue→écran dérive. Pattern mpv. No-op si les fences sont indisponibles.
+    fn limit_frame_latency(&mut self) {
+        if self.fence_broken || !self.caps.fences {
+            return;
+        }
+        let gl = &self.gl;
+        unsafe {
+            match gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                Ok(fence) => self.frame_fences.push_back(fence),
+                Err(e) => {
+                    self.fence_broken = true;
+                    tracing::warn!(
+                        target: "compositor",
+                        %e,
+                        "glFenceSync indisponible, limiteur de latence désactivé"
+                    );
+                    return;
+                }
+            }
+            // Purge non bloquante des rendus déjà terminés.
+            while let Some(&fence) = self.frame_fences.front() {
+                match gl.client_wait_sync(fence, 0, 0) {
+                    glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED | glow::WAIT_FAILED => {
+                        gl.delete_sync(fence);
+                        self.frame_fences.pop_front();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        // Trop de rendus en vol : attente courte et bornée du plus ancien.
+        while self.frame_fences.len() > MAX_FRAMES_IN_FLIGHT {
+            let Some(fence) = self.frame_fences.pop_front() else {
+                break;
+            };
+            wait_fence_bounded(&self.gl, fence);
+        }
+        self.frames_in_flight = self.frame_fences.len();
+    }
+
+    /// Nombre de rendus de sortie soumis au GPU et pas encore terminés à la
+    /// dernière mesure (0..=[`MAX_FRAMES_IN_FLIGHT`]) — métrique pour le HUD
+    /// santé. Toujours 0 si les fences sont indisponibles.
+    pub fn frames_in_flight(&self) -> usize {
+        self.frames_in_flight
     }
 
     /// Rend une mire plein cadre dans le framebuffer courant (calage global,
@@ -672,6 +910,9 @@ impl Compositor {
             gl.bind_vertex_array(None);
             gl.use_program(None);
         }
+        if self.current_target.is_none() {
+            self.limit_frame_latency();
+        }
         Ok(())
     }
 
@@ -689,7 +930,7 @@ impl Compositor {
             if let Some(old) = self.preview.take() {
                 release_target(&self.gl, old);
             }
-            self.preview = Some(create_target(&self.gl, w, h)?);
+            self.preview = Some(create_target(&self.gl, w, h, self.caps.tex_storage)?);
         }
         // self.preview vient d'être garanti ci-dessus.
         if let Some(t) = &self.preview {
@@ -915,6 +1156,7 @@ impl Compositor {
     ) -> Result<(), CompositorError> {
         // Emprunts disjoints : gl / slices / cache.
         let gl = &self.gl;
+        let tex_storage = self.caps.tex_storage;
         let Some(res) = self.slices.get_mut(&slice) else {
             return Ok(());
         };
@@ -948,7 +1190,7 @@ impl Compositor {
             if let Some(old) = slot.target.take() {
                 release_target(gl, old);
             }
-            slot.target = Some(create_target(gl, w, h)?);
+            slot.target = Some(create_target(gl, w, h, tex_storage)?);
         }
         let Some(target) = &slot.target else {
             return Ok(());
@@ -1099,11 +1341,16 @@ fn link_program(gl: &Gl, vertex: &str, fragment: &str) -> Result<GlProgram, Comp
 }
 
 /// Crée une texture RGBA8 (filtrage linéaire, clamp aux bords).
+/// `immutable` : stockage `glTexStorage2D` (1 niveau) — l'allocation est
+/// définitive, anti-fragmentation driver sur les sessions de 8 h ; la
+/// texture doit être RECRÉÉE pour changer de taille. `data` (optionnel) est
+/// interprété en RGBA.
 fn create_texture_rgba(
     gl: &Gl,
     w: u32,
     h: u32,
     data: Option<&[u8]>,
+    immutable: bool,
 ) -> Result<GlTexture, CompositorError> {
     unsafe {
         let tex = gl.create_texture().map_err(CompositorError::Resource)?;
@@ -1128,25 +1375,47 @@ fn create_texture_rgba(
             glow::TEXTURE_WRAP_T,
             glow::CLAMP_TO_EDGE as i32,
         );
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RGBA8 as i32,
-            w as i32,
-            h as i32,
-            0,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(data),
-        );
+        if immutable {
+            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w as i32, h as i32);
+            if let Some(data) = data {
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(data)),
+                );
+            }
+        } else {
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(data),
+            );
+        }
         gl.bind_texture(glow::TEXTURE_2D, None);
         Ok(tex)
     }
 }
 
 /// Crée une cible de rendu offscreen (FBO + texture couleur RGBA8).
-fn create_target(gl: &Gl, w: u32, h: u32) -> Result<RenderTarget, CompositorError> {
-    let tex_id = create_texture_rgba(gl, w, h, None)?;
+fn create_target(
+    gl: &Gl,
+    w: u32,
+    h: u32,
+    immutable: bool,
+) -> Result<RenderTarget, CompositorError> {
+    let tex_id = create_texture_rgba(gl, w, h, None, immutable)?;
     unsafe {
         let fbo = match gl.create_framebuffer() {
             Ok(f) => f,
@@ -1193,15 +1462,101 @@ fn release_slice(gl: &Gl, res: SliceRes) {
             unsafe { gl.delete_texture(tex.id) };
         }
         if let Some(ring) = deck.upload {
-            for buf in ring.bufs {
-                unsafe { gl.delete_buffer(buf) };
-            }
+            release_upload_ring(gl, ring);
         }
         if let Some(slot) = deck.material {
             if let Some(target) = slot.target {
                 release_target(gl, target);
             }
         }
+    }
+}
+
+/// Libère un ring d'upload (buffers + fences). Un PBO persistant mappé est
+/// démappé implicitement par sa suppression (spécification GL).
+fn release_upload_ring(gl: &Gl, ring: UploadRing) {
+    unsafe {
+        match ring {
+            UploadRing::Persistent(ring) => {
+                for fence in ring.fences.into_iter().flatten() {
+                    gl.delete_sync(fence);
+                }
+                gl.delete_buffer(ring.buf);
+            }
+            UploadRing::Orphan { bufs, .. } => {
+                for buf in bufs {
+                    gl.delete_buffer(buf);
+                }
+            }
+        }
+    }
+}
+
+/// Attend (borné) qu'une fence soit signalée, puis la supprime. Premier test
+/// à timeout 0 (cas nominal : déjà signalée), puis attentes courtes de
+/// [`FENCE_WAIT_NS`] avec flush ; après [`FENCE_WAIT_TRIES`] itérations on
+/// abandonne — jamais de gel du thread de rendu.
+fn wait_fence_bounded(gl: &Gl, fence: GlFence) {
+    unsafe {
+        let mut tries = 0u32;
+        loop {
+            let (flags, timeout) = if tries == 0 {
+                (0, 0)
+            } else {
+                (glow::SYNC_FLUSH_COMMANDS_BIT, FENCE_WAIT_NS)
+            };
+            match gl.client_wait_sync(fence, flags, timeout) {
+                glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => break,
+                glow::WAIT_FAILED => break, // erreur GL : ne pas boucler
+                _ => {
+                    tries += 1;
+                    if tries > FENCE_WAIT_TRIES {
+                        tracing::warn!(
+                            target: "compositor",
+                            "fence GPU toujours en attente après {} ms, poursuite",
+                            (FENCE_WAIT_NS as i64 * FENCE_WAIT_TRIES as i64) / 1_000_000
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        gl.delete_sync(fence);
+    }
+}
+
+/// Crée un ring de PBO persistant mappé : un buffer de
+/// `slot_size × UPLOAD_RING_SLOTS` octets en stockage immuable
+/// (`glBufferStorage`), mappé une fois en écriture persistante cohérente.
+fn create_persistent_ring(gl: &Gl, slot_size: usize) -> Result<PersistentRing, String> {
+    let total = slot_size
+        .checked_mul(UPLOAD_RING_SLOTS)
+        .filter(|t| *t <= i32::MAX as usize)
+        .ok_or_else(|| format!("taille de ring d'upload invalide ({slot_size} octets/tranche)"))?;
+    let flags = glow::MAP_WRITE_BIT | glow::MAP_PERSISTENT_BIT | glow::MAP_COHERENT_BIT;
+    unsafe {
+        let buf = gl.create_buffer()?;
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(buf));
+        gl.buffer_storage(glow::PIXEL_UNPACK_BUFFER, total as i32, None, flags);
+        let err = gl.get_error();
+        if err != glow::NO_ERROR {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+            gl.delete_buffer(buf);
+            return Err(format!("glBufferStorage : erreur GL 0x{err:x}"));
+        }
+        let ptr = gl.map_buffer_range(glow::PIXEL_UNPACK_BUFFER, 0, total as i32, flags);
+        gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+        if ptr.is_null() {
+            gl.delete_buffer(buf);
+            return Err("glMapBufferRange persistant : pointeur nul".into());
+        }
+        Ok(PersistentRing {
+            buf,
+            ptr: MappedPtr(ptr),
+            slot_size,
+            fences: std::array::from_fn(|_| None),
+            next: 0,
+        })
     }
 }
 
@@ -1219,20 +1574,49 @@ fn create_pbo_pair(gl: &Gl) -> Result<[GlBuffer; 2], String> {
     }
 }
 
-/// Garantit le ring de PBO d'upload d'un deck. Retourne `None` si la
-/// création a échoué (repli synchrone) ; l'échec n'est tenté qu'une fois par
-/// process (`broken`), pas de spam de log par frame.
+/// Garantit le ring de PBO d'upload d'un deck : persistant mappé si le
+/// contexte le permet (`buffer_storage` + fences), sinon paire orphanée.
+/// Retourne `None` si la création a échoué (repli synchrone) ; l'échec n'est
+/// tenté qu'une fois par process (`broken`), pas de spam de log par frame.
 fn ensure_upload_ring<'a>(
     gl: &Gl,
+    caps: &GlCaps,
     slot: &'a mut Option<UploadRing>,
     broken: &mut bool,
+    persistent_broken: &mut bool,
+    slot_size: usize,
 ) -> Option<&'a mut UploadRing> {
     if slot.is_none() && !*broken {
-        match create_pbo_pair(gl) {
-            Ok(bufs) => *slot = Some(UploadRing { bufs, next: 0 }),
-            Err(e) => {
-                *broken = true;
-                tracing::warn!(target: "compositor", %e, "PBO indisponibles, uploads synchrones");
+        if caps.buffer_storage && caps.fences && !*persistent_broken {
+            match create_persistent_ring(gl, slot_size) {
+                Ok(ring) => {
+                    tracing::debug!(
+                        target: "compositor",
+                        slot_size,
+                        "ring d'upload persistant mappé ({} tranches)",
+                        UPLOAD_RING_SLOTS
+                    );
+                    *slot = Some(UploadRing::Persistent(ring));
+                }
+                Err(e) => {
+                    // Sticky : plus de tentative persistante, mais le repli
+                    // orphané (ci-dessous) reste disponible.
+                    *persistent_broken = true;
+                    tracing::warn!(
+                        target: "compositor",
+                        %e,
+                        "PBO persistant indisponible, repli sur l'orphaning"
+                    );
+                }
+            }
+        }
+        if slot.is_none() {
+            match create_pbo_pair(gl) {
+                Ok(bufs) => *slot = Some(UploadRing::Orphan { bufs, next: 0 }),
+                Err(e) => {
+                    *broken = true;
+                    tracing::warn!(target: "compositor", %e, "PBO indisponibles, uploads synchrones");
+                }
             }
         }
     }
@@ -1262,4 +1646,60 @@ fn create_readback_channel(
         w,
         h,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_ext(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn caps_gl33_desktop_sans_extensions() {
+        // Cible minimale du produit : GL 3.3 core nu.
+        let c = caps_from(3, 3, false, &no_ext);
+        assert!(c.bgra_upload, "GL_BGRA est du GL desktop de base");
+        assert!(!c.tex_storage);
+        assert!(!c.buffer_storage);
+        assert!(c.fences, "sync objects depuis GL 3.2");
+    }
+
+    #[test]
+    fn caps_gl33_desktop_avec_extensions_arb() {
+        // Cas fréquent : driver GL 3.3 exposant les ARB modernes.
+        let has = |name: &str| {
+            matches!(name, "GL_ARB_texture_storage" | "GL_ARB_buffer_storage")
+        };
+        let c = caps_from(3, 3, false, &has);
+        assert!(c.tex_storage);
+        assert!(c.buffer_storage);
+    }
+
+    #[test]
+    fn caps_gl46_desktop_tout_en_version() {
+        let c = caps_from(4, 6, false, &no_ext);
+        assert!(c.bgra_upload && c.tex_storage && c.buffer_storage && c.fences);
+    }
+
+    #[test]
+    fn caps_gles30_jamais_de_bgra() {
+        // GLES 3.0 (Raspberry Pi) : GL_BGRA absent du cœur — RGBA conservé.
+        let c = caps_from(3, 0, true, &no_ext);
+        assert!(!c.bgra_upload);
+        assert!(c.tex_storage, "glTexStorage2D est du cœur GLES 3.0");
+        assert!(!c.buffer_storage);
+        assert!(c.fences);
+        // Même avec EXT_buffer_storage : BGRA reste exclu.
+        let c = caps_from(3, 1, true, &|n| n == "GL_EXT_buffer_storage");
+        assert!(!c.bgra_upload);
+        assert!(c.buffer_storage);
+    }
+
+    #[test]
+    fn caps_gles2_rien_de_moderne() {
+        let c = caps_from(2, 0, true, &no_ext);
+        assert!(!c.bgra_upload && !c.tex_storage && !c.buffer_storage && !c.fences);
+    }
 }

@@ -37,6 +37,15 @@ pub enum StateEvent {
     MasterChanged { value: f32 },
     /// Dead blackout posé/levé.
     DboChanged { active: bool },
+    /// Avertissement de conduite non bloquant (GO refusé par l'anti
+    /// double-GO, commande impossible…) — affiché par l'UI, throttlé côté
+    /// émetteur.
+    Warning { message: String },
+    /// Un fichier de récupération post-crash plus récent que le show chargé
+    /// existe : l'UI propose `Command::RecoveryLoad { path }` ou
+    /// `Command::RecoveryDismiss`. Émis au démarrage, et l'information reste
+    /// disponible dans `runtime.recovery` tant qu'elle n'est pas tranchée.
+    RecoveryAvailable { path: String, timestamp: String },
     /// Le zip de diagnostic est prêt (chemin expurgé, relatif ou `~`).
     DiagnosticReady { path: String },
 }

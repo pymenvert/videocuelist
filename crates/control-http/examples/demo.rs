@@ -34,6 +34,12 @@ fn main() {
         preview_rx,
         preview_b_rx,
         thumb_dir: std::env::temp_dir(),
+        about: json!({ "name": "Conduite", "version": "demo" }),
+        tick_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            conduite_control_http::epoch_ms(),
+        )),
+        version: "demo".to_string(),
+        early_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let handle = HttpServer::spawn("127.0.0.1:8787".parse().expect("addr"), deps).expect("spawn");
     println!("Démo : http://{}", handle.local_addr());

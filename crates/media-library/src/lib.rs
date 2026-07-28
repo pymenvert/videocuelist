@@ -21,8 +21,8 @@ pub use collect::{collect_show, CollectReport};
 pub use images::{load_image_rgba, ImageRgba};
 pub use probe::{probe_all, ProbeInfo};
 pub use scan::{
-    media_kind, reconcile, reconcile_materials, scan, scan_materials, MediaKind, IMAGE_EXTS,
-    MATERIAL_EXT, VIDEO_EXTS,
+    media_kind, reconcile, reconcile_materials, relocate_cascade, scan, scan_materials, MediaKind,
+    IMAGE_EXTS, MATERIAL_EXT, VIDEO_EXTS,
 };
 pub use thumbs::{
     ensure_thumb, ffmpeg_available, generate_thumbs, resolve_ffmpeg, thumb_path, ThumbReport,

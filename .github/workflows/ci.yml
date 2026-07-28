@@ -26,3 +26,13 @@ jobs:
         run: cargo build --workspace
       - name: Tests
         run: cargo test --workspace
+
+  # Conformité : licences des dépendances (allowlist deny.toml) + advisories
+  # RUSTSEC. Bloque toute dépendance copyleft ou vulnérable avant merge.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses advisories sources

@@ -36,7 +36,7 @@ Un show de démonstration est créé au premier lancement (mires, matériaux, un
    Numérotation décimale (1, 2, 2.5…) pour insérer sans renuméroter. Régler la
    **transition** d'entrée (cut, fondu, par le noir + durée + courbe) et le **follow**
    (manuel, à la fin du média, ou minuterie).
-5. **Patch** (si pilotage externe) : mapper MIDI (bouton *Learn*), patcher des canaux
+5. **Patch** (si pilotage externe) : ajouter des mappings MIDI, patcher des canaux
    Art-Net, relever les adresses OSC.
 6. **Mode Show** (Réglages) : verrouille toute l'édition pour le spectacle.
 
@@ -77,8 +77,9 @@ Compatible Chataigne, TouchOSC, Open Stage Control, Bitfocus Companion (module O
 
 ### MIDI
 
-- **Learn** dans l'onglet Patch : bouge le contrôleur, c'est mappé. Notes → commandes
+- Mapping dans l'onglet Patch (ajout manuel : canal, note/CC, cible). Notes → commandes
   (GO, DBO…), CC 7/14 bits → paramètres avec **soft-takeover** (pas de saut de valeur).
+  Le bouton *Learn* (mapper en bougeant le contrôleur) arrive dans une prochaine version.
 - **MIDI Show Control** : GO/STOP/RESUME/LOAD reçus d'une console lumière ou de QLab.
 
 ### Art-Net (port 6454)
@@ -96,8 +97,17 @@ Conduite/
 ├── shaders/          ← vos matériaux ISF (.fs)
 ├── shows/            ← vos conduites (JSON lisible + backups automatiques)
 ├── logs/             ← journaux horodatés
-└── config.toml       ← port HTTP, entrée audio… (créé au premier lancement)
+├── licenses/         ← licences : Conduite (MIT), FFmpeg, composants tiers
+├── LISEZMOI.txt      ← démarrage express (pare-feu, raccourcis)
+├── MANUEL.md         ← ce manuel
+└── config.toml       ← réglages machine (créé au premier lancement)
 ```
+
+`config.toml` (réglages machine, distincts des réglages du show) :
+`http_port` (défaut 9820), `http_bind` (défaut `0.0.0.0`), `audio_input`
+(nom du périphérique d'entrée pour la modulation audio, absent = désactivé),
+`last_show` (show chargé au démarrage), `target_fps` (cadence de rendu,
+défaut 60).
 
 Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 « Collecter le show » (Réglages) rassemble show + médias dans un dossier autonome.
@@ -108,8 +118,9 @@ Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
   multi-couches. H.264/HEVC fonctionnent aussi.
 - Un média manquant n'empêche jamais le show de se charger : il apparaît en damier
   + alerte rouge dans Médias (re-link possible).
-- Sauvegardes : autosave permanent + backups rotatifs dans `shows/backups/` ;
-  après un crash, un fichier de récupération est proposé.
+- Sauvegardes : autosave permanent + backups rotatifs dans le dossier du show
+  (`shows/<nom-du-show>/backups/`) ; après un crash, un fichier de
+  récupération est proposé au démarrage.
 - **Mode Show** avant le public : édition verrouillée, fermeture double-confirmée.
 - Les logs (`logs/`) horodatent tout : GO, erreurs, protocoles — utile au débrief.
 
@@ -120,8 +131,9 @@ Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 | Espace | GO (jamais dans un champ de saisie) |
 | B (maintenu) | Noir d'urgence (DBO) |
 | T | Tap tempo |
+| O | Notes de régie de la cue en standby |
 | Flèches | Nudge du coin sélectionné (Maj ×10, Alt ×0,1) |
-| 1–9 | Onglets |
+| 1–9, 0 | Onglets (0 = Réglages) |
 
 ## 10. Dépannage rapide
 

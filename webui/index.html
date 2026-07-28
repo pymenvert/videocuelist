@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0e1013">
 <title>Conduite — régie vidéo</title>
+<!-- favicon : pastille GO (SVG inline, aucune ressource externe) -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230e1013'/%3E%3Ccircle cx='32' cy='32' r='15' fill='%234da3ff'/%3E%3Cpath d='M27 24l12 8-12 8z' fill='%23071527'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
@@ -13,16 +15,17 @@
   <div id="brand" data-tip="Conduite — régie vidéo de spectacle">CONDUITE<span id="show-name"></span></div>
   <nav id="tabs" data-tip="Onglets — raccourcis clavier 1 à 9 (0 = Réglages)"></nav>
   <div id="top-right">
-    <span id="mode-badge" data-tip="Mode courant. Double-clic pour basculer Édition / Show (le mode Show verrouille toute édition).">ÉDITION</span>
-    <span id="clock" data-tip="Horloge locale">--:--:--</span>
+    <span id="mode-badge" role="button" tabindex="0" data-tip="Mode courant. Double-clic (ou Entrée) pour basculer Édition / Show (le mode Show verrouille toute édition).">ÉDITION</span>
   </div>
 </header>
 <main id="main"></main>
 <footer id="statusbar">
-  <span class="chip" id="foot-conn" data-tip="Liaison WebSocket avec le moteur">…</span>
-  <span id="foot-show" class="muted"></span>
+  <button id="warn-chip" class="hidden" data-tip="État du show : avertissements en cours (médias manquants, protocoles, écrans). Clic : détail et actions."></button>
+  <span id="sb-protos" data-tip="État réel des protocoles (détail dans l’onglet Patch)"></span>
   <span class="spacer"></span>
   <button id="update-badge" class="hidden" data-tip="Une nouvelle version est disponible — clic pour le détail (aucun téléchargement automatique)"></button>
+  <span id="sb-version" data-tip="Version de Conduite"></span>
+  <span id="clock" data-tip="Horloge locale">--:--:--</span>
 </footer>
 <div id="toasts" aria-live="polite"></div>
 <div id="tooltip" class="hidden" role="tooltip"></div>
