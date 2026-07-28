@@ -232,8 +232,6 @@ pub struct Session {
     h264_seen_clients: usize,
     /// Pas de nouvelle tentative de spawn avant cet instant (backoff).
     h264_retry_at: Option<Instant>,
-    /// Buffer réutilisé du flip vertical (glReadPixels sort bas→haut).
-    h264_flip: Vec<u8>,
     /// Throttle du warn de saturation du bus de commandes.
     last_cmd_warn: Option<Instant>,
     /// Une génération de vignettes est déjà en cours (coalescence).
@@ -359,7 +357,6 @@ impl Session {
             h264_cfg: (0, 0, 0),
             h264_seen_clients: 0,
             h264_retry_at: None,
-            h264_flip: Vec::new(),
             last_cmd_warn: None,
             thumbs_running: Arc::new(AtomicBool::new(false)),
             tick_ms: ch.tick_ms,
@@ -1969,8 +1966,8 @@ impl Session {
                 let got =
                     gfx.render_preview_into(0, w, h, slices, master, self.dbo_level, true, &mut buf);
                 if got {
-                    // La même frame RGBA nourrit l'encodeur H.264 (flip fait
-                    // dans feed_h264, push non bloquant côté engine).
+                    // La même frame RGBA nourrit l'encodeur H.264 (remise à
+                    // l'endroit par ffmpeg `-vf vflip`, push non bloquant).
                     self.feed_h264(&buf, w, h);
                     self.preview.submit(PreviewJob {
                         rgba: buf.clone(),
@@ -2068,7 +2065,15 @@ impl Session {
             }
             // Un spawn de process (~qq ms) sur le tick, au plus une fois par
             // connexion client (backoff sur échec) : acceptable, tracé.
-            match conduite_engine::PreviewEncoder::new(cfg.0, cfg.1, cfg.2) {
+            // `new_bottom_up` : les frames préview sortent du FBO lignes de
+            // bas en haut — ffmpeg les remet à l'endroit (`-vf vflip`), zéro
+            // memcpy côté thread de session.
+            match conduite_engine::PreviewEncoder::new_bottom_up(
+                cfg.0,
+                cfg.1,
+                cfg.2,
+                conduite_engine::PixelOrder::Rgba,
+            ) {
                 Ok(enc) => {
                     self.h264_enc = Some(enc);
                     self.h264_cfg = cfg;
@@ -2104,25 +2109,19 @@ impl Session {
         }
     }
 
-    /// Alimente l'encodeur H.264 avec la frame préview RGBA (lignes bas→haut
-    /// telles que lues du FBO : retournées ici dans un buffer réutilisé —
-    /// ~1 Mo memcpy en 640×360, puis `push_frame` non bloquant côté engine).
+    /// Alimente l'encodeur H.264 avec la frame préview RGBA telle que lue du
+    /// FBO (lignes bas→haut) : l'encodeur a été lancé avec `-vf vflip`
+    /// ([`PreviewEncoder::new_bottom_up`]) — aucun memcpy ici, `push_frame`
+    /// est non bloquant côté engine.
     fn feed_h264(&mut self, rgba: &[u8], w: u32, h: u32) {
         let Some(enc) = &mut self.h264_enc else { return };
         if (w, h) != (self.h264_cfg.0, self.h264_cfg.1) {
             return; // réglages en cours de changement : frame sautée
         }
-        let (wu, hu) = (w as usize, h as usize);
-        let stride = wu * 4;
-        if rgba.len() < stride * hu {
+        if rgba.len() < (w as usize) * 4 * (h as usize) {
             return;
         }
-        self.h264_flip.clear();
-        self.h264_flip.reserve(stride * hu);
-        for y in (0..hu).rev() {
-            self.h264_flip.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
-        }
-        enc.push_frame(&self.h264_flip);
+        enc.push_frame(rgba);
     }
 
     // ------------------------------------------------------------ événements

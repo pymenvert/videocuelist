@@ -50,6 +50,25 @@ version portable Windows.
   micro-UX des sliders (saisie exacte au clic, clic droit = défaut,
   Maj+drag = réglage fin), dialogue À propos (version, licence,
   crédits), favicon et titre dynamique, navigation tablette.
+- **Confort de régie** : menus contextuels (clic droit) sur cues, slices,
+  médias et paramètres ; raccourcis clavier remappables (mode « apprendre »,
+  persistés dans le patch du show — Espace/Échap/B restent prioritaires et
+  non remappables) ; mires premium (grilles 4/16, barres SMPTE, mire
+  d'identification avec nom et résolution de la sortie incrustés).
+- **Préview H.264 (WebCodecs)** : flux `ws://…/preview.h264` (config JSON
+  puis frames Annex-B, encodeur Windows MediaFoundation `h264_mf` via le
+  FFmpeg embarqué) — bande passante divisée par ~10 ; repli MJPEG
+  automatique (Safari, encodeur absent, ou aucune frame décodée en 3 s).
+- **Support** : bouton « Rapport de diagnostic » (zip horodaté dans
+  `logs/` : journaux récents, config, show, versions, santé — chemins
+  personnels expurgés) ; crash dumps locaux hors-process
+  (`logs/crash/`, rétention 5, aucun envoi réseau) ; vérification de mise
+  à jour **opt-in** (désactivée par défaut, une requête au démarrage en
+  mode édition, timeout 3 s, jamais de téléchargement — badge discret).
+- **Endurance** : allocateur mimalloc ; priorité process relevée en mode
+  Show (option) ; résolution DNS OSC hors du thread de tick ; ré-ancrage
+  des transitions après une veille machine ; soak test scripté
+  (`tools/soak.ps1`) et rituel de release documenté (`docs/RELEASE.md`).
 - **Produit** : version portable Windows (`tools/package.ps1`) — zip
   versionné avec SHA-256, FFmpeg **LGPL** embarqué avec notices
   (`licenses/FFMPEG.txt`), attributions des dépendances Rust

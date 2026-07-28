@@ -51,11 +51,38 @@ dans `shaders/`.
   `dist/Conduite-{version}-win64.zip` + SHA-256 (FFmpeg LGPL embarqué depuis
   `tools/ffmpeg-lgpl/`, notices copiées depuis `licenses/`).
 
+## Endurance et fiabilité
+
+Un logiciel de spectacle se juge sur la durée, pas sur la démo. Ce que
+Conduite met sur la table — et qui se vérifie :
+
+- **Soaks archivés** : chaque campagne d'endurance (GO en boucle +
+  balayage du master sur le build release) échantillonne mémoire, threads
+  et handles toutes les 30 s ; les CSV sont commités dans
+  [docs/bench/](docs/bench/). Le rituel est scripté :
+  `powershell -File tools/soak.ps1` (8 h par défaut, verdict automatique
+  PLATE / CROISSANTE, zéro process résiduel exigé). Le soak 8 h est la
+  **gate de release** : verdict PLATE ou pas de publication.
+- **Supervision** : `GET /health` répond `{status: ok|stalled,
+  tick_age_ms, version}` — un moteur « vivant mais figé » se détecte de
+  l'extérieur.
+- **Watchdog-friendly** : codes de sortie documentés (0 = arrêt normal,
+  10 = instance/port déjà pris — ne pas relancer, 11 = perte GPU —
+  relancer), verrou mono-instance, écritures atomiques, autosave +
+  récupération après crash.
+
+L'endurance est mesurée sur Windows (la plateforme livrée aujourd'hui) ;
+les autres cibles seront benchées quand leurs builds existeront.
+
+Le processus complet de publication est documenté dans
+[docs/RELEASE.md](docs/RELEASE.md).
+
 ## Documentation
 
 | Fichier | Contenu |
 |---|---|
 | [docs/MANUEL.md](docs/MANUEL.md) | **Manuel de l'utilisateur** (régie, protocoles, dépannage) |
+| [docs/RELEASE.md](docs/RELEASE.md) | Checklist de release (tests, packaging, soak 8 h, publication) |
 | [CHANGELOG.md](CHANGELOG.md) | Versions et changements |
 | [docs/SPEC.md](docs/SPEC.md) | Spécification fonctionnelle : concepts, features, conduite |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Stack, découpage en crates, réutilisation Lanterne |

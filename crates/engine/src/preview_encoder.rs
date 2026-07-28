@@ -22,7 +22,9 @@
 //! live_streaming` + `-rate_control cbr` + `-g 16 -bf 0`. Le profil se passe
 //! en NUMÉRIQUE (`-profile:v 66` = baseline ; le nom « baseline » n'est pas
 //! reconnu par cet encodeur). Entrée convertie en yuv420p (h264_mf n'accepte
-//! que nv12/yuv420p/d3d11).
+//! que nv12/yuv420p/d3d11). Les frames du chemin préview GL arrivant lignes
+//! de bas en haut, [`PreviewEncoder::new_bottom_up`] ajoute `-vf vflip` —
+//! le flip est payé par ffmpeg, pas par le thread appelant.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -206,8 +208,16 @@ fn preview_bitrate(w: u32, h: u32, fps: u32) -> u32 {
 }
 
 /// Arguments ffmpeg de l'encodeur de préview (pur, testé). Voir l'en-tête du
-/// module pour la justification de chaque option `h264_mf`.
-fn build_encoder_args(w: u32, h: u32, fps: u32, order: PixelOrder) -> Vec<std::ffi::OsString> {
+/// module pour la justification de chaque option `h264_mf`. `vflip` : frames
+/// d'entrée lignes de bas en haut (lecture FBO GL) remises à l'endroit par
+/// ffmpeg — zéro coût CPU côté appelant.
+fn build_encoder_args(
+    w: u32,
+    h: u32,
+    fps: u32,
+    order: PixelOrder,
+    vflip: bool,
+) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let push = |args: &mut Vec<std::ffi::OsString>, s: &str| args.push(s.into());
     push(&mut args, "-v");
@@ -246,6 +256,10 @@ fn build_encoder_args(w: u32, h: u32, fps: u32, order: PixelOrder) -> Vec<std::f
     args.push(preview_bitrate(w, h, fps).to_string().into());
     push(&mut args, "-scenario");
     push(&mut args, "live_streaming");
+    if vflip {
+        push(&mut args, "-vf");
+        push(&mut args, "vflip");
+    }
     push(&mut args, "-pix_fmt");
     push(&mut args, "yuv420p");
     push(&mut args, "-flush_packets");
@@ -325,6 +339,28 @@ impl PreviewEncoder {
         fps: u32,
         order: PixelOrder,
     ) -> Result<Self, PreviewEncoderError> {
+        Self::new_inner(w, h, fps, order, false)
+    }
+
+    /// Comme [`PreviewEncoder::new_with_order`] pour des frames **lignes de
+    /// bas en haut** (sortie `glReadPixels` du chemin préview) : ffmpeg les
+    /// remet à l'endroit (`-vf vflip`), zéro coût CPU côté appelant.
+    pub fn new_bottom_up(
+        w: u32,
+        h: u32,
+        fps: u32,
+        order: PixelOrder,
+    ) -> Result<Self, PreviewEncoderError> {
+        Self::new_inner(w, h, fps, order, true)
+    }
+
+    fn new_inner(
+        w: u32,
+        h: u32,
+        fps: u32,
+        order: PixelOrder,
+        vflip: bool,
+    ) -> Result<Self, PreviewEncoderError> {
         if w == 0 || h == 0 || fps == 0 || w > 8192 || h > 8192 {
             return Err(PreviewEncoderError::BadParams { w, h, fps });
         }
@@ -333,7 +369,7 @@ impl PreviewEncoder {
         }
 
         let ffmpeg = resolve_ffmpeg();
-        let args = build_encoder_args(w, h, fps, order);
+        let args = build_encoder_args(w, h, fps, order, vflip);
         let mut cmd = Command::new(&ffmpeg);
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -379,7 +415,7 @@ impl PreviewEncoder {
                 PreviewEncoderError::Spawn(format!("thread lecteur : {e}"))
             })?;
 
-        tracing::info!(target: LOG, w, h, fps, ?order, "encodeur h264_mf lancé");
+        tracing::info!(target: LOG, w, h, fps, ?order, vflip, "encodeur h264_mf lancé");
         Ok(PreviewEncoder {
             child: Some(child),
             writer: Some(writer),
@@ -554,7 +590,7 @@ mod tests {
 
     #[test]
     fn args_ffmpeg_conformes_au_contrat() {
-        let a: Vec<String> = build_encoder_args(640, 360, 15, PixelOrder::Rgba)
+        let a: Vec<String> = build_encoder_args(640, 360, 15, PixelOrder::Rgba, false)
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
@@ -599,13 +635,31 @@ mod tests {
         assert!(a.contains(&"-flush_packets".to_string()));
         // Notre stdin est la source : -nostdin serait fatal.
         assert!(!a.contains(&"-nostdin".to_string()));
+        // Pas de flip par défaut.
+        assert!(!a.contains(&"-vf".to_string()));
         // BGRA sur demande.
-        let b: Vec<String> = build_encoder_args(64, 64, 30, PixelOrder::Bgra)
+        let b: Vec<String> = build_encoder_args(64, 64, 30, PixelOrder::Bgra, false)
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         assert!(b.contains(&"bgra".to_string()));
         assert!(!b.contains(&"rgba".to_string()));
+    }
+
+    #[test]
+    fn vflip_pour_les_frames_gl_bas_en_haut() {
+        // Frames lues d'un FBO GL (lignes de bas en haut) : ffmpeg remet à
+        // l'endroit via -vf vflip, posé en option de SORTIE (après -i).
+        let a: Vec<String> = build_encoder_args(640, 360, 15, PixelOrder::Rgba, true)
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let vf = a.iter().position(|s| s == "-vf").expect("-vf présent");
+        assert_eq!(a[vf + 1], "vflip");
+        let i = a.iter().position(|s| s == "-i").unwrap();
+        assert!(vf > i, "-vf est une option de sortie (après -i)");
+        // La sortie reste du h264 brut sur stdout.
+        assert_eq!(a[a.len() - 3..], ["-f".to_string(), "h264".into(), "pipe:1".into()]);
     }
 
     #[test]

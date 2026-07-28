@@ -59,6 +59,10 @@ struct Cli {
     headless: bool,
     version: bool,
     help: bool,
+    /// Flag caché de recette (absent de `--help`) : crash volontaire juste
+    /// après l'installation de la capture — vérifie qu'un dump apparaît
+    /// bien dans `logs/crash/`. Actif en build DEBUG uniquement.
+    crash_test: bool,
 }
 
 /// Texte de `--help` (aligné sur README.md et docs/MANUEL.md).
@@ -84,6 +88,10 @@ fn parse_cli() -> Cli {
             "--show" => cli.show = args.next(),
             "--port" => cli.port = args.next().and_then(|p| p.parse().ok()),
             "--headless" => cli.headless = true,
+            // Recette de la capture de crash (interne, debug uniquement —
+            // volontairement absent de --help, comme --crash-server).
+            #[cfg(debug_assertions)]
+            "--crash-test" => cli.crash_test = true,
             "--version" | "-V" => cli.version = true,
             "--help" | "-h" => cli.help = true,
             other => {
@@ -188,6 +196,15 @@ fn run() -> i32 {
     // de minidump (logs/crash/, rétention 5, aucun envoi réseau). L'app
     // démarre normalement si la capture est indisponible.
     let _crash_guard = crash::spawn(&dirs.logs);
+    if cli.crash_test {
+        // Recette : accès mémoire invalide RÉEL (pas un panic Rust — le
+        // hook de panic ne passe pas par le handler de crash). Le serveur
+        // hors-process doit écrire logs/crash/crash-<ts>.dmp.
+        warn!(target: "app::crash",
+            "--crash-test : crash volontaire dans 500 ms (recette de la capture)");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u32>(), 0xDEAD) };
+    }
 
     let mut config = AppConfig::load(&dirs.base);
     if let Some(p) = cli.port {
