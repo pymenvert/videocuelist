@@ -109,6 +109,13 @@ function Send-Json([string]$json) {
     $script:ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() | Out-Null
 }
 
+# Contrat WS entrant (docs/INTERFACES.md) : {"type":"cmd","cmd":{...Command}}.
+# Une commande envoyée NUE (sans l'enveloppe) est IGNORÉE en silence par le
+# serveur — le soak tournerait alors à vide sans déclencher un seul GOTO.
+function Send-Cmd([string]$inner) {
+    Send-Json ('{"type":"cmd","cmd":' + $inner + '}')
+}
+
 # ------------------------------------------------------------ boucle soak
 $deadline = (Get-Date).AddMinutes($Minutes)
 $t0 = Get-Date
@@ -134,12 +141,12 @@ while ((Get-Date) -lt $deadline) {
     if ($now -ge $nextGoto) {
         $cue = $cueList[$cueIdx % $cueList.Count]
         $cueIdx++
-        Send-Json ('{"cmd":"cue_goto","cue":' + $cue + '}')
+        Send-Cmd ('{"cmd":"cue_goto","cue":' + $cue + '}')
         $gotos++
         $phase = (($now - $t0).TotalSeconds % 60.0) / 60.0
         if ($phase -gt 0.5) { $phase = 1.0 - $phase }
         $master = [math]::Round(0.05 + 1.9 * $phase, 3)   # 0.05 -> 1.0 -> 0.05
-        Send-Json ('{"cmd":"param_set","addr":"master/intensity","value":{"f":' + $master.ToString([Globalization.CultureInfo]::InvariantCulture) + '},"source":"ui"}')
+        Send-Cmd ('{"cmd":"param_set","addr":"master/intensity","value":{"f":' + $master.ToString([Globalization.CultureInfo]::InvariantCulture) + '},"source":"ui"}')
         $nextGoto = $now.AddSeconds($GotoEverySec)
     }
 
@@ -174,7 +181,7 @@ while ((Get-Date) -lt $deadline) {
 
 # --------------------------------------------------------------- arrêt
 Write-Host "Arrêt propre (cmd quit)…"
-try { Send-Json '{"cmd":"quit"}' } catch {}
+try { Send-Cmd '{"cmd":"quit"}' } catch {}
 try { $ws.Dispose() } catch {}
 if (-not $proc.WaitForExit(15000)) {
     Write-Host "Pas d'arrêt en 15 s — Stop-Process Id $($proc.Id)." -ForegroundColor Yellow
