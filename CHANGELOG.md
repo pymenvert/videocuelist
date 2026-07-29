@@ -28,6 +28,18 @@ version portable Windows.
   avec soft-takeover, MIDI Show Control), Art-Net (récepteur DMX patchable,
   répond à ArtPoll) ; interface web de régie complète (10 onglets, FR),
   utilisable depuis une tablette.
+- **Timecode (MTC)** : réception MIDI Time Code sur le port d'entrée
+  existant (quarter-frames et full-frames, 24/25/29,97 DF/30 fps,
+  compensation de latence, drop-frame exact) ; **chase de cues** opt-in
+  (« Chase timecode » dans Réglages, désactivé par défaut — les shows
+  existants sont intacts) : chaque cue peut porter un déclencheur
+  `HH:MM:SS:FF` — à l'avancée du TC la cue part en GO automatique
+  (transition respectée), un saut avant/arrière ou un re-verrouillage se
+  cale en GOTO sur la dernière cue passée, une perte de signal laisse
+  2 s de roue libre puis suspend le chase **sans rien couper** ; cues
+  manuelles et cues timecodées coexistent ; affichage du TC entrant en
+  direct (Live et pied de page, vert/orange/gris), colonne Timecode et
+  badge TC dans la liste des cues, toasts au verrouillage/perte.
 - **Fiabilité spectacle** : verrou mono-instance (2ᵉ lancement refusé,
   code 10), autosave, backups rotatifs par show avec proposition de
   récupération au démarrage après arrêt sale, journaux horodatés,

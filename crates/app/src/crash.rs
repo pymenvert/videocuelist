@@ -267,7 +267,7 @@ fn prune_dumps(dir: &Path, keep: usize) {
     if dumps.len() <= keep {
         return;
     }
-    dumps.sort_by(|a, b| b.0.cmp(&a.0)); // récents d'abord
+    dumps.sort_by_key(|d| std::cmp::Reverse(d.0)); // récents d'abord
     for (_, path) in dumps.into_iter().skip(keep) {
         match std::fs::remove_file(&path) {
             Ok(()) => debug!(target: "app::crash", path = %path.display(), "vieux dump purgé"),

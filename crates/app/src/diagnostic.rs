@@ -237,7 +237,7 @@ fn recent_log_files(logs_dir: &Path, max: usize) -> Vec<PathBuf> {
             Some((modified, path))
         })
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     files.truncate(max);
     files.into_iter().map(|(_, p)| p).collect()
 }
@@ -370,14 +370,13 @@ mod tests {
         );
         // Aucune trace du chemin personnel dans AUCUNE entrée.
         let home_lower = home.to_lowercase();
-        for i in 0..archive.len() {
+        for (i, name) in names.iter().enumerate() {
             let mut entry = archive.by_index(i).expect("entrée");
             let mut text = String::new();
             let _ = entry.read_to_string(&mut text);
             assert!(
                 !text.to_lowercase().contains(&home_lower),
-                "chemin personnel non expurgé dans {}",
-                names[i]
+                "chemin personnel non expurgé dans {name}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
