@@ -28,6 +28,10 @@ pub enum CoreError {
     #[error("numéro de cue invalide : {0:?}")]
     InvalidCueNumber(String),
 
+    /// Timecode illisible (attendu : "HH:MM:SS:FF").
+    #[error("timecode invalide : {0:?} (attendu HH:MM:SS:FF)")]
+    InvalidTimecode(String),
+
     /// Fichier show écrit par une version plus récente du logiciel.
     #[error("format de show v{0} plus récent que ce logiciel (v{1})")]
     UnsupportedVersion(u32, u32),

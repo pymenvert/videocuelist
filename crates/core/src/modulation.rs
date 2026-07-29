@@ -69,8 +69,12 @@ pub enum ModKind {
         #[serde(default = "default_true")]
         normalize: bool,
     },
-    /// **Réservé v2** — chase timecode (MTC/LTC), cf. DECISIONS 2026-07-23.
-    /// Aucune logique aujourd'hui : le moteur sort 0.0, l'UI grise l'option.
+    /// **Réservé v2** — ANIMATION DE PARAMÈTRES pilotée timecode (MTC/LTC),
+    /// cf. DECISIONS 2026-07-23. Aucune logique aujourd'hui : le moteur sort
+    /// 0.0, l'option « Timecode » du popover d'animation reste grisée.
+    /// NE PAS confondre avec le chase de CUES, lui bien livré :
+    /// `ShowSettings::timecode_chase` + `CueTriggers::timecode` (GOTO/GO
+    /// automatiques dans la crate `cue`).
     /// Les champs futurs devront porter des `serde(default)` pour rester
     /// rétro-compatibles ; les champs inconnus d'un show plus récent sont
     /// ignorés à la désérialisation (tolérance par défaut de serde).

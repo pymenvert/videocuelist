@@ -13,10 +13,18 @@
 use std::collections::BTreeMap;
 
 use conduite_core::{
-    Content, Cue, CueNumber, Curve, EndMode, FollowMode, ParamValue, Playback, SliceId,
-    Transition, TransitionKind,
+    Content, Cue, CueNumber, Curve, EndMode, FollowMode, ParamValue, Playback, SliceId, TcRate,
+    TcTime, Transition, TransitionKind,
 };
 use tracing::{debug, warn};
+
+/// Roue libre après perte du signal timecode : le TC continue d'avancer en
+/// interne pendant cette durée, puis le chase se suspend SANS rien couper.
+pub const TC_FREEWHEEL_S: f64 = 2.0;
+
+/// Au-delà de ce pas en avant (en secondes de timecode) entre deux ticks,
+/// l'avancée est traitée comme un SAUT (calage) et non comme une lecture.
+const TC_SEEK_FWD_S: f64 = 1.0;
 
 /// Emplacement de deck : A = programme, B = préparation / cible de transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,11 +33,25 @@ pub enum DeckSlot {
     B,
 }
 
-/// Entrée d'un tick moteur : horloge monotone (secondes) et oracle de fin
-/// de média (l'app interroge ses players, le moteur reste pur).
+/// État du timecode entrant fourni au tick par l'app (lecteur MTC/LTC).
+/// Sémantique du chase : voir [`CueEngine::tick`] et docs/INTERFACES.md.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TcState {
+    pub time: TcTime,
+    pub rate: TcRate,
+    /// Signal présent et verrouillé. `false` = signal perdu : le moteur
+    /// freewheele [`TC_FREEWHEEL_S`] puis suspend le chase sans rien couper.
+    pub locked: bool,
+}
+
+/// Entrée d'un tick moteur : horloge monotone (secondes), oracle de fin
+/// de média (l'app interroge ses players, le moteur reste pur) et timecode
+/// entrant (`None` = chase désactivé — `ShowSettings::timecode_chase` faux
+/// ou aucune source configurée).
 pub struct EngineTick<'a> {
     pub now_s: f64,
     pub media_eof: &'a dyn Fn(SliceId) -> bool,
+    pub tc: Option<TcState>,
 }
 
 /// Cible d'un slice : contenu + réglages de lecture. L'app compare
@@ -120,6 +142,20 @@ struct PanicState {
     from: f32,
 }
 
+/// État interne du chase timecode (position déjà traitée entre deux ticks).
+#[derive(Debug, Clone)]
+struct ChaseState {
+    /// Dernière position traitée, en frames de `rate` (les triggers dans
+    /// `(frames_précédent, frames_courant]` ont déjà tiré).
+    frames: u64,
+    rate: TcRate,
+    /// Le signal était verrouillé au dernier tick.
+    locked: bool,
+    /// Roue libre en cours : (instant moteur de la perte, position au moment
+    /// de la perte). `None` une fois [`TC_FREEWHEEL_S`] écoulées (suspendu).
+    freewheel: Option<(f64, u64)>,
+}
+
 /// Commandes latchées entre deux ticks, appliquées dans l'ordre au tick
 /// suivant sur l'horloge du tick (déterminisme, horloge simulée en test).
 #[derive(Debug, Clone)]
@@ -164,6 +200,9 @@ pub struct CueEngine {
     /// `slice/{id}/media/speed` appliqué par l'app aux players), pour le
     /// compte à rebours AfterMedia. Absent = 1.0.
     speed_mult: BTreeMap<SliceId, f32>,
+    /// Chase timecode : `None` tant qu'aucun signal verrouillé n'a été vu
+    /// (ou `EngineTick::tc` absent).
+    chase: Option<ChaseState>,
 }
 
 impl CueEngine {
@@ -190,6 +229,7 @@ impl CueEngine {
         self.finished_params = None;
         self.media_start_s = 0.0;
         self.speed_mult.clear();
+        self.chase = None;
         debug!(target: "cue", count = self.cues.len(), "conduite chargée");
     }
 
@@ -212,6 +252,9 @@ impl CueEngine {
         let keep_follow_fired = self.follow_fired;
         let keep_panic = self.panic.clone();
         let keep_speed = std::mem::take(&mut self.speed_mult);
+        // Le point de chase (position TC déjà traitée) survit à l'édition :
+        // pas de re-calage intempestif au prochain tick.
+        let keep_chase = self.chase.take();
         // Les événements du snap (et le snapshot de params à poser à 1.0)
         // doivent survivre au rechargement.
         let keep_events = std::mem::take(&mut self.events);
@@ -223,6 +266,7 @@ impl CueEngine {
         self.finished_params = keep_finished;
         self.panic = keep_panic;
         self.speed_mult = keep_speed;
+        self.chase = keep_chase;
         match active_n.and_then(|n| self.index_of(n)) {
             Some(i) => {
                 self.active = Some(i);
@@ -298,6 +342,17 @@ impl CueEngine {
     /// Appelé chaque frame. Retourne l'état désiré des decks, l'alpha de
     /// blend A→B, le noir global, le snapshot de paramètres interpolé et
     /// les événements du tick.
+    ///
+    /// **Chase timecode** (`EngineTick::tc = Some`, sémantique
+    /// QLab/média-serveurs) : à l'avancée normale du TC verrouillé, toute
+    /// cue armée dont le trigger `CueTriggers::timecode` passe est déclenchée
+    /// (plusieurs dans le même tick ⇒ les intermédiaires sont traversées en
+    /// cut, seule la dernière joue pleinement) ; un saut avant/arrière est
+    /// un CALAGE (GOTO de la dernière cue dont le trigger ≤ TC, noir si
+    /// aucune) ; perte de signal = roue libre [`TC_FREEWHEEL_S`] puis
+    /// suspension SANS rien couper ; re-verrouillage = re-calage. Les cues
+    /// sans trigger restent manuelles : un GO/GOTO intercalé est accepté,
+    /// le chase repart du TC, jamais de la position manuelle.
     pub fn tick(&mut self, t: EngineTick) -> CueFrame {
         let now = t.now_s;
         self.last_now_s = now;
@@ -312,6 +367,7 @@ impl CueEngine {
             }
         }
 
+        self.check_chase(now, t.tc);
         self.check_follow(now, t.media_eof);
 
         let (blend, trans_black) = self.eval_transition(now);
@@ -605,6 +661,155 @@ impl CueEngine {
         }
     }
 
+    // ------------------------------------------------------ chase timecode
+
+    /// Fait suivre le timecode entrant à la conduite (voir [`Self::tick`]).
+    /// Ne touche JAMAIS un show sans trigger timecode ni ne libère un panic
+    /// (les GO du chase sont automatiques, comme les follows).
+    fn check_chase(&mut self, now: f64, tc: Option<TcState>) {
+        let Some(st) = tc else {
+            // Chase coupé (réglage ou source absente) : on oublie le point
+            // de calage — rien n'est interrompu.
+            self.chase = None;
+            return;
+        };
+        if st.locked {
+            let frames = st.time.to_frames(st.rate);
+            match self.chase.take() {
+                // Signal continu à cadence inchangée : avancée ou saut.
+                Some(cs) if cs.locked && cs.rate == st.rate => {
+                    let fwd_max = (TC_SEEK_FWD_S * f64::from(st.rate.nominal_fps())) as u64;
+                    if frames > cs.frames && frames - cs.frames <= fwd_max {
+                        self.chase_advance(cs.frames, frames, st.rate, now);
+                    } else if frames != cs.frames {
+                        // Saut avant (trop grand) ou arrière : calage.
+                        self.chase_seek(frames, st.rate, now);
+                    }
+                }
+                // Premier verrouillage, re-verrouillage après perte ou
+                // changement de cadence : re-calage comme un seek.
+                _ => self.chase_seek(frames, st.rate, now),
+            }
+            self.chase = Some(ChaseState {
+                frames,
+                rate: st.rate,
+                locked: true,
+                freewheel: None,
+            });
+        } else if let Some(mut cs) = self.chase.take() {
+            // Signal perdu : roue libre TC_FREEWHEEL_S (le TC continue
+            // d'avancer en interne), puis suspension — les cues actives
+            // CONTINUENT, on ne coupe rien.
+            if cs.locked {
+                cs.locked = false;
+                cs.freewheel = Some((now, cs.frames));
+                debug!(target: "cue", "timecode perdu : roue libre {TC_FREEWHEEL_S} s");
+            }
+            if let Some((t0, f0)) = cs.freewheel {
+                let elapsed = (now - t0).max(0.0);
+                // Frame la plus proche (round, pas floor) : la troncature
+                // raterait d'une frame les triggers posés pile sur
+                // l'estimation (bruit flottant de l'horloge).
+                let est = f0 + (elapsed.min(TC_FREEWHEEL_S) * cs.rate.fps()).round() as u64;
+                if est > cs.frames {
+                    self.chase_advance(cs.frames, est, cs.rate, now);
+                    cs.frames = est;
+                }
+                if elapsed >= TC_FREEWHEEL_S {
+                    cs.freewheel = None;
+                    debug!(target: "cue", "roue libre écoulée : chase suspendu (rien n'est coupé)");
+                }
+            }
+            self.chase = Some(cs);
+        }
+        // Jamais verrouillé et non verrouillé : rien à suivre.
+    }
+
+    /// Triggers timecode de la conduite, en frames de `rate`, triés par
+    /// position. Les cues désarmées sont ignorées (retirées du spectacle,
+    /// comme pour GO/follow) ; les cues sans trigger restent manuelles.
+    fn chase_triggers(&self, rate: TcRate) -> Vec<(u64, usize)> {
+        let mut v: Vec<(u64, usize)> = self
+            .cues
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.armed)
+            .filter_map(|(i, c)| c.triggers.timecode.map(|t| (t.to_frames(rate), i)))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Avancée normale du TC : déclenche dans l'ordre toute cue dont le
+    /// trigger tombe dans `(from, to]`. Plusieurs dans le même tick = calage :
+    /// les intermédiaires sont traversées en cut, la dernière joue pleinement
+    /// (sa transition d'entrée est respectée).
+    fn chase_advance(&mut self, from: u64, to: u64, rate: TcRate, now: f64) {
+        let fired: Vec<usize> = self
+            .chase_triggers(rate)
+            .into_iter()
+            .filter(|(f, _)| *f > from && *f <= to)
+            .map(|(_, i)| i)
+            .collect();
+        let Some((&last, skipped)) = fired.split_last() else {
+            return;
+        };
+        for &i in skipped {
+            self.snap_transition(now);
+            self.start_go(i, Transition::default(), now); // cut de calage
+        }
+        self.snap_transition(now);
+        let tr = self.cues[last].transition.clone();
+        debug!(target: "cue", cue = %self.cues[last].number, "trigger timecode");
+        self.start_go(last, tr, now);
+    }
+
+    /// Saut de TC (avant/arrière, verrouillage, re-verrouillage) : calage
+    /// sur la DERNIÈRE cue dont le trigger ≤ position, noir si aucune. Sans
+    /// aucun trigger dans la conduite, le chase est inerte (les cues
+    /// manuelles ne sont jamais touchées).
+    fn chase_seek(&mut self, frames: u64, rate: TcRate, now: f64) {
+        let triggers = self.chase_triggers(rate);
+        if triggers.is_empty() {
+            return;
+        }
+        let target = triggers
+            .iter()
+            .take_while(|(f, _)| *f <= frames)
+            .map(|&(_, i)| i)
+            .last();
+        match target {
+            Some(i) => {
+                // Déjà calé : la bonne cue est au programme, on ne la
+                // relance pas (re-verrouillage sans saut réel).
+                if self.transition.is_none() && self.active == Some(i) {
+                    return;
+                }
+                // Transition déjà en route vers la bonne cue : on la snappe.
+                if self.transition.as_ref().map(|tr| tr.to) == Some(i) {
+                    self.snap_transition(now);
+                    return;
+                }
+                self.snap_transition(now);
+                let tr = self.cues[i].transition.clone();
+                debug!(target: "cue", cue = %self.cues[i].number, "calage timecode (GOTO)");
+                self.start_go(i, tr, now);
+            }
+            None => {
+                // Aucun trigger avant la position : noir (rien au
+                // programme), standby sur le premier trigger à venir.
+                if self.active.is_none() && self.transition.is_none() {
+                    return;
+                }
+                self.transition = None;
+                self.active = None;
+                self.follow_fired = false;
+                self.standby = triggers.first().map(|&(_, i)| i);
+                debug!(target: "cue", "calage timecode avant le premier trigger : noir");
+            }
+        }
+    }
+
     /// Progression brute 0..1 de la transition en cours.
     fn transition_progress(&self, tr: &ActiveTransition, now: f64) -> f32 {
         if tr.dur_s <= 0.0 {
@@ -716,7 +921,7 @@ fn media_progress(
 
 #[cfg(test)]
 mod tests {
-    use conduite_core::{CueTriggers, SliceState};
+    use conduite_core::{CueTriggers, SliceState, TcRate, TcTime};
 
     use super::*;
 
@@ -781,14 +986,19 @@ mod tests {
         e
     }
 
-    /// Tick sans fin de média.
+    /// Tick sans fin de média ni timecode.
     fn tk(e: &mut CueEngine, now_s: f64) -> CueFrame {
-        e.tick(EngineTick { now_s, media_eof: &|_| false })
+        e.tick(EngineTick { now_s, media_eof: &|_| false, tc: None })
     }
 
     /// Tick avec oracle de fin de média.
     fn tk_eof(e: &mut CueEngine, now_s: f64, eof: &dyn Fn(SliceId) -> bool) -> CueFrame {
-        e.tick(EngineTick { now_s, media_eof: eof })
+        e.tick(EngineTick { now_s, media_eof: eof, tc: None })
+    }
+
+    /// Tick avec timecode entrant.
+    fn tk_tc(e: &mut CueEngine, now_s: f64, tc: TcState) -> CueFrame {
+        e.tick(EngineTick { now_s, media_eof: &|_| false, tc: Some(tc) })
     }
 
     fn has_warning(f: &CueFrame) -> bool {
@@ -2134,6 +2344,323 @@ mod tests {
         assert_eq!(active(&e), Some(1000));
         assert_eq!(standby_of(&e), Some(3000), "standby désarmée re-pointée");
     }
+
+    // ------------------------------------------------------ chase timecode
+
+    /// Pose un trigger timecode sur la cue.
+    fn with_tc(mut c: Cue, t: &str) -> Cue {
+        c.triggers.timecode = Some(t.parse().expect("timecode"));
+        c
+    }
+
+    /// Signal verrouillé à `frames` (25 im/s : 1 s = 25 frames).
+    fn lock25(frames: u64) -> TcState {
+        TcState {
+            time: TcTime::from_frames(frames, TcRate::Fps25),
+            rate: TcRate::Fps25,
+            locked: true,
+        }
+    }
+
+    /// Signal perdu (la position portée est ignorée par le moteur).
+    fn unlock25() -> TcState {
+        TcState {
+            time: TcTime::default(),
+            rate: TcRate::Fps25,
+            locked: false,
+        }
+    }
+
+    fn started(f: &CueFrame, n: u32) -> bool {
+        f.events.contains(&CueEvent::CueStarted { cue: CueNumber(n) })
+    }
+
+    /// Avancée normale : le trigger tire à SA frame, pas avant, une seule
+    /// fois — vérifié frame par frame.
+    #[test]
+    fn chase_advances_and_fires_triggers_frame_by_frame() {
+        let mut e = engine(vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:20:00"), // frame 500
+        ]);
+        // Verrouillage avant le premier trigger : noir, rien ne tire.
+        let f = tk_tc(&mut e, 0.0, lock25(100));
+        assert!(f.events.is_empty());
+        assert_eq!(active(&e), None);
+        assert_eq!(standby_of(&e), Some(1000));
+        // Frame par frame jusqu'à 249 : rien.
+        let mut now = 0.0;
+        for fr in 101..250 {
+            now += 0.04;
+            let f = tk_tc(&mut e, now, lock25(fr));
+            assert!(f.events.is_empty(), "rien avant le trigger (frame {fr})");
+            assert_eq!(active(&e), None);
+        }
+        // Frame 250 : la cue 1000 tire (GO direct, cut).
+        now += 0.04;
+        let f = tk_tc(&mut e, now, lock25(250));
+        assert!(started(&f, 1000));
+        assert_eq!(active(&e), Some(1000));
+        assert_eq!(standby_of(&e), Some(2000));
+        // Le trigger passé ne re-tire pas.
+        now += 0.04;
+        let f = tk_tc(&mut e, now, lock25(251));
+        assert!(f.events.is_empty());
+        // Jusqu'à la frame 500 : la cue 2000 tire pile à son trigger.
+        for fr in 252..=500 {
+            now += 0.04;
+            let f = tk_tc(&mut e, now, lock25(fr));
+            assert_eq!(started(&f, 2000), fr == 500, "frame {fr}");
+        }
+        assert_eq!(active(&e), Some(2000));
+    }
+
+    /// Deux triggers dans le même tick (avancée normale) : l'intermédiaire
+    /// est traversée en cut (son snapshot est posé), la dernière joue
+    /// pleinement avec sa transition.
+    #[test]
+    fn chase_two_triggers_same_tick_cut_through_intermediate() {
+        let c1 = with_param(
+            with_state(
+                with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+                1,
+                10,
+                EndMode::Loop,
+                None,
+            ),
+            "slice/1/opacity",
+            0.3,
+        );
+        let c2 = with_tc(cue(2000, TransitionKind::Crossfade, 2.0), "00:00:10:03"); // frame 253
+        let mut e = engine(vec![c1, c2]);
+        tk_tc(&mut e, 0.0, lock25(240));
+        // Un seul tick passe les deux triggers (delta 20 frames < 1 s).
+        let f = tk_tc(&mut e, 0.2, lock25(260));
+        assert!(started(&f, 1000), "intermédiaire traversée");
+        assert!(
+            f.events.contains(&CueEvent::TransitionFinished { cue: CueNumber(1000) }),
+            "traversée en CUT : posée immédiatement"
+        );
+        assert!(started(&f, 2000), "la dernière tire aussi");
+        // Le snapshot de l'intermédiaire est posé à alpha 1.0.
+        let (map, alpha) = f.params_target.expect("snapshot de calage");
+        assert!((alpha - 1.0).abs() < EPS);
+        assert_eq!(map.get("slice/1/opacity"), Some(&ParamValue::F(0.3)));
+        // La dernière joue pleinement : son crossfade est en cours.
+        assert!(e.status().transition_active, "crossfade de la cue 2000");
+        assert_eq!(active(&e), Some(1000), "1000 posée, transition vers 2000");
+        // Fin naturelle du crossfade (le TC continue d'avancer normalement).
+        let mut now = 0.2;
+        let mut fr = 260;
+        while now < 2.5 {
+            now += 0.2;
+            fr += 5;
+            tk_tc(&mut e, now, lock25(fr));
+        }
+        assert_eq!(active(&e), Some(2000));
+        assert!(!e.status().transition_active);
+    }
+
+    /// Saut en avant : calage — GOTO de la DERNIÈRE cue dont le trigger est
+    /// passé, les intermédiaires ne sont PAS jouées.
+    #[test]
+    fn chase_forward_jump_seeks_to_last_passed_trigger() {
+        let mut e = engine(vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:20:00"), // frame 500
+        ]);
+        tk_tc(&mut e, 0.0, lock25(100));
+        assert_eq!(active(&e), None);
+        // Saut 100 → 600 (bien plus d'une seconde) : calage sur la 2000.
+        let f = tk_tc(&mut e, 1.0, lock25(600));
+        assert!(!started(&f, 1000), "l'intermédiaire n'est pas jouée sur un saut");
+        assert!(started(&f, 2000));
+        assert_eq!(active(&e), Some(2000));
+    }
+
+    /// Saut en arrière : calage sur la dernière cue passée, et noir si le
+    /// TC retombe avant le premier trigger.
+    #[test]
+    fn chase_backward_jump_seeks_and_blacks_before_first_trigger() {
+        let mut e = engine(vec![
+            with_tc(
+                with_state(cue(1000, TransitionKind::Cut, 0.0), 1, 10, EndMode::Loop, None),
+                "00:00:10:00",
+            ), // frame 250
+            with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:20:00"), // frame 500
+        ]);
+        tk_tc(&mut e, 0.0, lock25(600));
+        assert_eq!(active(&e), Some(2000));
+        // Retour à la frame 300 : calage sur la 1000.
+        let f = tk_tc(&mut e, 1.0, lock25(300));
+        assert!(started(&f, 1000));
+        assert_eq!(active(&e), Some(1000));
+        // Retour avant le premier trigger : noir, standby préchargée sur le
+        // premier trigger à venir.
+        let f = tk_tc(&mut e, 2.0, lock25(100));
+        assert!(f.events.is_empty());
+        assert_eq!(active(&e), None, "noir : rien au programme");
+        assert!(f.deck_a.is_none());
+        assert_eq!(standby_of(&e), Some(1000));
+    }
+
+    /// Perte de signal : roue libre 2 s (les triggers continuent de tirer
+    /// sur le TC extrapolé), puis suspension — rien n'est coupé.
+    #[test]
+    fn chase_unlock_freewheels_two_seconds_then_holds() {
+        let mut e = engine(vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:11:00"), // frame 275
+            with_tc(cue(3000, TransitionKind::Cut, 0.0), "00:00:14:00"), // frame 350
+        ]);
+        tk_tc(&mut e, 100.0, lock25(255));
+        assert_eq!(active(&e), Some(1000));
+        // Perte du signal à t=100.5 (position 255).
+        tk_tc(&mut e, 100.5, unlock25());
+        assert_eq!(active(&e), Some(1000), "rien n'est coupé à la perte");
+        // Roue libre : à t=101.3 (0.8 s), TC estimé = 255 + 20 = 275 → la
+        // cue 2000 tire pendant la roue libre.
+        let f = tk_tc(&mut e, 101.3, unlock25());
+        assert!(started(&f, 2000), "trigger passé en roue libre");
+        assert_eq!(active(&e), Some(2000));
+        // Au-delà de 2 s : suspension. Le TC interne s'arrête à +2 s
+        // (position 305) — le trigger 350 ne tire jamais.
+        for now in [103.0, 105.0, 110.0, 200.0] {
+            let f = tk_tc(&mut e, now, unlock25());
+            assert!(f.events.is_empty(), "chase suspendu à t={now}");
+            assert_eq!(active(&e), Some(2000), "la cue active CONTINUE");
+        }
+    }
+
+    /// Re-verrouillage : re-calage comme un seek — mais sans re-lancer la
+    /// cue si la position retombe dans la zone de la cue déjà active.
+    #[test]
+    fn chase_relock_recals_like_seek() {
+        let mut e = engine(vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:14:00"), // frame 350
+        ]);
+        tk_tc(&mut e, 0.0, lock25(255));
+        assert_eq!(active(&e), Some(1000));
+        // Perte puis re-verrouillage un peu plus loin, toujours dans la
+        // zone de la cue 1000 : pas de re-lancement.
+        tk_tc(&mut e, 0.5, unlock25());
+        let f = tk_tc(&mut e, 1.0, lock25(270));
+        assert!(f.events.is_empty(), "déjà calé : la cue active n'est pas relancée");
+        assert_eq!(active(&e), Some(1000));
+        // Perte puis re-verrouillage APRÈS un autre trigger : calage GOTO.
+        tk_tc(&mut e, 2.0, unlock25());
+        for now in [3.0, 4.5] {
+            tk_tc(&mut e, now, unlock25()); // roue libre puis suspension
+        }
+        let f = tk_tc(&mut e, 5.0, lock25(400));
+        assert!(started(&f, 2000), "re-calage sur la dernière cue passée");
+        assert_eq!(active(&e), Some(2000));
+    }
+
+    /// GO manuel pendant le chase : accepté — et le chase repart du TC, pas
+    /// de la position manuelle.
+    #[test]
+    fn chase_coexists_with_manual_go() {
+        let mut e = engine(vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            cue(2000, TransitionKind::Cut, 0.0),                         // manuelle
+            with_tc(cue(3000, TransitionKind::Cut, 0.0), "00:00:20:00"), // frame 500
+        ]);
+        tk_tc(&mut e, 0.0, lock25(255));
+        assert_eq!(active(&e), Some(1000));
+        assert_eq!(standby_of(&e), Some(2000));
+        // GO manuel vers la cue 2000 (sans trigger) : accepté.
+        e.go();
+        let f = tk_tc(&mut e, 0.5, lock25(256));
+        assert!(started(&f, 2000));
+        assert_eq!(active(&e), Some(2000), "cue manuelle au programme");
+        // Le TC continue d'avancer : la cue manuelle reste au programme
+        // jusqu'au PROCHAIN trigger, qui tire depuis le TC.
+        let mut now = 0.5;
+        for fr in (260..=500).step_by(20) {
+            now += 0.8;
+            tk_tc(&mut e, now, lock25(fr));
+        }
+        assert_eq!(active(&e), Some(3000), "le chase repart du TC");
+    }
+
+    /// Show sans AUCUN trigger timecode : le chase est inerte à 100 % —
+    /// mêmes états qu'en pilotage manuel pur, même sur seek.
+    #[test]
+    fn chase_without_any_trigger_changes_nothing() {
+        let cues = vec![
+            cue(1000, TransitionKind::Cut, 0.0),
+            cue(2000, TransitionKind::Cut, 0.0),
+        ];
+        let mut e = engine(cues.clone());
+        // Verrouillage + avancée + gros sauts : aucun événement.
+        for (now, fr) in [(0.0, 100u64), (0.5, 112), (1.0, 5000), (1.5, 50)] {
+            let f = tk_tc(&mut e, now, lock25(fr));
+            assert!(f.events.is_empty(), "chase inerte (frame {fr})");
+            assert_eq!(active(&e), None);
+        }
+        // GO manuel : conduite normale, un saut de TC ne coupe rien.
+        e.go();
+        tk_tc(&mut e, 2.0, lock25(60));
+        assert_eq!(active(&e), Some(1000));
+        let f = tk_tc(&mut e, 2.5, lock25(9000)); // seek énorme
+        assert!(f.events.is_empty());
+        assert_eq!(active(&e), Some(1000), "cue manuelle intouchée");
+        // Et le comportement est identique tc: None ↔ tc verrouillé.
+        let mut e2 = engine(cues);
+        e2.go();
+        tk(&mut e2, 2.0);
+        assert_eq!(e.status().active, e2.status().active);
+        assert_eq!(e.status().standby, e2.status().standby);
+    }
+
+    /// Les cues désarmées sont ignorées par le chase (avancée ET calage),
+    /// comme par GO/follow.
+    #[test]
+    fn chase_skips_disarmed_cues() {
+        let mut e = engine(vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            disarmed(with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:12:00")), // frame 300
+            with_tc(cue(3000, TransitionKind::Cut, 0.0), "00:00:16:00"), // frame 400
+        ]);
+        tk_tc(&mut e, 0.0, lock25(240));
+        // Avancée par pas d'½ s : la 2000 (désarmée) ne tire jamais.
+        let mut now = 0.0;
+        let mut fired_2000 = false;
+        for fr in (250..=320).step_by(10) {
+            now += 0.4;
+            let f = tk_tc(&mut e, now, lock25(fr));
+            fired_2000 |= started(&f, 2000);
+        }
+        assert!(!fired_2000, "cue désarmée jamais tirée par le chase");
+        assert_eq!(active(&e), Some(1000));
+        // Calage par saut : la désarmée est ignorée aussi.
+        let f = tk_tc(&mut e, now + 1.0, lock25(330));
+        assert!(f.events.is_empty(), "calage : dernière cue ARMÉE passée = déjà active");
+        let f = tk_tc(&mut e, now + 2.0, lock25(450));
+        assert!(started(&f, 3000));
+        assert_eq!(active(&e), Some(3000));
+    }
+
+    /// Édition à chaud pendant le chase : le point de calage survit — pas de
+    /// re-calage ni de re-tir au tick suivant.
+    #[test]
+    fn chase_watermark_survives_load_hot() {
+        let cues = vec![
+            with_tc(cue(1000, TransitionKind::Cut, 0.0), "00:00:10:00"), // frame 250
+            with_tc(cue(2000, TransitionKind::Cut, 0.0), "00:00:20:00"), // frame 500
+        ];
+        let mut e = engine(cues.clone());
+        tk_tc(&mut e, 0.0, lock25(255));
+        assert_eq!(active(&e), Some(1000));
+        e.load_hot(&cues);
+        let f = tk_tc(&mut e, 0.5, lock25(256));
+        assert!(f.events.is_empty(), "pas de re-tir après édition à chaud");
+        assert_eq!(active(&e), Some(1000));
+    }
+
+    // ---------------------------------------------------------------- serde
 
     /// Le roundtrip serde garde `armed` et les anciens shows (champ absent)
     /// restent armés.

@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 use conduite_core::{Command, MidiBinding};
 
 use crate::engine::{EngineEvent, MidiEngine};
+use crate::mtc::MtcEvent;
 
 /// Période du tick superviseur (flush moteur, drain contrôle).
 const TICK: Duration = Duration::from_millis(100);
@@ -32,6 +33,9 @@ const TICK: Duration = Duration::from_millis(100);
 const SCAN: Duration = Duration::from_millis(1000);
 /// Taille du canal d'événements vers l'UI (droppés si plein).
 const EVENTS_CAP: usize = 256;
+/// Taille du canal d'horloge MTC (l'app le draine à chaque tick ; plein =
+/// événements droppés sans bruit — c'est un flux, pas des commandes).
+const MTC_CAP: usize = 512;
 
 /// Événement du hub vers l'app/UI (learn, pickup, état de connexion).
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +73,7 @@ enum Ctl {
 pub struct MidiHub {
     ctl: Sender<Ctl>,
     events: Receiver<HubEvent>,
+    mtc: Receiver<MtcEvent>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -80,12 +85,13 @@ impl MidiHub {
     pub fn spawn(port_name: Option<String>, tx: Sender<Command>) -> MidiHub {
         let (ctl_tx, ctl_rx) = unbounded::<Ctl>();
         let (events_tx, events_rx) = bounded::<HubEvent>(EVENTS_CAP);
+        let (mtc_tx, mtc_rx) = bounded::<MtcEvent>(MTC_CAP);
         let engine = Arc::new(Mutex::new(MidiEngine::default()));
 
         let handle = std::thread::Builder::new()
             .name("conduite-midi-hub".into())
             .spawn(move || {
-                supervisor(port_name, engine, tx, ctl_rx, events_tx);
+                supervisor(port_name, engine, tx, ctl_rx, events_tx, mtc_tx);
             });
         let handle = match handle {
             Ok(h) => Some(h),
@@ -97,6 +103,7 @@ impl MidiHub {
         MidiHub {
             ctl: ctl_tx,
             events: events_rx,
+            mtc: mtc_rx,
             handle,
         }
     }
@@ -119,6 +126,13 @@ impl MidiHub {
     /// Flux d'événements (learn, pickup, connexion). Cloneable.
     pub fn events(&self) -> Receiver<HubEvent> {
         self.events.clone()
+    }
+
+    /// Flux d'horloge MTC (canal dédié — pas des commandes). L'app le draine
+    /// à chaque tick et nourrit sa [`crate::MtcClock`] ; s'il n'est pas
+    /// consommé, les événements sont simplement droppés quand il est plein.
+    pub fn mtc(&self) -> Receiver<MtcEvent> {
+        self.mtc.clone()
     }
 
     /// Remplace les bindings (chargement de show, édition du patch).
@@ -178,14 +192,25 @@ fn lock_engine<'a>(engine: &'a Arc<Mutex<MidiEngine>>) -> MutexGuard<'a, MidiEng
     }
 }
 
-/// Route les sorties du moteur : commandes vers le bus, le reste vers l'UI.
-fn dispatch(events: Vec<EngineEvent>, tx: &Sender<Command>, events_tx: &Sender<HubEvent>) {
+/// Route les sorties du moteur : commandes vers le bus, l'horloge MTC vers
+/// son canal dédié, le reste vers l'UI.
+fn dispatch(
+    events: Vec<EngineEvent>,
+    tx: &Sender<Command>,
+    events_tx: &Sender<HubEvent>,
+    mtc_tx: &Sender<MtcEvent>,
+) {
     for ev in events {
         match ev {
             EngineEvent::Command(cmd) => {
                 if tx.try_send(cmd).is_err() {
                     warn!("bus saturé ou arrêté : commande MIDI perdue");
                 }
+            }
+            // Flux d'horloge : droppé sans bruit si l'app ne consomme pas
+            // (c'est un flux continu, le prochain événement recale).
+            EngineEvent::Mtc(ev) => {
+                let _ = mtc_tx.try_send(ev);
             }
             other => {
                 let hub_ev = match other {
@@ -200,7 +225,7 @@ fn dispatch(events: Vec<EngineEvent>, tx: &Sender<Command>, events_tx: &Sender<H
                         incoming,
                     },
                     EngineEvent::PickupEngaged { addr } => HubEvent::PickupEngaged { addr },
-                    EngineEvent::Command(_) => continue, // déjà traité
+                    EngineEvent::Command(_) | EngineEvent::Mtc(_) => continue, // déjà traités
                 };
                 if events_tx.try_send(hub_ev).is_err() {
                     debug!("canal d'événements MIDI plein : événement UI droppé");
@@ -239,6 +264,7 @@ fn supervisor(
     tx: Sender<Command>,
     ctl_rx: Receiver<Ctl>,
     events_tx: Sender<HubEvent>,
+    mtc_tx: Sender<MtcEvent>,
 ) {
     let epoch = Instant::now();
     let mut input: Option<MidiInputConnection<()>> = None;
@@ -278,7 +304,7 @@ fn supervisor(
         // 2. Tick moteur : timeouts d'appariement (14 bits, learn).
         let now_ms = epoch.elapsed().as_millis() as u64;
         let evs = lock_engine(&engine).flush(now_ms);
-        dispatch(evs, &tx, &events_tx);
+        dispatch(evs, &tx, &events_tx, &mtc_tx);
 
         // 3. Gestion de connexion (throttlée).
         if Instant::now() >= next_scan {
@@ -302,7 +328,7 @@ fn supervisor(
             }
             if input.is_none() {
                 if let Some((conn, name)) =
-                    connect_input(filter.as_deref(), &engine, &tx, &events_tx, epoch)
+                    connect_input(filter.as_deref(), &engine, &tx, &events_tx, &mtc_tx, epoch)
                 {
                     output = connect_output(&name, filter.as_deref());
                     if events_tx
@@ -337,6 +363,7 @@ fn connect_input(
     engine: &Arc<Mutex<MidiEngine>>,
     tx: &Sender<Command>,
     events_tx: &Sender<HubEvent>,
+    mtc_tx: &Sender<MtcEvent>,
     epoch: Instant,
 ) -> Option<(MidiInputConnection<()>, String)> {
     let mut midi_in = match MidiInput::new("conduite-midi") {
@@ -368,6 +395,7 @@ fn connect_input(
     let cb_engine = Arc::clone(engine);
     let cb_tx = tx.clone();
     let cb_events = events_tx.clone();
+    let cb_mtc = mtc_tx.clone();
     // Le callback tourne sur le thread MIDI de l'OS : court et sans blocage.
     match midi_in.connect(
         &port,
@@ -375,7 +403,7 @@ fn connect_input(
         move |_timestamp, bytes, _| {
             let now_ms = epoch.elapsed().as_millis() as u64;
             let evs = lock_engine(&cb_engine).handle(bytes, now_ms);
-            dispatch(evs, &cb_tx, &cb_events);
+            dispatch(evs, &cb_tx, &cb_events, &cb_mtc);
         },
         (),
     ) {

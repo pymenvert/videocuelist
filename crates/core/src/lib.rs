@@ -18,11 +18,12 @@ pub mod modulation;
 pub mod patch;
 pub mod paths;
 pub mod persist;
+pub mod timecode;
 
 pub use command::{Command, CommandTemplate, EditOp, Source};
 pub use demo::demo_show;
 pub use error::CoreError;
-pub use event::{HealthSnapshot, RuntimeStatus, StateEvent, UpdateInfo};
+pub use event::{HealthSnapshot, RuntimeStatus, StateEvent, TimecodeStatus, UpdateInfo};
 pub use model::{
     AppMode, Content, Cue, CueDefaults, CueNumber, CueTriggers, Curve, EndMode, FollowMode, MaterialId,
     MaterialRef, MediaId, MediaRef, ModId, OutputCfg, OutputId, ParamValue, PatternKind, Playback,
@@ -32,6 +33,7 @@ pub use model::{
 pub use modulation::{Freq, ModKind, ModRoute, ModRouteState, ModulatorCfg, RouteMode, Wave};
 pub use patch::{DmxBits, KeyBinding, MidiBinding, OscOutCfg, PatchEntry, PatchTable};
 pub use paths::validate_relative_path;
+pub use timecode::{TcRate, TcTime};
 pub use persist::{
     acquire_instance_lock, load_show, load_show_with_media, save_show_atomic, write_atomic,
     InstanceLock, LoadWarning, BACKUP_DIR, BACKUP_KEEP, LOCK_FILE, SHOW_FILE,
@@ -364,6 +366,56 @@ mod tests {
         };
         let json = serde_json::to_string(&st).expect("ser");
         assert!(json.contains(r#""update":{"version":"9.9.9""#));
+        let back: RuntimeStatus = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, st);
+    }
+
+    /// Contrat timecode : `Cue.triggers.timecode` (serde default `None`),
+    /// `ShowSettings.timecode_chase` (défaut FAUX) — un show antérieur sans
+    /// ces champs charge tel quel, et le JSON porte bien "HH:MM:SS:FF".
+    #[test]
+    fn timecode_trigger_and_chase_setting_contract() {
+        // Défauts : show antérieur au timecode.
+        let json = r#"{"format_version":1,"name":"ancien"}"#;
+        let show: Show = serde_json::from_str(json).expect("show antérieur");
+        assert!(!show.settings.timecode_chase, "chase opt-in : défaut FAUX");
+
+        let triggers: CueTriggers =
+            serde_json::from_str(r#"{"midi_note":[0,60]}"#).expect("triggers antérieurs");
+        assert_eq!(triggers.timecode, None, "champ absent ⇒ cue manuelle");
+
+        // Roundtrip avec trigger posé : forme texte "HH:MM:SS:FF".
+        let mut show = demo_show();
+        show.cues[0].triggers.timecode = Some(TcTime::new(0, 10, 5, 12));
+        show.settings.timecode_chase = true;
+        let json = serde_json::to_string(&show).expect("ser");
+        assert!(json.contains(r#""timecode":"00:10:05:12""#), "forme texte : {json}");
+        assert!(json.contains(r#""timecode_chase":true"#));
+        let back: Show = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, show);
+    }
+
+    /// `runtime.timecode` est ABSENT de la trame quand `None` (compat) et
+    /// porte `{time, rate, locked, chasing}` sinon (contrat).
+    #[test]
+    fn runtime_timecode_field_is_optional() {
+        let st = RuntimeStatus::default();
+        let json = serde_json::to_string(&st).expect("ser");
+        assert!(!json.contains("timecode"), "champ absent quand None : {json}");
+
+        let st = RuntimeStatus {
+            timecode: Some(TimecodeStatus {
+                time: TcTime::new(10, 0, 5, 12),
+                rate: TcRate::Fps25,
+                locked: true,
+                chasing: true,
+            }),
+            ..RuntimeStatus::default()
+        };
+        let json = serde_json::to_string(&st).expect("ser");
+        assert!(json.contains(
+            r#""timecode":{"time":"10:00:05:12","rate":"fps25","locked":true,"chasing":true}"#
+        ), "contrat runtime.timecode : {json}");
         let back: RuntimeStatus = serde_json::from_str(&json).expect("de");
         assert_eq!(back, st);
     }

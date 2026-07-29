@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CoreError;
 use crate::modulation::{ModRoute, ModRouteState, ModulatorCfg};
 use crate::patch::PatchTable;
+use crate::timecode::TcTime;
 
 pub type OutputId = u32;
 pub type SliceId = u32;
@@ -346,6 +347,12 @@ pub struct CueTriggers {
     /// Adresse OSC dédiée (ex. `/conduite/cue/ouverture`).
     #[serde(default)]
     pub osc: Option<String>,
+    /// Position de timecode qui déclenche la cue quand le chase est actif
+    /// (`ShowSettings::timecode_chase` + signal verrouillé). `None` = cue
+    /// manuelle, jamais touchée par le chase. Compat serde : absent des
+    /// shows antérieurs.
+    #[serde(default)]
+    pub timecode: Option<TcTime>,
 }
 
 /// Valeur par défaut du champ `armed` (cue armée) — les shows existants
@@ -448,6 +455,11 @@ pub struct ShowSettings {
     /// Priorité process ABOVE_NORMAL au passage en mode Show (retour à
     /// Normal en Edit). Windows uniquement, défaut faux.
     pub boost_priority: bool,
+    /// Chase timecode au niveau CUES (GOTO/GO automatiques sur les triggers
+    /// `CueTriggers::timecode`, sémantique QLab/média-serveurs — voir crate
+    /// `cue`). Défaut FAUX. Indépendant de `ModKind::TimecodeChase`
+    /// (animation de paramètres, réservé v2, toujours grisé dans l'UI).
+    pub timecode_chase: bool,
 }
 
 /// URL par défaut du manifeste de mise à jour (raw GitHub du dépôt).
@@ -473,6 +485,7 @@ impl Default for ShowSettings {
             update_check: false,
             update_url: UPDATE_URL_DEFAULT.to_string(),
             boost_priority: false,
+            timecode_chase: false,
         }
     }
 }

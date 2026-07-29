@@ -19,9 +19,26 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     println!("cargo:rustc-env=CONDUITE_GIT_HASH={git_hash}");
-    // Recompiler quand HEAD bouge (chemin depuis crates/app/).
-    if std::path::Path::new("../../.git/HEAD").exists() {
-        println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // Recompiler quand le commit courant change (chemins depuis crates/app/).
+    // HEAD seul ne suffit pas : il ne bouge qu'au changement de branche ; un
+    // nouveau commit met à jour .git/refs/heads/<branche> (ou packed-refs si
+    // la réf est empaquetée par git gc). Dégradation silencieuse hors dépôt.
+    let git_dir = std::path::Path::new("../../.git");
+    let head_path = git_dir.join("HEAD");
+    if head_path.exists() {
+        println!("cargo:rerun-if-changed={}", head_path.display());
+        if let Ok(head) = std::fs::read_to_string(&head_path) {
+            if let Some(branch_ref) = head.trim().strip_prefix("ref: ") {
+                // Déclaré même si le fichier de réf n'existe pas encore
+                // (réf empaquetée) : cargo relance alors le script à chaque
+                // build, ce qui garantit un hash à jour dans tous les cas.
+                println!("cargo:rerun-if-changed={}", git_dir.join(branch_ref).display());
+            }
+        }
+        let packed = git_dir.join("packed-refs");
+        if packed.exists() {
+            println!("cargo:rerun-if-changed={}", packed.display());
+        }
     }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

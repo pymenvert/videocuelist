@@ -168,6 +168,7 @@ fn show_maximal() -> Show {
             triggers: CueTriggers {
                 midi_note: Some((0, 60)),
                 osc: Some(format!("/conduite/cue/{}", i + 1)),
+                timecode: Some(TcTime::new(0, 1 + i as u8, 30, 12)),
             },
         });
     }
@@ -352,6 +353,7 @@ fn show_maximal() -> Show {
         update_check: true,
         update_url: UPDATE_URL_DEFAULT.to_string(),
         boost_priority: true,
+        timecode_chase: true,
     };
 
     show

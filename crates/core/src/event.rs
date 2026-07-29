@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::EditOp;
 use crate::model::{AppMode, CueNumber, OutputId};
+use crate::timecode::{TcRate, TcTime};
 
 /// Événement runtime publié aux abonnés (UI, feedback OSC/MIDI, journal).
 /// JSON : `{"type":"...", ...}`.
@@ -62,6 +63,21 @@ pub struct UpdateInfo {
     pub notes: String,
 }
 
+/// État du timecode entrant publié dans `runtime.timecode` (contrat :
+/// `{ time: "HH:MM:SS:FF", rate, locked, chasing }`). `TcTime` se sérialise
+/// nativement sous la forme texte attendue.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TimecodeStatus {
+    /// Position courante (dernier signal reçu, ou extrapolée en roue libre).
+    pub time: TcTime,
+    pub rate: TcRate,
+    /// Signal présent et verrouillé ?
+    pub locked: bool,
+    /// Le chase de cues est-il effectivement en train de suivre le TC
+    /// (`ShowSettings::timecode_chase` actif ET verrouillage/roue libre) ?
+    pub chasing: bool,
+}
+
 /// Instantané de conduite sérialisé vers l'UI (~10 Hz).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStatus {
@@ -84,6 +100,10 @@ pub struct RuntimeStatus {
     /// Absent du JSON quand `None` (compat trames existantes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateInfo>,
+    /// Timecode entrant (`None` = aucune source configurée). Absent du JSON
+    /// quand `None` (compat trames existantes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timecode: Option<TimecodeStatus>,
 }
 
 impl Default for RuntimeStatus {
@@ -100,6 +120,7 @@ impl Default for RuntimeStatus {
             dbo: false,
             mod_levels: Vec::new(),
             update: None,
+            timecode: None,
         }
     }
 }

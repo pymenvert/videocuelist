@@ -24,6 +24,7 @@ pub mod hub;
 pub mod learn;
 pub mod msc;
 pub mod msg;
+pub mod mtc;
 pub mod pickup;
 pub mod resolve;
 
@@ -33,5 +34,6 @@ pub use hub::{choose_port, HubEvent, MidiHub};
 pub use learn::Learn;
 pub use msc::{parse_msc, MSC_ALL_CALL};
 pub use msg::{parse_midi, MidiMsg};
+pub use mtc::{MtcAssembler, MtcClock, MtcEvent, FREEWHEEL_S};
 pub use pickup::{Pickup, PickupDecision};
 pub use resolve::{resolve, scale};

@@ -17,9 +17,11 @@ use conduite_control_osc::FeedbackEvent;
 use conduite_core::{
     AppMode, Command, Content, CoreError, Cue, CueDefaults, CueNumber, EditOp, FollowMode,
     LoadWarning, MaterialId, MaterialRef, MediaId, MediaRef, OutputCfg, OutputId, ParamValue,
-    PatternKind, RuntimeStatus, Show, ShowSettings, SliceId, Source, StateEvent, Transition,
+    PatternKind, RuntimeStatus, Show, ShowSettings, SliceId, Source, StateEvent, TimecodeStatus,
+    Transition,
 };
-use conduite_cue::{CueEngine, CueEvent, CueFrame, EngineTick, SceneTarget};
+use conduite_control_midi::MtcClock;
+use conduite_cue::{CueEngine, CueEvent, CueFrame, EngineTick, SceneTarget, TcState};
 use conduite_isf::{IsfInputKind, IsfSources};
 use conduite_media_library::ProbeInfo;
 use conduite_modulation::{
@@ -265,6 +267,14 @@ pub struct Session {
     update_info: Option<conduite_core::UpdateInfo>,
     /// Une génération de rapport de diagnostic est déjà en cours.
     diagnostic_running: Arc<AtomicBool>,
+    /// Horloge MTC : nourrie par le canal dédié du hub MIDI à chaque tick,
+    /// interpole entre les quarter-frames et freewheele 2 s sur perte.
+    mtc: MtcClock,
+    /// État courant publié dans `runtime.timecode` (contrat : `None` tant
+    /// qu'aucune position n'a jamais été reçue — affichage « absent »).
+    tc_status: Option<TimecodeStatus>,
+    /// Verrouillage au tick précédent (événement UI + journal aux fronts).
+    tc_locked: bool,
 }
 
 impl Session {
@@ -373,6 +383,9 @@ impl Session {
             update_rx: None,
             update_info: None,
             diagnostic_running: Arc::new(AtomicBool::new(false)),
+            mtc: MtcClock::new(),
+            tc_status: None,
+            tc_locked: false,
         };
         // Vérification de mise à jour OPT-IN : une seule requête, au
         // démarrage (toujours en mode Edit), timeout 3 s, jamais de
@@ -542,13 +555,29 @@ impl Session {
             }
         }
 
-        // 2. Moteur de cues (l'oracle EOF interroge les players).
+        // 2. Horloge timecode (canal MTC du hub MIDI → MtcClock → contrat
+        // `runtime.timecode` + fronts lock/unlock), puis moteur de cues.
+        // Le chase fonctionne aussi en mode Show — c'est son usage principal.
+        self.protocols.drain_mtc(&mut self.mtc, now_s);
+        self.update_timecode(now_s);
         let frame = {
             let players = &self.players;
             let eof = |sid: SliceId| players.media_eof(sid);
+            // `tc = None` = chase coupé (réglage désactivé ou aucune source) :
+            // comportement inchangé, les cues restent manuelles.
+            let tc = if self.show.settings.timecode_chase {
+                self.tc_status.map(|s| TcState {
+                    time: s.time,
+                    rate: s.rate,
+                    locked: s.locked,
+                })
+            } else {
+                None
+            };
             self.cue.tick(EngineTick {
                 now_s,
                 media_eof: &eof,
+                tc,
             })
         };
         self.process_cue_events(&frame.events);
@@ -2335,6 +2364,37 @@ impl Session {
             .set_device(effective_audio_input(&self.config, &self.show.settings));
     }
 
+    /// Met à jour `runtime.timecode` depuis l'horloge MTC et publie les
+    /// fronts de verrouillage : journal (tracing → page Journal) + événement
+    /// UI (`timecode_locked` / `timecode_unlocked`, toast côté webui).
+    /// Pendant la roue libre (2 s), `locked` reste vrai et le temps avance ;
+    /// après, la position se fige et `locked` tombe — les cues actives
+    /// CONTINUENT, l'unlock ne coupe rien.
+    fn update_timecode(&mut self, now_s: f64) {
+        let chase = self.show.settings.timecode_chase;
+        self.tc_status = self.mtc.current(now_s).map(|(time, locked)| TimecodeStatus {
+            time,
+            rate: self.mtc.rate(),
+            locked,
+            chasing: chase && locked,
+        });
+        let locked = self.tc_status.map(|s| s.locked).unwrap_or(false);
+        if locked == self.tc_locked {
+            return;
+        }
+        self.tc_locked = locked;
+        if locked {
+            info!(target: "app::session", rate = %self.mtc.rate(), "timecode verrouillé (MTC)");
+        } else {
+            warn!(target: "app::session",
+                "signal timecode perdu (roue libre écoulée) — les cues actives continuent");
+        }
+        let _ = self.events_tx.send(json!({
+            "type": if locked { "timecode_locked" } else { "timecode_unlocked" },
+            "rate": self.mtc.rate(),
+        }));
+    }
+
     fn runtime_status(&self, st: &conduite_cue::CueStatus) -> RuntimeStatus {
         RuntimeStatus {
             mode: self.mode,
@@ -2350,6 +2410,9 @@ impl Session {
             // Renseigné par la vérification de mise à jour opt-in (thread
             // `conduite-update`, ramassé sur le tick).
             update: self.update_info.clone(),
+            // CONTRAT runtime.timecode : `None` tant qu'aucune position MTC
+            // n'a jamais été reçue (affichage « absent » côté UI).
+            timecode: self.tc_status,
         }
     }
 

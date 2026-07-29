@@ -130,7 +130,8 @@
           0,
           60
         ],
-        "osc": "/conduite/cue/1"
+        "osc": "/conduite/cue/1",
+        "timecode": "00:01:30:12"
       }
     },
     {
@@ -200,7 +201,8 @@
           0,
           60
         ],
-        "osc": "/conduite/cue/2"
+        "osc": "/conduite/cue/2",
+        "timecode": "00:02:30:12"
       }
     },
     {
@@ -272,7 +274,8 @@
           0,
           60
         ],
-        "osc": "/conduite/cue/3"
+        "osc": "/conduite/cue/3",
+        "timecode": "00:03:30:12"
       }
     },
     {
@@ -347,7 +350,8 @@
           0,
           60
         ],
-        "osc": "/conduite/cue/4"
+        "osc": "/conduite/cue/4",
+        "timecode": "00:04:30:12"
       }
     },
     {
@@ -417,7 +421,8 @@
           0,
           60
         ],
-        "osc": "/conduite/cue/5"
+        "osc": "/conduite/cue/5",
+        "timecode": "00:05:30:12"
       }
     },
     {
@@ -494,7 +499,8 @@
       "mod_routes": [],
       "triggers": {
         "midi_note": null,
-        "osc": null
+        "osc": null,
+        "timecode": null
       }
     }
   ],
@@ -795,6 +801,7 @@
     },
     "update_check": true,
     "update_url": "https://raw.githubusercontent.com/pymenvert/videocuelist/main/latest.json",
-    "boost_priority": true
+    "boost_priority": true,
+    "timecode_chase": true
   }
 }

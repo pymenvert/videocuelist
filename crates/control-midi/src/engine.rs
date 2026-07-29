@@ -9,6 +9,7 @@ use crate::cc14::Cc14Assembler;
 use crate::learn::Learn;
 use crate::msc::{parse_msc, MSC_ALL_CALL};
 use crate::msg::{parse_midi, MidiMsg};
+use crate::mtc::{MtcAssembler, MtcEvent};
 use crate::pickup::{Pickup, PickupDecision};
 use crate::resolve::{find_cc, resolve, scale};
 
@@ -27,6 +28,9 @@ pub enum EngineEvent {
     },
     /// Soft-takeover : le fader vient de reprendre la main.
     PickupEngaged { addr: String },
+    /// Flux d'horloge MTC : routé dans le canal DÉDIÉ du hub (pas une
+    /// commande — consommé par l'app à chaque tick).
+    Mtc(MtcEvent),
 }
 
 /// Moteur de traduction MIDI (pur). Le hub le partage entre le callback midir
@@ -37,6 +41,7 @@ pub struct MidiEngine {
     cc14: Cc14Assembler,
     pickup: Pickup,
     learn: Learn,
+    mtc: MtcAssembler,
     /// Device id MSC de CE récepteur (0x7F = accepte tout).
     msc_device_id: u8,
 }
@@ -54,6 +59,7 @@ impl MidiEngine {
             cc14: Cc14Assembler::new(),
             pickup: Pickup::new(),
             learn: Learn::new(),
+            mtc: MtcAssembler::new(),
             msc_device_id,
         }
     }
@@ -99,6 +105,14 @@ impl MidiEngine {
     /// monotone du hub.
     pub fn handle(&mut self, bytes: &[u8], now_ms: u64) -> Vec<EngineEvent> {
         let mut out = Vec::new();
+        // MTC (quarter-frames F1, full-frame SysEx) : flux d'horloge dédié,
+        // jamais consommé par le learn ni les bindings.
+        if MtcAssembler::is_mtc(bytes) {
+            if let Some(ev) = self.mtc.push(bytes) {
+                out.push(EngineEvent::Mtc(ev));
+            }
+            return out;
+        }
         let Some(msg) = parse_midi(bytes) else {
             trace!(?bytes, "message MIDI ignoré");
             return out;

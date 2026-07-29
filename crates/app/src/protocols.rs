@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 
 use conduite_control_artnet::{smoothing_overrides, ArtnetNode};
-use conduite_control_midi::{HubEvent, MidiHub};
+use conduite_control_midi::{HubEvent, MidiHub, MtcClock};
 use conduite_control_osc::{FeedbackEvent, OscFeedback, OscFeedbackHandle, OscServer, OscServerHandle};
 use conduite_core::{Command, PatchTable, ShowSettings, Source};
 use crossbeam_channel::{Receiver, Sender};
@@ -351,6 +351,18 @@ impl Protocols {
     pub fn midi_update_logical(&self, addr: &str, value: f32) {
         if let Some(hub) = &self.midi {
             hub.update_logical(addr, value);
+        }
+    }
+
+    /// Draine le canal d'horloge MTC du hub vers l'horloge de l'app (appelé
+    /// à chaque tick, coût de `try_recv`). Les événements sont datés `now_s`
+    /// (horloge monotone de la session) : la latence de traversée du canal
+    /// (< un tick) est négligeable devant la granularité des quarter-frames.
+    pub fn drain_mtc(&self, clock: &mut MtcClock, now_s: f64) {
+        let Some(hub) = &self.midi else { return };
+        let rx = hub.mtc();
+        while let Ok(ev) = rx.try_recv() {
+            clock.feed(ev, now_s);
         }
     }
 
