@@ -454,6 +454,16 @@ body.mode-show #mode-badge {
 #clock { font-variant-numeric: tabular-nums; color: var(--text-2); }
 #sb-version { color: var(--text-3); }
 
+/* timecode entrant (MTC) : visible seulement si le chase est activé.
+   Gris = aucun signal, vert = verrouillé, orange = signal perdu (figé). */
+#sb-timecode {
+  font: var(--fs-xs) var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+#sb-timecode.ok { color: var(--ok); }
+#sb-timecode.lost { color: var(--warn); }
+
 /* avertissements : icône + compte, visible seulement s'il y a un problème */
 #warn-chip {
   display: inline-flex;
@@ -726,6 +736,11 @@ body.mode-show .edit-only { display: none !important; }
   white-space: nowrap;
 }
 .cue-badge.loop { color: var(--accent-2); border-color: var(--accent-line); }
+.cue-badge.tc {
+  color: var(--ok);
+  border-color: rgba(67, 196, 127, 0.4);
+  font-variant-numeric: tabular-nums;
+}
 .cue-badge.off { color: var(--warn); border-color: rgba(240, 178, 50, 0.35); }
 
 /* standby : liseré accent */

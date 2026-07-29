@@ -82,6 +82,43 @@ Compatible Chataigne, TouchOSC, Open Stage Control, Bitfocus Companion (module O
   Le bouton *Learn* (mapper en bougeant le contrôleur) arrive dans une prochaine version.
 - **MIDI Show Control** : GO/STOP/RESUME/LOAD reçus d'une console lumière ou de QLab.
 
+### Timecode (MTC) — chase de cues
+
+Conduite peut suivre un **MIDI Time Code** entrant et déclencher les cues toute
+seule, comme QLab ou un média-serveur : idéal quand la bande-son (ou la console)
+fait foi et que la vidéo doit se caler dessus.
+
+**Brancher une source :**
+1. La source MTC (DAW, QLab, console…) doit arriver sur le **port MIDI d'entrée
+   utilisé par Conduite** — le même que le pilotage MIDI (état visible dans
+   l'onglet Patch). Cadences reconnues : 24, 25, 29,97 DF et 30 i/s.
+2. Dans **Réglages → Chase timecode**, cochez la case.
+3. Dans l'onglet **Cues**, colonne **Timecode**, donnez à chaque cue concernée
+   sa position de déclenchement au format `HH:MM:SS:FF` (ex. `00:05:30:00`).
+   Champ vide = cue manuelle, jamais touchée par le chase. Les deux types de
+   cues coexistent librement dans la même conduite.
+
+Le timecode reçu s'affiche près de l'horloge, en bas à droite : **vert** =
+signal verrouillé (la cadence est dans l'infobulle), **orange** = signal perdu
+(dernier timecode figé), **gris** = aucun signal reçu.
+
+**Sémantique du calage :**
+- **Avancée normale** : chaque cue dont le déclencheur passe est jouée (GO
+  direct, sa transition est respectée).
+- **Saut avant ou arrière** (relecture, scrub) : Conduite se cale par GOTO sur
+  la **dernière** cue dont le déclencheur est ≤ au timecode courant (noir si
+  aucune).
+- **Perte de signal** : 2 s de **roue libre** (le temps continue d'avancer en
+  interne), puis le chase se met en pause — **les cues actives continuent**,
+  rien n'est coupé ni éteint. Au retour du signal, re-calage comme après un
+  saut. Chaque verrouillage/perte est signalé par un toast et une ligne de
+  Journal.
+
+Le chase fonctionne bien sûr en **mode Show** — c'est son usage principal.
+Note : l'option « Timecode » du popover d'animation des *paramètres* reste
+grisée ; le chase pilote les **cues** (l'animation de paramètres au timecode
+viendra plus tard).
+
 ### Art-Net (port 6454)
 
 Le logiciel se comporte comme un récepteur DMX : patchez univers/canal → paramètre

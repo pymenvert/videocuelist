@@ -135,6 +135,30 @@
 
   /* ============================================== helpers du modèle JSON */
 
+  /* Timecode "HH:MM:SS:FF" — miroir de TcTime::from_str côté Rust :
+     4 champs de 1-2 chiffres séparés par ':' (ou ';' drop-frame toléré),
+     bornes 23/59/59/59. Retourne la forme normalisée "HH:MM:SS:FF",
+     null si vide (= cue manuelle), undefined si invalide. */
+  function tcParse(txt) {
+    var raw = String(txt || '').trim();
+    if (!raw) { return null; }
+    var parts = raw.split(/[:;]/);
+    if (parts.length !== 4) { return undefined; }
+    var max = [23, 59, 59, 59];
+    var out = [];
+    for (var i = 0; i < 4; i++) {
+      if (!/^\d{1,2}$/.test(parts[i])) { return undefined; }
+      var v = parseInt(parts[i], 10);
+      if (v > max[i]) { return undefined; }
+      out.push((v < 10 ? '0' : '') + v);
+    }
+    return out.join(':');
+  }
+
+  /* Cadence TcRate (serde snake_case) → libellé humain (i/s). */
+  var TC_RATES = { fps24: '24', fps25: '25', fps2997_df: '29,97 DF', fps30: '30' };
+  function tcRateLabel(r) { return TC_RATES[r] || String(r || '?'); }
+
   function followKind(f) {
     if (typeof f === 'string') { return f; }
     if (f && typeof f === 'object' && 'wait' in f) { return 'wait'; }
@@ -183,7 +207,7 @@
       number: number, name: 'Cue ' + cnStr(number), color: null, notes: '', armed: true,
       transition: { kind: 'crossfade', dur_s: 1.0, curve: 'linear' },
       follow: 'manual', goto_after: null, states: [], mod_routes: [],
-      triggers: { midi_note: null, osc: null }
+      triggers: { midi_note: null, osc: null, timecode: null }
     };
   }
 
@@ -1427,6 +1451,14 @@
       out.push(el('span', { class: 'cue-badge', 'data-tip': 'Follow : enchaîne après l’attente' },
         'attente ' + fmtF(followWait(c.follow), 1) + ' s'));
     }
+    var tct = c.triggers && c.triggers.timecode;
+    if (tct) {
+      out.push(el('span', {
+        class: 'cue-badge tc',
+        'data-tip': 'Déclenchée par timecode à ' + tct +
+          (settings().timecode_chase ? '' : ' — chase inactif (Réglages → Chase timecode)')
+      }, 'TC ' + tct));
+    }
     if (c.goto_after !== null && c.goto_after !== undefined) {
       out.push(el('span', { class: 'cue-badge loop', 'data-tip': 'À la fin, saute à la cue ' + cnStr(c.goto_after) },
         '⟳ vers ' + cnStr(c.goto_after)));
@@ -1782,6 +1814,28 @@
         }
       }
     }
+    /* Timecode entrant (runtime.timecode, contrat {time, rate, locked,
+       chasing}) : affiché près de l'horloge UNIQUEMENT si le chase est
+       activé dans les Réglages. Vert = verrouillé (roue libre de 2 s
+       comprise), orange = signal perdu (dernier timecode figé), gris =
+       aucun signal jamais reçu. */
+    var tcEl = byId('sb-timecode');
+    if (tcEl) {
+      var chase = !!settings().timecode_chase;
+      var t = r.timecode || null;
+      tcEl.classList.toggle('hidden', !chase);
+      if (chase) {
+        tcEl.textContent = 'TC ' + (t ? t.time : '--:--:--:--');
+        tcEl.classList.toggle('ok', !!(t && t.locked));
+        tcEl.classList.toggle('lost', !!(t && !t.locked));
+        var tip = !t
+          ? 'Chase timecode actif — aucun signal MTC reçu (brancher une source timecode sur un port MIDI).'
+          : (t.locked
+            ? 'Timecode MTC verrouillé (' + tcRateLabel(t.rate) + ' i/s) — le chase suit.'
+            : 'Signal timecode perdu (' + tcRateLabel(t.rate) + ' i/s) — dernier timecode figé, les cues actives continuent.');
+        if (tcEl.getAttribute('data-tip') !== tip) { tcEl.setAttribute('data-tip', tip); }
+      }
+    }
     var chip = byId('warn-chip');
     if (chip) {
       var warns = Array.isArray(r.warnings) ? r.warnings : [];
@@ -1954,6 +2008,7 @@
         el('th', { 'data-tip': 'Durée de la transition (secondes)' }, 'Durée'),
         el('th', { 'data-tip': 'Courbe d’interpolation' }, 'Courbe'),
         el('th', { 'data-tip': 'Enchaînement : GO manuel, fin de média, ou attente chronométrée' }, 'Follow'),
+        el('th', { 'data-tip': 'Déclenchement par timecode : « HH:MM:SS:FF », vide = cue manuelle. Actif quand « Chase timecode » est coché dans Réglages et qu’un signal MTC est verrouillé.' }, 'Timecode'),
         el('th', { 'data-tip': 'Notes de régie (visibles en Live)' }, 'Notes'),
         el('th', { 'data-tip': 'Contenus posés par cette cue' }, 'Contenus')));
 
@@ -2044,6 +2099,26 @@
       });
     }
     tr.appendChild(el('td', null, fsel, fwait));
+
+    var tcIn = el('input', {
+      type: 'text', value: (c.triggers && c.triggers.timecode) || '',
+      placeholder: '—', style: 'width:96px', class: 'tc-input',
+      'data-tip': 'Position « HH:MM:SS:FF » qui déclenche la cue quand le chase timecode est actif (Réglages). Vide = cue manuelle, jamais touchée par le chase.'
+    });
+    tcIn.addEventListener('change', function () {
+      var v = tcParse(tcIn.value);
+      if (v === undefined) {
+        uiWarn('Timecode invalide — format HH:MM:SS:FF (ex. 00:05:30:00).');
+        tcIn.value = (c.triggers && c.triggers.timecode) || '';
+        return;
+      }
+      tcIn.value = v || '';
+      commit(function (x) {
+        x.triggers = x.triggers || {};
+        x.triggers.timecode = v;
+      });
+    });
+    tr.appendChild(el('td', null, tcIn));
 
     var notes = el('input', { type: 'text', value: c.notes || '', 'data-tip': 'Notes de régie' });
     notes.addEventListener('change', function () { commit(function (x) { x.notes = notes.value; }); });
@@ -3604,8 +3679,8 @@
       src.appendChild(el('option', { value: 'new_band' }, '+ Créer une bande FFT'));
       src.appendChild(el('option', {
         value: 'timecode', disabled: 'disabled',
-        title: 'Chase timecode (MTC/LTC) — prévu en v2'
-      }, 'Timecode (v2)'));
+        title: 'Le chase timecode pilote les CUES (Réglages → Chase timecode) ; l’animation de paramètres au timecode viendra plus tard'
+      }, 'Timecode (réservé)'));
 
       src.addEventListener('change', function () {
         var v = src.value;
@@ -4217,6 +4292,14 @@
         x.panic_fade_s = clamp(parseFloat(panicFade.value) || 0, 0, 30);
       });
     });
+    /* chase timecode : les cues à déclencheur TC suivent un MTC entrant */
+    var tcChk = el('input', {
+      type: 'checkbox', checked: !!st.timecode_chase,
+      'data-tip': 'Suit un timecode MTC entrant (ports MIDI). À l’avancée normale : chaque cue dont le déclencheur passe est jouée (GO, transition respectée). Sur un saut avant/arrière : calage direct (GOTO) sur la dernière cue dont le déclencheur est ≤ au timecode. Perte de signal : 2 s de roue libre puis pause du chase — les cues actives continuent, rien n’est coupé ; au retour du signal, re-calage comme après un saut. Les cues sans déclencheur restent manuelles.'
+    });
+    tcChk.addEventListener('change', function () {
+      commitSettings(function (x) { x.timecode_chase = tcChk.checked; });
+    });
     /* mise à jour : opt-in, désactivée par défaut, libellé honnête */
     var updChk = el('input', {
       type: 'checkbox', checked: !!st.update_check,
@@ -4232,6 +4315,9 @@
       el('span', null, 'Préview (img/s)'), fps,
       el('span', null, 'Anti double-GO (ms)'), goMs,
       el('span', null, 'Fondu du panic (s)'), panicFade,
+      el('span', null, 'Chase timecode'),
+      el('span', { class: 'toolbar', style: 'margin:0' }, tcChk,
+        el('span', { class: 'muted' }, 'déclenche les cues à déclencheur TC sur un timecode MTC entrant')),
       el('span', null, 'Vérifier les mises à jour'),
       el('span', { class: 'toolbar', style: 'margin:0' }, updChk,
         el('span', { class: 'muted' }, 'vérifie une fois au démarrage, ne télécharge rien'))));
@@ -4699,6 +4785,12 @@
         renderAll();
         break;
       case 'health_tick': S.health = ev.snapshot; updateHealth(); break;
+      case 'timecode_locked':
+        toast('Timecode verrouillé (' + tcRateLabel(ev.rate) + ' i/s).', 'ok');
+        break;
+      case 'timecode_unlocked':
+        toast('Signal timecode perdu — les cues actives continuent.', 'warn');
+        break;
       case 'log_line':
         pushLog(ev.level, ev.target, ev.message);
         reactToLog(ev);
