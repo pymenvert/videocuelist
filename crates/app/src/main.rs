@@ -273,7 +273,7 @@ fn run() -> i32 {
 fn about_info() -> serde_json::Value {
     json!({
         "name": "Conduite",
-        "description": "Régie vidéo de spectacle — cues, mapping, ISF, MIDI/OSC/Art-Net",
+        "description": conduite_core::ui_text::about::DESCRIPTION,
         "version": env!("CARGO_PKG_VERSION"),
         "git": env!("CONDUITE_GIT_HASH"),
         "license": "MIT",
@@ -282,20 +282,20 @@ fn about_info() -> serde_json::Value {
         "credits": [
             {
                 "name": "FFmpeg",
-                "role": "décodage vidéo (programme séparé, appelé en sous-processus)",
+                "role": conduite_core::ui_text::about::ROLE_FFMPEG,
                 "license": "LGPL v3",
                 "url": "https://ffmpeg.org",
                 "notice": "licenses/FFMPEG.txt"
             },
             {
-                "name": "Dépendances Rust",
-                "role": "bibliothèques du moteur et des surfaces de contrôle",
+                "name": conduite_core::ui_text::about::NAME_RUST_DEPS,
+                "role": conduite_core::ui_text::about::ROLE_RUST_DEPS,
                 "license": "MIT / Apache-2.0 / BSD / ISC / Zlib",
                 "notice": "licenses/THIRD-PARTY-NOTICES.html"
             },
             {
-                "name": "Shaders DomePack",
-                "role": "matériaux ISF embarqués",
+                "name": conduite_core::ui_text::about::NAME_SHADERS,
+                "role": conduite_core::ui_text::about::ROLE_SHADERS,
                 "license": "© Pym — Pack Sources Dome-Native",
                 "notice": "shaders/CREDITS.txt"
             }

@@ -13,6 +13,22 @@ Régie vidéo de spectacle : on prépare des **cues** (des scènes complètes), 
 Un show de démonstration est créé au premier lancement (mires, matériaux, une vidéo).
 `ffmpeg` doit être disponible (dossier `bin/` du portable, sinon dans le PATH).
 
+### Langue de l'interface
+
+**Réglages → Langue** bascule l'interface entre **français** et **anglais** —
+immédiatement, sans rechargement, y compris en pleine conduite. Le choix est
+enregistré **dans le show** : une conduite préparée en anglais s'ouvre en
+anglais chez le régisseur suivant, quelle que soit la machine.
+
+Suivent la langue : tous les libellés, boutons, menus contextuels, infobulles,
+messages et confirmations, ainsi que les avertissements du centre **État du
+show** (média manquant, moniteur perdu, port occupé).
+
+Restent en français : le **journal** (onglet Journal et fichiers `logs/`) et
+les quelques toasts techniques du moteur. C'est un outil de diagnostic destiné
+au support, pas un organe de conduite — le rapport de diagnostic est lisible
+tel quel par l'auteur.
+
 ## 2. Les concepts en 30 secondes
 
 | Terme | Ce que c'est |

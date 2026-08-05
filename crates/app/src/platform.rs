@@ -187,11 +187,16 @@ mod imp {
 
     /// SIGINT/SIGTERM → arrêt propre.
     pub fn install_quit_handler() {
+        // Passage explicite par un pointeur : la conversion directe
+        // fonction → entier est refusée par clippy (`function_casts_as_integer`)
+        // parce qu'elle vaut l'ADRESSE de l'item, pas un pointeur de fonction
+        // en bonne et due forme. `as *const ()` rend l'intention explicite.
+        let handler = on_signal as *const () as libc::sighandler_t;
         unsafe {
-            if libc::signal(libc::SIGINT, on_signal as libc::sighandler_t) == libc::SIG_ERR {
+            if libc::signal(libc::SIGINT, handler) == libc::SIG_ERR {
                 warn!(target: "app::platform", "handler SIGINT refusé");
             }
-            if libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t) == libc::SIG_ERR {
+            if libc::signal(libc::SIGTERM, handler) == libc::SIG_ERR {
                 warn!(target: "app::platform", "handler SIGTERM refusé");
             }
         }

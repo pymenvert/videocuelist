@@ -15,10 +15,10 @@ use bytes::Bytes;
 use conduite_compositor::{BlendMode, SliceDraw};
 use conduite_control_osc::FeedbackEvent;
 use conduite_core::{
-    AppMode, Command, Content, CoreError, Cue, CueDefaults, CueNumber, EditOp, FollowMode,
-    LoadWarning, MaterialId, MaterialRef, MediaId, MediaRef, OutputCfg, OutputId, ParamValue,
-    PatternKind, RuntimeStatus, Show, ShowSettings, SliceId, Source, StateEvent, TimecodeStatus,
-    Transition,
+    ui_text, AppMode, Command, Content, CoreError, Cue, CueDefaults, CueNumber, EditOp,
+    FollowMode, LoadWarning, MaterialId, MaterialRef, MediaId, MediaRef, OutputCfg, OutputId,
+    ParamValue, PatternKind, RuntimeStatus, Show, ShowSettings, SliceId, Source, StateEvent,
+    TimecodeStatus, Transition,
 };
 use conduite_control_midi::MtcClock;
 use conduite_cue::{CueEngine, CueEvent, CueFrame, EngineTick, SceneTarget, TcState};
@@ -707,7 +707,7 @@ impl Session {
                 );
                 // CONTRAT runtime.shows : noms des dossiers de `shows/`.
                 map.insert("shows".to_string(), json!(self.shows_list));
-                // CONTRAT runtime.warnings : [{level, msg, action?}].
+                // CONTRAT runtime.warnings : [{level, msg, key, args, action?}].
                 map.insert("warnings".to_string(), Value::Array(self.build_warnings()));
                 // Récupération post-crash en attente de décision.
                 if let Some((path, timestamp)) = &self.recovery_pending {
@@ -1002,42 +1002,60 @@ impl Session {
         }
     }
 
-    /// Construit `runtime.warnings` (contrat : [{level, msg, action?}]) :
+    /// Construit `runtime.warnings` (contrat : [{level, msg, key, args, action?}]) :
     /// médias manquants (action « relink »), protocoles en erreur, MIDI
     /// déconnecté (action « midi »), moniteurs perdus (action « output »).
+    ///
+    /// `msg` reste la phrase française toute faite (compatibilité, journal,
+    /// rapport de diagnostic) ; `key` + `args` en sont la forme démontée —
+    /// gabarit `{0}` et valeurs — pour que la web UI la RECOMPOSE dans la
+    /// langue de l'opérateur (`trf`). Le centre « État du show » est le texte
+    /// moteur le plus lu en régie : il ne pouvait pas rester monolingue.
     fn build_warnings(&self) -> Vec<Value> {
+        /// Un avertissement : gabarit `core::warnings` + valeurs, rendu en
+        /// français dans `msg` et laissé démonté dans `key`/`args`.
+        fn warn(level: &str, key: &str, args: Vec<String>, action: Option<&str>) -> Value {
+            let mut w = json!({
+                "level": level,
+                "msg": ui_text::render(key, &args),
+                "key": key,
+                "args": args,
+            });
+            if let Some(a) = action {
+                w["action"] = json!(a);
+            }
+            w
+        }
+
         let mut out = Vec::new();
         let missing: Vec<&MediaRef> = self.show.media.iter().filter(|m| m.missing).collect();
         for m in missing.iter().take(WARN_MEDIA_MAX) {
-            out.push(json!({
-                "level": "warn",
-                "msg": format!("média manquant : {}", m.path),
-                "action": "relink",
-            }));
+            out.push(warn(
+                "warn",
+                ui_text::warnings::MEDIA_MISSING,
+                vec![m.path.clone()],
+                Some("relink"),
+            ));
         }
         if missing.len() > WARN_MEDIA_MAX {
-            out.push(json!({
-                "level": "warn",
-                "msg": format!("… et {} autres médias manquants", missing.len() - WARN_MEDIA_MAX),
-                "action": "relink",
-            }));
+            out.push(warn(
+                "warn",
+                ui_text::warnings::MEDIA_MISSING_MORE,
+                vec![(missing.len() - WARN_MEDIA_MAX).to_string()],
+                Some("relink"),
+            ));
         }
         let ps = self.protocols.status();
-        for (name, status, action) in [
-            ("OSC entrant", &ps.osc_in, None),
-            ("OSC sortant", &ps.osc_out, None),
-            ("Art-Net", &ps.artnet, None),
-            ("MIDI", &ps.midi, Some("midi")),
+        for (key, status, action) in [
+            (ui_text::warnings::PROTO_OSC_IN, &ps.osc_in, None),
+            (ui_text::warnings::PROTO_OSC_OUT, &ps.osc_out, None),
+            (ui_text::warnings::PROTO_ARTNET, &ps.artnet, None),
+            (ui_text::warnings::PROTO_MIDI, &ps.midi, Some("midi")),
         ] {
             if let Some(msg) = status.strip_prefix("erreur: ") {
-                let mut w = json!({
-                    "level": "err",
-                    "msg": format!("{name} : {msg}"),
-                });
-                if let Some(a) = action {
-                    w["action"] = json!(a);
-                }
-                out.push(w);
+                // Le nom du protocole est DANS le gabarit (donc traduit) ;
+                // `{0}` reste le message système brut, jamais traduit.
+                out.push(warn("err", key, vec![msg.to_string()], action));
             }
         }
         for output in &self.monitor_fallback {
@@ -1048,13 +1066,12 @@ impl Session {
                 .find(|o| o.id == *output)
                 .map(|o| o.name.as_str())
                 .unwrap_or("?");
-            out.push(json!({
-                "level": "err",
-                "msg": format!(
-                    "sortie « {name} » : moniteur perdu, repli fenêtré (rebranchez l'écran)"
-                ),
-                "action": "output",
-            }));
+            out.push(warn(
+                "err",
+                ui_text::warnings::MONITOR_LOST,
+                vec![name.to_string()],
+                Some("output"),
+            ));
         }
         out
     }

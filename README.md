@@ -20,7 +20,7 @@ surprend jamais.**
 | **Matériaux** | Shaders ISF / GLSL avec paramètres exposés automatiquement (sliders, couleurs), pack DomePack livré |
 | **Modulation** | LFO (6 formes, Hz ou BPM + tap tempo), bandes audio temps réel (FFT, enveloppe), profondeur enregistrée par cue |
 | **Pilotage** | Chaque paramètre adressable en **OSC**, mappable **MIDI** (soft-takeover, MIDI Show Control), patchable **Art-Net** ; feedback sortant |
-| **Régie web** | Interface complète dans le navigateur — localement ou depuis une tablette du même réseau, aucune installation |
+| **Régie web** | Interface complète dans le navigateur — localement ou depuis une tablette du même réseau, aucune installation ; **bilingue français / anglais**, bascule immédiate même en pleine conduite, langue enregistrée dans le show |
 | **Fiabilité** | Écritures atomiques, autosave + backups rotatifs + récupération après crash, verrou mono-instance, journaux horodatés, bandeau santé |
 
 **Cibles** : Windows · macOS · Ubuntu · Raspberry Pi 4/5.

@@ -62,6 +62,12 @@ Dézipper `dist/Conduite-{version}-win64.zip` dans un dossier de test
 - [ ] `conduite.exe` démarre, l'UI répond sur http://localhost:9820.
 - [ ] `--version` affiche la bonne version (et le hash git).
 - [ ] Show de démo : un GO produit une image ; Échap = panic ; B = DBO.
+- [ ] **Bilingue** : Réglages → Langue → *English*, puis parcourir les
+      10 onglets. Aucun mot français ne doit rester **hors du Journal**
+      (le journal et `logs/` sont volontairement en français). Repasser en
+      *Français* : tout revient, sans rechargement. Les tests bloquent déjà
+      une chaîne non traduite — cette passe attrape ce qu'un test ne voit
+      pas : une traduction qui déborde de son bouton.
 - [ ] LISEZMOI.txt lisible (accents corrects), licenses/ complet
       (FFMPEG.txt, THIRD-PARTY-NOTICES.html), shaders/CREDITS.txt présent.
 - [ ] Quitter proprement (bouton Quitter) : aucun process résiduel.

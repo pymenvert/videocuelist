@@ -19,6 +19,7 @@ pub mod patch;
 pub mod paths;
 pub mod persist;
 pub mod timecode;
+pub mod ui_text;
 
 pub use command::{Command, CommandTemplate, EditOp, Source};
 pub use demo::demo_show;

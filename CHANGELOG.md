@@ -26,7 +26,7 @@ version portable Windows.
   branchement enregistrée par cue ; spectre en direct dans l'onglet.
 - **Pilotage** : OSC in/out (`/conduite/...`), MIDI (notes, CC 7/14 bits
   avec soft-takeover, MIDI Show Control), Art-Net (récepteur DMX patchable,
-  répond à ArtPoll) ; interface web de régie complète (10 onglets, FR),
+  répond à ArtPoll) ; interface web de régie complète (10 onglets, FR/EN),
   utilisable depuis une tablette.
 - **Timecode (MTC)** : réception MIDI Time Code sur le port d'entrée
   existant (quarter-frames et full-frames, 24/25/29,97 DF/30 fps,
@@ -40,6 +40,18 @@ version portable Windows.
   manuelles et cues timecodées coexistent ; affichage du TC entrant en
   direct (Live et pied de page, vert/orange/gris), colonne Timecode et
   badge TC dans la liste des cues, toasts au verrouillage/perte.
+- **Interface bilingue FR/EN** : **Réglages → Langue** bascule toute
+  l'interface entre français et anglais, immédiatement et sans rechargement,
+  y compris en pleine conduite ; le choix est enregistré dans le show (une
+  conduite préparée en anglais s'ouvre en anglais chez le régisseur suivant).
+  Suivent la langue : libellés, boutons, menus contextuels, infobulles,
+  confirmations, toasts de l'interface **et** les avertissements du centre
+  « État du show » (média manquant, moniteur perdu, port occupé — le moteur
+  publie désormais `runtime.warnings` sous forme de gabarit + valeurs). Le
+  français reste la langue source : une chaîne non traduite s'affiche en
+  français, jamais en blanc. Le journal et les fichiers `logs/` restent en
+  français (outil de diagnostic). Garde-fou en CI : toute chaîne française
+  ajoutée à la web UI sans traduction fait échouer les tests.
 - **Fiabilité spectacle** : verrou mono-instance (2ᵉ lancement refusé,
   code 10), autosave, backups rotatifs par show avec proposition de
   récupération au démarrage après arrêt sale, journaux horodatés,

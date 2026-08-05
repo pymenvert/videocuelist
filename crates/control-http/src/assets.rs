@@ -9,6 +9,8 @@ pub const INDEX_HTML: &str = include_str!("../../../webui/index.html");
 pub const APP_JS: &str = include_str!("../../../webui/app.js");
 /// Couche WebSocket (reconnexion, backoff).
 pub const WS_JS: &str = include_str!("../../../webui/ws.js");
+/// Bilingue FR/EN : catalogue anglais + `tr` / `trf`.
+pub const I18N_JS: &str = include_str!("../../../webui/i18n.js");
 /// Thème sombre régie.
 pub const STYLE_CSS: &str = include_str!("../../../webui/style.css");
 
@@ -17,19 +19,20 @@ pub fn asset(path: &str) -> Option<(&'static str, &'static str)> {
     match path {
         "app.js" => Some(("application/javascript; charset=utf-8", APP_JS)),
         "ws.js" => Some(("application/javascript; charset=utf-8", WS_JS)),
+        "i18n.js" => Some(("application/javascript; charset=utf-8", I18N_JS)),
         "style.css" => Some(("text/css; charset=utf-8", STYLE_CSS)),
         "index.html" => Some(("text/html; charset=utf-8", INDEX_HTML)),
         _ => None,
     }
 }
 
-/// Mode développement : si `CONDUITE_WEBUI_DIR` est défini, sert les quatre
+/// Mode développement : si `CONDUITE_WEBUI_DIR` est défini, sert les cinq
 /// fichiers connus depuis ce dossier (relu à chaque requête, pour itérer sur
 /// l'UI sans recompiler). Liste blanche stricte : aucun autre nom n'est lu.
 pub fn asset_dev(path: &str) -> Option<(&'static str, String)> {
     let dir = std::env::var("CONDUITE_WEBUI_DIR").ok()?;
     let content_type = match path {
-        "app.js" | "ws.js" => "application/javascript; charset=utf-8",
+        "app.js" | "ws.js" | "i18n.js" => "application/javascript; charset=utf-8",
         "style.css" => "text/css; charset=utf-8",
         "index.html" => "text/html; charset=utf-8",
         _ => return None,
