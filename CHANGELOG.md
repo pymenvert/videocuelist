@@ -93,6 +93,19 @@ version portable Windows.
   Show (option) ; résolution DNS OSC hors du thread de tick ; ré-ancrage
   des transitions après une veille machine ; soak test scripté
   (`tools/soak.ps1`) et rituel de release documenté (`docs/RELEASE.md`).
+- **Linux et player Raspberry Pi** : dossier de travail explicitable
+  (`--home <dir>`, ou `CONDUITE_HOME`) — le binaire peut vivre en lecture
+  seule dans `/usr/bin` pendant que les shows vivent ailleurs ;
+  `tools/package-linux.sh [--deb]` produit le **portable** `tar.gz` (même
+  disposition que le portable Windows, ffmpeg fourni par la distribution)
+  **et** un **paquet Debian** (binaire système, données dans
+  `/var/lib/conduite`, utilisateur système dédié, désinstallation qui ne
+  touche jamais aux shows), chacun avec son SHA-256 ; **service systemd**
+  désactivé par défaut, qui relance sur perte GPU (code 11) mais jamais sur
+  port occupé (code 10), et **chien de garde** `conduite-health.timer` qui
+  interroge `/health` toutes les 30 s pour rattraper un moteur « vivant mais
+  figé » — le cas que `Restart=on-failure` ne voit pas — sans jamais
+  ressusciter un service arrêté à la main.
 - **Produit** : version portable Windows (`tools/package.ps1`) — zip
   versionné avec SHA-256, FFmpeg **LGPL** embarqué avec notices
   (`licenses/FFMPEG.txt`), attributions des dépendances Rust

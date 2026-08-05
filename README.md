@@ -33,6 +33,29 @@ Dézipper `Conduite-{version}-win64.zip`, lancer `conduite.exe`, ouvrir
 **http://localhost:9820**. Aucune installation, aucun registre : le dossier
 se copie sur une clé USB. Voir le `LISEZMOI.txt` livré (pare-feu, raccourcis).
 
+### Linux (portable ou paquet)
+
+**Portable** : dézipper `Conduite-{version}-linux-{arch}.tar.gz`, lancer
+`./conduite`, ouvrir **http://localhost:9820**. `ffmpeg` n'est pas embarqué
+sur Linux (`sudo apt install ffmpeg`) : les distributions le fournissent et
+le tiennent à jour.
+
+**Player installé** (machine de salle, Raspberry Pi 4/5 64 bits) :
+
+```
+sudo apt install ./conduite_{version}_arm64.deb
+sudo systemctl enable --now conduite conduite-health.timer
+```
+
+Binaire dans `/usr/bin`, données dans `/var/lib/conduite`, service systemd
+**désactivé par défaut**. Le service relance sur perte GPU mais jamais sur
+port occupé, et un chien de garde interroge `/health` toutes les 30 s pour
+rattraper un moteur « vivant mais figé » — le cas que `Restart=on-failure`
+ne voit pas. Une désinstallation, même `purge`, ne touche pas à vos shows.
+Détail : [docs/MANUEL.md](docs/MANUEL.md), section 8.
+
+Fabrication des paquets : `tools/package-linux.sh --deb`.
+
 ### Depuis les sources
 
 ```
@@ -46,10 +69,12 @@ dans `shaders/`.
 - `ffmpeg`/`ffprobe` requis (dans le PATH, ou copiés dans `bin/` du dossier portable).
 - OSC en écoute sur le port 9000 (`/conduite/cue/go`, `/conduite/param/...`),
   Art-Net sur 6454, MIDI depuis l'onglet Patch.
-- Options : `conduite --help` (`--headless`, `--port`, `--show`).
-- Packaging portable : `powershell -File tools/package.ps1` →
+- Options : `conduite --help` (`--headless`, `--port`, `--show`, `--home`).
+- Packaging Windows : `powershell -File tools/package.ps1` →
   `dist/Conduite-{version}-win64.zip` + SHA-256 (FFmpeg LGPL embarqué depuis
   `tools/ffmpeg-lgpl/`, notices copiées depuis `licenses/`).
+- Packaging Linux : `tools/package-linux.sh [--deb]` → tarball portable et
+  paquet Debian, chacun avec son SHA-256.
 
 ## Endurance et fiabilité
 

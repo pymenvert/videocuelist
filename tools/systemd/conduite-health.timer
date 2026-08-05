@@ -1,0 +1,16 @@
+[Unit]
+# Surveillance « vivant mais figé ». À activer avec le service :
+#   sudo systemctl enable --now conduite conduite-health.timer
+Description=Conduite — contrôle de vitalité périodique
+Documentation=file:///usr/share/doc/conduite/MANUEL.md
+
+[Timer]
+# Une minute après le boot, puis toutes les 30 s. Assez serré pour qu'un
+# figeage ne dure pas un tableau entier, assez lâche pour rester invisible.
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=conduite-health.service
+
+[Install]
+WantedBy=timers.target

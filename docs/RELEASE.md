@@ -26,6 +26,27 @@ elle attrape ce qui est invisible en local.
 
 ## 3. Packaging
 
+### Linux (portable + paquet)
+
+```bash
+tools/package-linux.sh --deb
+```
+
+Produit `dist/Conduite-{version}-linux-{arch}.tar.gz` et
+`dist/conduite_{version}_{arch}.deb`, chacun avec son `.sha256`. Pour un
+player Raspberry Pi 64 bits : `--target aarch64-unknown-linux-gnu` (toolchain
+de cross-compilation requise), ou construire sur le Pi lui-même.
+
+- [ ] `dpkg-deb --info` : version, architecture et dépendances attendues.
+- [ ] Installer sur une machine propre (`sudo apt install ./…deb`), vérifier
+      que `/var/lib/conduite` est créé et appartient à l'utilisateur système,
+      que `conduite --version` répond, et que le service démarre
+      (`sudo systemctl enable --now conduite`) avec `/health` en `ok`.
+- [ ] `systemd-analyze verify` sur les trois unités : silence exigé.
+- [ ] Désinstaller (`sudo apt remove`) : `/var/lib/conduite` doit RESTER.
+
+### Windows
+
 ```powershell
 powershell -File tools/package.ps1
 ```
