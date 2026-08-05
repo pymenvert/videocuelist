@@ -299,7 +299,23 @@ Art-Net : socket UDP 6454, réponse ArtPoll, réception ArtDMX multi-univers ; `
 - `GET /about` : JSON statique « À propos » construit par `app` — `{ name, description,
   version, git, license, copyright, website, credits: [{ name, role, license, url?, notice }] }`.
   L'affichage (Réglages) est à la charge de la webui.
-- UI (français, sombre, tooltips partout via un système central `data-tip`) : onglets
+- `runtime.warnings` : `[{level, msg, key, args, action?}]`. `msg` = la phrase
+  française déjà composée (journal, rapport de diagnostic, clients anciens) ;
+  `key` = le gabarit `{0}`/`{1}` — une constante de `core::warnings` — et
+  `args` ses valeurs brutes (chemins, noms, messages système : jamais
+  traduits). La webui recompose `trf(key, …args)` pour l'afficher dans la
+  langue de l'opérateur ; à défaut de `key`, elle retombe sur `msg`.
+- **Bilingue FR/EN** : le français est la langue SOURCE (chaînes en clair dans
+  `app.js`), l'anglais vit dans `webui/i18n.js` — catalogue JSON strict indexé
+  par la chaîne française, plus `tr(s)` (chaîne complète) et `trf(tpl, …)`
+  (gabarit). La traduction se fait à UN point de passage (`appendChild` +
+  attributs `title`/`placeholder`/`aria-label`, et `data-tip` à l'affichage de
+  l'infobulle) : aucun site d'appel n'a à s'en soucier. Une chaîne absente du
+  catalogue s'affiche en français — jamais de trou. La langue vient de
+  `settings.language` et s'applique sans rechargement. Garde-fou :
+  `crates/control-http/tests/webui_i18n.rs` échoue si une chaîne française de
+  la web UI (ou un gabarit de `core::warnings`) n'a pas de traduction.
+- UI (français + anglais, sombre, tooltips partout via un système central `data-tip`) : onglets
   **Live** (cuelist + progress + program/preview + GO/BACK/GOTO + master + DBO + santé),
   **Cues** (édition), **Mapping** (canvas coins/nudge/mires), **Médias**, **Matériaux** (params ISF),
   **Modulation**, **Patch** (OSC/MIDI learn/Art-Net), **Sorties**, **Journal** (logs), **Réglages**.

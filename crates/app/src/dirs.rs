@@ -1,13 +1,25 @@
-//! Chemins portables : tout est relatif au dossier de l'exécutable.
+//! Chemins portables : par défaut, tout est relatif au dossier de
+//! l'exécutable.
 //!
 //! En développement (exe sous `target/debug` ou `target/release`), la base
 //! est la racine du workspace (le parent du dossier `target` qui contient un
 //! `Cargo.toml`) : les dossiers `media/`, `shows/`, `shaders/`… du dépôt
 //! sont utilisés directement.
+//!
+//! La base est **explicitable** — `--home <dossier>`, sinon la variable
+//! d'environnement `CONDUITE_HOME` — pour le cas où le binaire n'est pas
+//! dans un dossier inscriptible : installation système (binaire dans
+//! `/usr/bin/conduite`, données dans `/var/lib/conduite`), service systemd
+//! d'un player Raspberry Pi, ou simplement plusieurs jeux de shows sur une
+//! même machine. Sans l'un ni l'autre, le comportement portable est
+//! inchangé.
 
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
+
+/// Variable d'environnement fixant le dossier de travail.
+pub const HOME_ENV: &str = "CONDUITE_HOME";
 
 /// Dossiers de travail de l'application (créés au besoin).
 #[derive(Debug, Clone)]
@@ -23,8 +35,10 @@ pub struct Dirs {
 
 impl Dirs {
     /// Détecte la base et crée les sous-dossiers manquants.
-    pub fn detect() -> Dirs {
-        let base = detect_base();
+    ///
+    /// `explicit` = valeur de `--home` (prioritaire sur `CONDUITE_HOME`).
+    pub fn detect(explicit: Option<PathBuf>) -> Dirs {
+        let base = detect_base(explicit);
         let dirs = Dirs {
             media: base.join("media"),
             shows: base.join("shows"),
@@ -55,9 +69,18 @@ impl Dirs {
     }
 }
 
-/// Base = dossier de l'exe ; en dev (`target/debug|release`), racine du
-/// workspace (ancêtre `target` dont le parent contient `Cargo.toml`).
-fn detect_base() -> PathBuf {
+/// Base explicite (`--home` puis `CONDUITE_HOME`) ; à défaut, dossier de
+/// l'exe ; en dev (`target/debug|release`), racine du workspace (ancêtre
+/// `target` dont le parent contient `Cargo.toml`).
+fn detect_base(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    // Une variable vide est ignorée : `CONDUITE_HOME=` dans un fichier
+    // d'environnement systemd ne doit pas faire écrire à la racine.
+    if let Some(dir) = std::env::var_os(HOME_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             if let Some(root) = workspace_root_of(dir) {
@@ -113,6 +136,25 @@ mod tests {
         assert_eq!(safe_show_name("a/b\\c"), "a_b_c");
         assert_eq!(safe_show_name(""), "show");
         assert_eq!(safe_show_name(".."), "show");
+    }
+
+    #[test]
+    fn base_explicite_prioritaire_sur_l_environnement() {
+        // `--home` gagne : c'est le geste le plus explicite de l'opérateur.
+        let wanted = PathBuf::from("/srv/conduite-explicite");
+        assert_eq!(detect_base(Some(wanted.clone())), wanted);
+    }
+
+    #[test]
+    fn base_env_vide_ignoree() {
+        // `CONDUITE_HOME=` dans un fichier d'environnement systemd ne doit
+        // PAS faire écrire à la racine : on retombe sur le comportement
+        // portable (dossier de l'exe / racine du workspace en dev).
+        let sans_env = detect_base(None);
+        // SAFETY: test mono-thread sur une variable qui n'est lue qu'ici.
+        unsafe { std::env::set_var(HOME_ENV, "") };
+        assert_eq!(detect_base(None), sans_env);
+        unsafe { std::env::remove_var(HOME_ENV) };
     }
 
     #[test]

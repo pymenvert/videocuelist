@@ -1,0 +1,87 @@
+Conduite {VERSION} — régie vidéo de spectacle (Linux)
+=====================================================
+
+DÉMARRAGE (version portable)
+----------------------------
+1. ./conduite
+2. Ouvrir http://localhost:9820 dans un navigateur : c'est l'interface de
+   régie (utilisable aussi depuis une tablette ou un autre poste du même
+   réseau : http://<ip-de-cette-machine>:9820)
+3. Déposer vos vidéos dans media/, vos shaders ISF dans shaders/
+4. Vos conduites sont enregistrées dans shows/ (avec backups automatiques)
+
+Tout est relatif à ce dossier : rien n'est installé, rien n'est écrit
+ailleurs. Le dossier se copie sur une clé USB.
+
+FFMPEG EST REQUIS
+-----------------
+Contrairement à la version Windows, ffmpeg n'est pas embarqué : les
+distributions le fournissent, et il est mieux tenu à jour par elles.
+
+  sudo apt install ffmpeg          (Debian, Ubuntu, Raspberry Pi OS)
+
+Conduite le cherche d'abord dans bin/ de ce dossier, puis dans le PATH.
+Pour figer une version précise, y déposer ffmpeg et ffprobe.
+
+DÉPENDANCES SYSTÈME
+-------------------
+  ffmpeg            décodage vidéo (obligatoire)
+  libasound2        entrée audio pour le module de modulation (optionnel)
+
+Pour projeter réellement, une session graphique est nécessaire (X11 ou
+Wayland). Sans session graphique, lancer avec --headless : le moteur et
+l'interface web tournent, les sorties restent noires — c'est le mode d'un
+player piloté à distance ou d'une préparation de conduite.
+
+OPTIONS
+-------
+  conduite --help                aide complète
+  conduite --port 9821           autre port pour l'interface web
+  conduite --show gala-2026      ouvrir un show précis
+  conduite --headless            sans fenêtre de sortie
+  conduite --home /srv/conduite  travailler dans un autre dossier
+                                 (aussi : variable CONDUITE_HOME)
+
+RACCOURCIS ESSENTIELS
+---------------------
+  Espace          GO (envoie la cue en standby)
+  Échap           Panic (double appui : arrêt sec)
+  B (maintenu)    Noir d'urgence (DBO)
+  T               Tap tempo
+  O               Notes de régie de la cue en standby
+  1–9, 0          Changer d'onglet (0 = Réglages)
+
+LANGUE
+------
+Réglages → Langue bascule l'interface entre français et anglais,
+immédiatement. Le choix est enregistré dans le show.
+
+PARE-FEU
+--------
+L'interface web (9820), OSC (9000) et Art-Net (6454) écoutent sur le
+réseau. Sur une machine avec ufw :
+
+  sudo ufw allow 9820/tcp
+  sudo ufw allow 9000/udp
+  sudo ufw allow 6454/udp
+
+PLAYER INSTALLÉ (paquet .deb)
+-----------------------------
+Le paquet installe le binaire dans /usr/bin, les données dans
+/var/lib/conduite et un service systemd désactivé par défaut :
+
+  sudo apt install ./conduite_{VERSION}_arm64.deb
+  sudo systemctl enable --now conduite conduite-health.timer
+
+Le service tourne en --headless (pas de session graphique au boot), relance
+le moteur sur perte GPU et surveille l'endpoint /health pour rattraper un
+moteur « vivant mais figé ». Détail dans MANUEL.md, section « Player
+Raspberry Pi ».
+
+LICENCES
+--------
+Conduite est sous licence MIT (licenses/LICENSE-CONDUITE.txt).
+Attributions des bibliothèques : licenses/THIRD-PARTY-NOTICES.html.
+Crédits des shaders livrés : shaders/CREDITS.txt.
+
+Manuel complet : MANUEL.md (à côté de ce fichier).

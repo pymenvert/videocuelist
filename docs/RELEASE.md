@@ -26,6 +26,27 @@ elle attrape ce qui est invisible en local.
 
 ## 3. Packaging
 
+### Linux (portable + paquet)
+
+```bash
+tools/package-linux.sh --deb
+```
+
+Produit `dist/Conduite-{version}-linux-{arch}.tar.gz` et
+`dist/conduite_{version}_{arch}.deb`, chacun avec son `.sha256`. Pour un
+player Raspberry Pi 64 bits : `--target aarch64-unknown-linux-gnu` (toolchain
+de cross-compilation requise), ou construire sur le Pi lui-même.
+
+- [ ] `dpkg-deb --info` : version, architecture et dépendances attendues.
+- [ ] Installer sur une machine propre (`sudo apt install ./…deb`), vérifier
+      que `/var/lib/conduite` est créé et appartient à l'utilisateur système,
+      que `conduite --version` répond, et que le service démarre
+      (`sudo systemctl enable --now conduite`) avec `/health` en `ok`.
+- [ ] `systemd-analyze verify` sur les trois unités : silence exigé.
+- [ ] Désinstaller (`sudo apt remove`) : `/var/lib/conduite` doit RESTER.
+
+### Windows
+
 ```powershell
 powershell -File tools/package.ps1
 ```
@@ -62,6 +83,12 @@ Dézipper `dist/Conduite-{version}-win64.zip` dans un dossier de test
 - [ ] `conduite.exe` démarre, l'UI répond sur http://localhost:9820.
 - [ ] `--version` affiche la bonne version (et le hash git).
 - [ ] Show de démo : un GO produit une image ; Échap = panic ; B = DBO.
+- [ ] **Bilingue** : Réglages → Langue → *English*, puis parcourir les
+      10 onglets. Aucun mot français ne doit rester **hors du Journal**
+      (le journal et `logs/` sont volontairement en français). Repasser en
+      *Français* : tout revient, sans rechargement. Les tests bloquent déjà
+      une chaîne non traduite — cette passe attrape ce qu'un test ne voit
+      pas : une traduction qui déborde de son bouton.
 - [ ] LISEZMOI.txt lisible (accents corrects), licenses/ complet
       (FFMPEG.txt, THIRD-PARTY-NOTICES.html), shaders/CREDITS.txt présent.
 - [ ] Quitter proprement (bouton Quitter) : aucun process résiduel.

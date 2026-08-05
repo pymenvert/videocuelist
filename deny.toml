@@ -32,6 +32,13 @@ allow = [
     "CC0-1.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # webpki-roots : le magasin de certificats racines de Mozilla, tiré par
+    # ureq (vérification de mise à jour, opt-in). Ce n'est PAS du code mais
+    # une DONNÉE, sous licence de données permissive — pas de copyleft, pas
+    # de réciprocité, la seule obligation en redistribution est de conserver
+    # les avis (assurée par THIRD-PARTY-NOTICES.html). Compatible avec un
+    # produit vendu sous MIT.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

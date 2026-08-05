@@ -1,0 +1,13 @@
+[Unit]
+# Une passe de surveillance /health. Déclenchée par conduite-health.timer,
+# jamais activée seule.
+Description=Conduite — contrôle de vitalité (/health)
+Documentation=file:///usr/share/doc/conduite/MANUEL.md
+After=conduite.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/conduite-health-check
+# Sort en 1 quand il a redémarré le service : c'est un signal, pas un échec
+# du contrôle lui-même.
+SuccessExitStatus=0 1

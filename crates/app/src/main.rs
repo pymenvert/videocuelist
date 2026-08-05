@@ -56,6 +56,8 @@ const EXIT_GPU_LOST: i32 = 11;
 struct Cli {
     show: Option<String>,
     port: Option<u16>,
+    /// Dossier de travail (`--home`) : prioritaire sur `CONDUITE_HOME`.
+    home: Option<std::path::PathBuf>,
     headless: bool,
     version: bool,
     help: bool,
@@ -74,6 +76,8 @@ Usage : conduite [OPTIONS]
 Options :
   --show <nom>    Show à charger (dossier dans shows/) — défaut : dernier show ouvert
   --port <port>   Port de l'interface web — défaut : 9820 (clé http_port de config.toml)
+  --home <dir>    Dossier de travail (config.toml, media/, shows/, shaders/, logs/)
+                  — défaut : le dossier de l'exécutable. Aussi : CONDUITE_HOME
   --headless      Sans fenêtres de sortie (moteur + interface web seulement)
   -V, --version   Affiche la version et quitte
   -h, --help      Affiche cette aide et quitte
@@ -87,6 +91,7 @@ fn parse_cli() -> Cli {
         match arg.as_str() {
             "--show" => cli.show = args.next(),
             "--port" => cli.port = args.next().and_then(|p| p.parse().ok()),
+            "--home" => cli.home = args.next().map(std::path::PathBuf::from),
             "--headless" => cli.headless = true,
             // Recette de la capture de crash (interne, debug uniquement —
             // volontairement absent de --help, comme --crash-server).
@@ -156,7 +161,7 @@ fn run() -> i32 {
     let (h264_tx, _h264_keep) = broadcast::channel(64);
     let h264_clients = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let dirs = Dirs::detect();
+    let dirs = Dirs::detect(cli.home.clone());
     let log_handles = logsetup::init(&dirs.logs, events_tx.clone());
     let _log_guard = log_handles.guard;
     logsetup::install_panic_hook();
@@ -273,7 +278,7 @@ fn run() -> i32 {
 fn about_info() -> serde_json::Value {
     json!({
         "name": "Conduite",
-        "description": "Régie vidéo de spectacle — cues, mapping, ISF, MIDI/OSC/Art-Net",
+        "description": conduite_core::ui_text::about::DESCRIPTION,
         "version": env!("CARGO_PKG_VERSION"),
         "git": env!("CONDUITE_GIT_HASH"),
         "license": "MIT",
@@ -282,20 +287,20 @@ fn about_info() -> serde_json::Value {
         "credits": [
             {
                 "name": "FFmpeg",
-                "role": "décodage vidéo (programme séparé, appelé en sous-processus)",
+                "role": conduite_core::ui_text::about::ROLE_FFMPEG,
                 "license": "LGPL v3",
                 "url": "https://ffmpeg.org",
                 "notice": "licenses/FFMPEG.txt"
             },
             {
-                "name": "Dépendances Rust",
-                "role": "bibliothèques du moteur et des surfaces de contrôle",
+                "name": conduite_core::ui_text::about::NAME_RUST_DEPS,
+                "role": conduite_core::ui_text::about::ROLE_RUST_DEPS,
                 "license": "MIT / Apache-2.0 / BSD / ISC / Zlib",
                 "notice": "licenses/THIRD-PARTY-NOTICES.html"
             },
             {
-                "name": "Shaders DomePack",
-                "role": "matériaux ISF embarqués",
+                "name": conduite_core::ui_text::about::NAME_SHADERS,
+                "role": conduite_core::ui_text::about::ROLE_SHADERS,
                 "license": "© Pym — Pack Sources Dome-Native",
                 "notice": "shaders/CREDITS.txt"
             }

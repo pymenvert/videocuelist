@@ -13,6 +13,22 @@ Régie vidéo de spectacle : on prépare des **cues** (des scènes complètes), 
 Un show de démonstration est créé au premier lancement (mires, matériaux, une vidéo).
 `ffmpeg` doit être disponible (dossier `bin/` du portable, sinon dans le PATH).
 
+### Langue de l'interface
+
+**Réglages → Langue** bascule l'interface entre **français** et **anglais** —
+immédiatement, sans rechargement, y compris en pleine conduite. Le choix est
+enregistré **dans le show** : une conduite préparée en anglais s'ouvre en
+anglais chez le régisseur suivant, quelle que soit la machine.
+
+Suivent la langue : tous les libellés, boutons, menus contextuels, infobulles,
+messages et confirmations, ainsi que les avertissements du centre **État du
+show** (média manquant, moniteur perdu, port occupé).
+
+Restent en français : le **journal** (onglet Journal et fichiers `logs/`) et
+les quelques toasts techniques du moteur. C'est un outil de diagnostic destiné
+au support, pas un organe de conduite — le rapport de diagnostic est lisible
+tel quel par l'auteur.
+
 ## 2. Les concepts en 30 secondes
 
 | Terme | Ce que c'est |
@@ -149,7 +165,94 @@ défaut 60).
 Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 « Collecter le show » (Réglages) rassemble show + médias dans un dossier autonome.
 
-## 8. Conseils spectacle
+### Travailler ailleurs que dans le dossier de l'exe
+
+`conduite --home /srv/gala` (ou la variable d'environnement `CONDUITE_HOME`)
+déplace **tout** le dossier de travail : `config.toml`, `media/`, `shows/`,
+`shaders/`, `logs/`. Le binaire, lui, peut rester où il veut — y compris en
+lecture seule dans `/usr/bin`. C'est ce qui rend possible l'installation
+système décrite plus bas, et c'est aussi le moyen simple de tenir plusieurs
+jeux de conduites indépendants sur une même machine.
+
+Sans `--home` ni `CONDUITE_HOME`, rien ne change : le comportement portable
+reste celui du dossier de l'exécutable.
+
+## 8. Linux et player Raspberry Pi
+
+Deux formes, deux usages.
+
+**Le portable** (`Conduite-<version>-linux-<arch>.tar.gz`) : on dézippe où
+l'on veut, `./conduite`, rien n'est installé. Identique au portable Windows,
+à une exception près : **ffmpeg n'est pas embarqué** (`sudo apt install
+ffmpeg`) — les distributions le fournissent et le tiennent à jour mieux
+qu'un binaire figé.
+
+**Le paquet** (`conduite_<version>_<arch>.deb`) : l'installation d'un player
+fixe — machine de salle, Raspberry Pi 4/5 64 bits.
+
+```bash
+sudo apt install ./conduite_0.1.0_arm64.deb
+sudo systemctl enable --now conduite conduite-health.timer
+```
+
+Le paquet pose le binaire dans `/usr/bin/conduite`, les données dans
+`/var/lib/conduite` (c'est le `CONDUITE_HOME` du service), la documentation
+et les licences dans `/usr/share/doc/conduite/`. Il crée un utilisateur
+système `conduite`, membre des groupes `video`, `render` et `audio`. Le
+service est **désactivé par défaut** : installer n'est pas démarrer.
+
+Une désinstallation, même `purge`, **ne supprime jamais `/var/lib/conduite`** :
+ce sont vos conduites et vos médias.
+
+### Ce que fait le service
+
+- Il démarre en `--headless` : moteur + interface web, **sans fenêtre de
+  sortie**. C'est le seul mode qui fonctionne sans session graphique, donc
+  le seul honnête au démarrage machine. Pour **projeter réellement**, il
+  faut une session graphique (X11 ou Wayland) : retirer `--headless` de
+  l'unité et fournir `DISPLAY`/`WAYLAND_DISPLAY`, ou lancer Conduite depuis
+  la session de l'utilisateur.
+- Il relance sur perte GPU (code 11) mais **jamais** sur port occupé ou
+  instance déjà lancée (code 10) : relancer en boucle sur un port pris est
+  une tempête de journaux, pas une guérison.
+- Au-delà de 5 relances en 2 minutes, systemd s'arrête et le laisse voir
+  dans `systemctl status` plutôt que de masquer le problème.
+- À l'arrêt (`systemctl stop`, extinction), il reçoit un SIGTERM et fait sa
+  sauvegarde propre.
+
+### Le chien de garde (`conduite-health.timer`)
+
+`Restart=on-failure` ne voit que les processus **morts**. Le cas qui fait
+rater un spectacle est l'autre : le process est là, la socket répond, et le
+rendu ne tourne plus. C'est exactement ce que rapporte `GET /health`
+(`status: stalled` dès que le tick dépasse 2 s).
+
+Toutes les 30 s, le timer interroge `/health` : réponse `ok` → rien ;
+réponse `stalled` ou aucune réponse → redémarrage du service, avec une ligne
+dans le journal système (`journalctl -t conduite-health`). Si vous avez
+arrêté le service à la main, la surveillance **ne le ressuscite pas**.
+
+```bash
+systemctl status conduite            # état du player
+journalctl -u conduite -f            # journal en direct
+journalctl -t conduite-health        # décisions du chien de garde
+```
+
+### Pare-feu
+
+```bash
+sudo ufw allow 9820/tcp   # interface de régie
+sudo ufw allow 9000/udp   # OSC entrant
+sudo ufw allow 6454/udp   # Art-Net
+```
+
+> **Statut** : le paquet, le service et le chien de garde sont vérifiés sur
+> Ubuntu x86-64 (installation, exécution sous l'utilisateur système,
+> redémarrage sur moteur figé). Le **bench Raspberry Pi** — combien de
+> couches HAP 1080p tiennent depuis un SSD USB3, HEVC 4K matériel sur Pi 5 —
+> reste à faire sur la machine réelle : voir `docs/PLAN.md`, phase 0.
+
+## 9. Conseils spectacle
 
 - **Codec** : préférez le **HAP** (`ffmpeg -c:v hap`) — décodage léger, scrub instantané,
   multi-couches. H.264/HEVC fonctionnent aussi.
@@ -161,7 +264,7 @@ Tout est relatif : copiez le dossier sur une clé USB, il repart ailleurs.
 - **Mode Show** avant le public : édition verrouillée, fermeture double-confirmée.
 - Les logs (`logs/`) horodatent tout : GO, erreurs, protocoles — utile au débrief.
 
-## 9. Checklist « machine de spectacle »
+## 10. Checklist « machine de spectacle »
 
 À dérouler sur la machine qui joue, avant la première. Conduite empêche
 déjà la veille pendant le show, mais en salle on met **ceinture et
@@ -192,7 +295,7 @@ c'est vous qui décidez.
       (les médias se préchargent, les erreurs se voient dans « État du
       show », pas devant le public).
 
-## 10. Sécurité en conduite
+## 11. Sécurité en conduite
 
 Ce que Conduite fait pour que la fausse manip ou le pépin technique ne
 se voie pas depuis la salle — chaque garde-fou existe parce qu'un
@@ -227,7 +330,7 @@ incident réel l'a rendu nécessaire quelque part :
   déjà lancé, 11 = perte GPU) — de quoi brancher un watchdog qui relance
   en quelques secondes.
 
-## 11. Raccourcis
+## 12. Raccourcis
 
 | Touche | Action |
 |---|---|
@@ -243,7 +346,7 @@ un raccourci, presser la touche voulue). Les raccourcis **système** —
 Espace (GO), Échap (panic), B (DBO) — restent prioritaires et ne sont pas
 remappables : ce sont des organes de sécurité.
 
-## 12. Dépannage rapide
+## 13. Dépannage rapide
 
 | Symptôme | Piste |
 |---|---|
@@ -253,7 +356,7 @@ remappables : ce sont des organes de sécurité.
 | Vidéo saccadée | Transcoder en HAP ; vérifier le disque (SSD conseillé) ; fps affichés dans Santé. |
 | Port déjà pris | `conduite --port 9821`, ou libérer 9820. |
 
-## 13. Rapport de diagnostic
+## 14. Rapport de diagnostic
 
 Pour joindre à un mail de support : **Réglages → Rapport de diagnostic**
 (ou commande `diagnostic_report`). Conduite écrit un zip horodaté dans
@@ -269,7 +372,7 @@ le fichier reste sur votre disque, c'est vous qui l'attachez (ou pas) à
 votre message. Vous pouvez l'ouvrir pour vérifier son contenu : c'est un
 zip ordinaire.
 
-## 14. Diagnostic avancé (optionnel) : crash dumps Windows
+## 15. Diagnostic avancé (optionnel) : crash dumps Windows
 
 Si un crash reproductible résiste au support, Windows peut conserver un
 *dump* du process au moment du crash (WER LocalDumps). C'est une

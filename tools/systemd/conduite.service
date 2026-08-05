@@ -1,0 +1,56 @@
+[Unit]
+# Player Conduite installé (paquet .deb). Désactivé par défaut :
+#   sudo systemctl enable --now conduite
+Description=Conduite — régie vidéo de spectacle
+Documentation=file:///usr/share/doc/conduite/MANUEL.md
+Documentation=https://github.com/pymenvert/videocuelist
+After=network-online.target
+Wants=network-online.target
+# Un flapping n'est pas une panne transitoire : au-delà, systemd s'arrête et
+# le laisse voir dans `systemctl status` plutôt que de masquer le problème.
+# (Ces deux clés vivent dans [Unit], pas dans [Service] — `systemd-analyze
+# verify` est formel, et mal placées elles sont silencieusement ignorées.)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=conduite
+Group=conduite
+Environment=CONDUITE_HOME=/var/lib/conduite
+WorkingDirectory=/var/lib/conduite
+
+# --headless : moteur + interface web, sans fenêtre de sortie. C'est le
+# mode qui marche SANS session graphique — donc celui d'un démarrage au
+# boot. Pour projeter réellement, il faut une session graphique (X11 ou
+# Wayland) : retirer --headless et fournir DISPLAY/WAYLAND_DISPLAY, ou
+# lancer Conduite depuis la session de l'utilisateur (systemd --user).
+ExecStart=/usr/bin/conduite --headless
+
+# Codes de sortie de Conduite (voir docs/MANUEL.md) :
+#   0  arrêt normal        -> pas de relance
+#   10 port web occupé OU instance déjà lancée -> NE PAS relancer : relancer
+#      en boucle sur un port pris est une tempête de logs, pas une guérison
+#   11 perte du GPU (TDR)  -> relance conseillée, rapidement
+Restart=on-failure
+RestartSec=3
+RestartPreventExitStatus=10
+
+# Arrêt propre : Conduite sauvegarde le show modifié sur SIGTERM, ferme les
+# sorties et purge les journaux. Large de côté pour un show qui écrit.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Durcissement raisonnable pour un service qui n'a besoin que de son
+# dossier de données, du réseau et des périphériques MIDI/vidéo.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/conduite
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

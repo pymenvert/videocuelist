@@ -2,11 +2,16 @@
 
 Règle : **chaque phase livre un outil utilisable en l'état**, avec un critère de sortie testable. On ne passe pas à la phase suivante sans l'avoir validé.
 
-> **État au 2026-07-24** : v1 desktop construite en une itération nocturne (phases 0 à 4
-> compressées, backend vidéo ffmpeg, Windows validé). Restent de la phase 0 : la
-> validation macOS/Ubuntu réelles (la CI compile les trois) et le bench Raspberry Pi
-> (backend GStreamer à brancher derrière `PlayerBackend`). Les critères de sortie
-> ci-dessous restent la référence pour valider chaque périmètre en conditions réelles.
+> **État au 2026-08-05** : v1 desktop construite en une itération nocturne (phases 0 à 4
+> compressées, backend vidéo ffmpeg, Windows validé). **Ubuntu x86-64 vérifié** depuis :
+> build, tests, exécution `--headless`, paquet `.deb` installé et lancé sous son
+> utilisateur système. Restent de la phase 0 : la validation **macOS** réelle (la CI y
+> compile et y passe les tests, mais rien n'a été lancé sur un Mac) et le **bench
+> Raspberry Pi** — le rendu GL et le décodage n'ont jamais tourné sur un Pi, et le
+> backend GStreamer reste à brancher derrière `PlayerBackend`. De la phase 5, restent
+> le transcodeur HAP intégré, l'installeur Windows et le `.app` macOS. Les critères de
+> sortie ci-dessous restent la référence pour valider chaque périmètre en conditions
+> réelles.
 
 ## Phase 0 — Socle & dérisquage
 

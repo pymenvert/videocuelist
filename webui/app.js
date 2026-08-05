@@ -6,6 +6,20 @@
 
 (function () {
 
+  /* ============================================================= bilingue
+     `tr` (chaîne complète) et `trf` (gabarit + valeurs) viennent de
+     i18n.js. Repli identité si le fichier manque : l'UI reste en français
+     plutôt que de planter — même doctrine que le chargement de show. */
+  var I18N = (window.Conduite && window.Conduite.i18n) || null;
+  var tr = I18N ? I18N.tr : function (s) { return s; };
+  var trf = I18N ? I18N.trf : function (tpl) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return String(tpl).replace(/\{(\d+)\}/g, function (m, i) {
+      var v = args[+i];
+      return (v === undefined || v === null) ? '' : String(v);
+    });
+  };
+
   /* ============================================================== état */
 
   var RT0 = {
@@ -64,6 +78,11 @@
            boutons conditionnels (« Assigner », « Dupliquer »…) restaient morts. */
         else if (k === 'checked') { n.checked = !!v; }
         else if (k === 'disabled') { n.disabled = !!v; }
+        /* Attributs rendus TELS QUELS par le navigateur : traduits ici.
+           `data-tip` ne l'est pas — les infobulles maison sont traduites à
+           l'affichage (installTooltips), ce qui couvre aussi celles posées
+           en dur dans index.html. */
+        else if (TRANSLATED_ATTRS[k]) { n.setAttribute(k, tr(String(v))); }
         else { n.setAttribute(k, v); }
       });
     }
@@ -73,10 +92,15 @@
     return n;
   }
 
+  var TRANSLATED_ATTRS = { title: 1, placeholder: 1, 'aria-label': 1, alt: 1 };
+
+  /* Point de passage UNIQUE du texte de l'interface : tout ce que `el()`
+     reçoit en enfant textuel passe ici, donc par `tr()`. Une valeur absente
+     du catalogue (nom de cue, chemin de média, nombre) ressort intacte. */
   function appendChild(n, c) {
     if (c === null || c === undefined || c === false) { return; }
     if (Array.isArray(c)) { c.forEach(function (x) { appendChild(n, x); }); return; }
-    n.appendChild(typeof c === 'object' ? c : document.createTextNode(String(c)));
+    n.appendChild(typeof c === 'object' ? c : document.createTextNode(tr(String(c))));
   }
 
   function byId(id) { return document.getElementById(id); }
@@ -155,9 +179,10 @@
     return out.join(':');
   }
 
-  /* Cadence TcRate (serde snake_case) → libellé humain (i/s). */
+  /* Cadence TcRate (serde snake_case) → libellé humain (i/s). « 29,97 DF »
+     passe par `tr` : la virgule décimale devient un point en anglais. */
   var TC_RATES = { fps24: '24', fps25: '25', fps2997_df: '29,97 DF', fps30: '30' };
-  function tcRateLabel(r) { return TC_RATES[r] || String(r || '?'); }
+  function tcRateLabel(r) { return tr(TC_RATES[r] || String(r || '?')); }
 
   function followKind(f) {
     if (typeof f === 'string') { return f; }
@@ -173,13 +198,13 @@
     if (typeof c === 'object') {
       if ('media' in c) {
         var m = medias().find(function (x) { return x.id === c.media; });
-        return 'Média : ' + (m ? m.name : ('#' + c.media));
+        return trf('Média : {0}', m ? m.name : ('#' + c.media));
       }
       if ('material' in c) {
         var mt = materials().find(function (x) { return x.id === c.material; });
-        return 'Matériau : ' + (mt ? mt.name : ('#' + c.material));
+        return trf('Matériau : {0}', mt ? mt.name : ('#' + c.material));
       }
-      if ('pattern' in c) { return 'Mire : ' + c.pattern; }
+      if ('pattern' in c) { return trf('Mire : {0}', c.pattern); }
       if ('color' in c) { return 'Couleur'; }
     }
     return '?';
@@ -204,7 +229,7 @@
 
   function newCue(number) {
     return {
-      number: number, name: 'Cue ' + cnStr(number), color: null, notes: '', armed: true,
+      number: number, name: trf('Cue {0}', cnStr(number)), color: null, notes: '', armed: true,
       transition: { kind: 'crossfade', dur_s: 1.0, curve: 'linear' },
       follow: 'manual', goto_after: null, states: [], mod_routes: [],
       triggers: { midi_note: null, osc: null, timecode: null }
@@ -244,7 +269,7 @@
 
   function sendEdit(op) {
     if (isShowMode()) {
-      uiWarn('Mode Show verrouillé — édition refusée (' + (op && op.op) + ')');
+      uiWarn(trf('Mode Show verrouillé — édition refusée ({0})', op && op.op));
       return false;
     }
     var c = { cmd: 'edit' };
@@ -330,7 +355,7 @@
     panicFlash();
     pushLog('warn', 'ui', hard
       ? 'PANIC — arrêt immédiat (double Échap)'
-      : 'PANIC — fondu ' + fmtF(fade, 1) + ' s (Échap)');
+      : trf('PANIC — fondu {0} s (Échap)', fmtF(fade, 1)));
   }
 
   function dboToggle() {
@@ -440,7 +465,7 @@
     var toEdit = (xf && xf.out) ? xf.out : function (v) { return v; };
     var fromEdit = (xf && xf['in']) ? xf['in'] : function (v) { return v; };
     var tip = input.getAttribute('data-tip');
-    input.setAttribute('data-tip', (tip ? tip + ' — ' : '') + SLIDER_TIP);
+    input.setAttribute('data-tip', (tip ? tr(tip) + ' — ' : '') + tr(SLIDER_TIP));
 
     function reset() {
       if (def === undefined || def === null) { return; }
@@ -472,7 +497,7 @@
     input.addEventListener('pointercancel', fineEnd);
 
     if (!valEl) { return; }
-    valEl.setAttribute('data-tip', SLIDER_TIP);
+    valEl.setAttribute('data-tip', tr(SLIDER_TIP));
     valEl.addEventListener('dblclick', reset);
     valEl.addEventListener('click', function () {
       if (valEl.getAttribute('data-editing')) { return; }
@@ -601,7 +626,7 @@
     if (!sendCmd({ cmd: 'undo' })) { return; }
     var label = EDITS.done.pop();
     if (label) { EDITS.undone.push(label); }
-    toast(label ? 'Annulé : ' + label : 'Annulation demandée');
+    toast(label ? trf('Annulé : {0}', tr(label)) : 'Annulation demandée');
   }
 
   function uiRedo() {
@@ -612,7 +637,7 @@
     if (!sendCmd({ cmd: 'redo' })) { return; }
     var label = EDITS.undone.pop();
     if (label) { EDITS.done.push(label); }
-    toast(label ? 'Rétabli : ' + label : 'Rétablissement demandé');
+    toast(label ? trf('Rétabli : {0}', tr(label)) : 'Rétablissement demandé');
   }
 
   /* Cue cible pour les assignations de contenu : standby, sinon active. */
@@ -638,9 +663,9 @@
     });
     if (ok && !quiet) {
       var slice = slices().find(function (s) { return s.id === sliceId; });
-      var sname = slice ? slice.name : ('slice ' + sliceId);
-      var what = (!content || content === 'none') ? 'Contenu retiré' : contentLabel(content);
-      toast(what + ' → ' + sname + ' (cue ' + cnStr(n) + ')', 'ok');
+      var sname = slice ? slice.name : trf('slice {0}', sliceId);
+      var what = (!content || content === 'none') ? tr('Contenu retiré') : contentLabel(content);
+      toast(trf('{0} → {1} (cue {2})', what, sname, cnStr(n)), 'ok');
     }
     return ok;
   }
@@ -738,7 +763,7 @@
       tipTimer = setTimeout(function () {
         var tip = byId('tooltip');
         if (!tip || !document.contains(target)) { return; }
-        tip.textContent = target.getAttribute('data-tip') || '';
+        tip.textContent = tr(target.getAttribute('data-tip') || '');
         tip.classList.remove('hidden', 'above', 'below');
         tip.style.left = '0px'; tip.style.top = '0px';
         var r = target.getBoundingClientRect();
@@ -906,7 +931,7 @@
       main.appendChild(fn());
     } catch (e) {
       console.error('render', e);
-      main.appendChild(el('div', { class: 'panel danger-text' }, 'Erreur de rendu : ' + e.message));
+      main.appendChild(el('div', { class: 'panel danger-text' }, trf('Erreur de rendu : {0}', e.message)));
     }
     updateDyn();
     updateHealth();
@@ -938,12 +963,29 @@
     });
   }
 
+  /* Aligne la langue de l'UI sur `settings.language`. Renvoie true si elle a
+     changé — l'appelant doit alors re-rendre TOUTE la page (onglets, pied de
+     page et chrome compris), pas seulement le panneau courant. */
+  function syncLang() {
+    if (!I18N) { return false; }
+    var changed = I18N.setLang(settings().language || 'fr');
+    if (!changed) { return false; }
+    document.documentElement.setAttribute('lang', I18N.lang());
+    /* Titre de repli seulement : dès la première trame `dyn`, updateTitle
+       reprend la main (« ● Cue 12 — MonShow »). */
+    document.title = tr('Conduite — régie vidéo');
+    var banner = byId('banner');
+    if (banner) { banner.textContent = tr('Reconnexion au moteur…'); }
+    return true;
+  }
+
   function renderAll() {
+    syncLang();
     var name = byId('show-name');
     if (name) { name.textContent = show().name || ''; }
     document.body.classList.toggle('mode-show', isShowMode());
     var badge = byId('mode-badge');
-    if (badge) { badge.textContent = isShowMode() ? 'SHOW' : 'ÉDITION'; }
+    if (badge) { badge.textContent = isShowMode() ? tr('SHOW') : tr('ÉDITION'); }
     if (isShowMode() && S.tab !== 'live') { S.tab = 'live'; }
     renderTabs();
     renderMain();
@@ -1109,7 +1151,7 @@
   function previewMonitor(label, src, tip, tryH264) {
     var wrap = el('div', { class: 'preview-wrap empty' },
       el('span', { class: 'preview-label' }, label));
-    var img = previewImg(src, tip + ' — flux MJPEG');
+    var img = previewImg(src, tr(tip) + tr(' — flux MJPEG'));
     img.addEventListener('load', function () { wrap.classList.remove('empty'); });
     wrap.appendChild(img);
     var ph = el('div', { class: 'preview-empty' });
@@ -1172,11 +1214,11 @@
       if (!img.parentNode) {
         /* l'img avait été retirée au profit du canvas : on la remet */
         wrap.classList.add('empty');
-        img = previewImg(src, tip + ' — flux MJPEG');
+        img = previewImg(src, tr(tip) + tr(' — flux MJPEG'));
         img.addEventListener('load', function () { wrap.classList.remove('empty'); });
         wrap.insertBefore(img, wrap.querySelector('.preview-empty'));
       }
-      img.setAttribute('data-tip', tip + ' — flux MJPEG');
+      img.setAttribute('data-tip', tr(tip) + tr(' — flux MJPEG'));
       if (msg && !H264.toasted) {
         H264.toasted = true;
         toast(msg);
@@ -1215,7 +1257,7 @@
               if (!canvas) {
                 canvas = el('canvas', {
                   class: 'preview-stream',
-                  'data-tip': tip + ' — flux H.264 (WebCodecs)'
+                  'data-tip': tr(tip) + tr(' — flux H.264 (WebCodecs)')
                 });
                 canvas.width = frame.displayWidth || (cfg && cfg.width) || 640;
                 canvas.height = frame.displayHeight || (cfg && cfg.height) || 360;
@@ -1269,7 +1311,7 @@
     var n = cnParse(input.value);
     if (n === null) {
       input.classList.add('danger-text');
-      uiWarn('Numéro de cue invalide : ' + input.value);
+      uiWarn(trf('Numéro de cue invalide : {0}', input.value));
       return;
     }
     input.classList.remove('danger-text');
@@ -1300,12 +1342,12 @@
     var next = nextCueAfter(c.number);
     copy.number = next === null ? c.number + 1000 : Math.floor((c.number + next) / 2);
     if (copy.number === c.number) {
-      uiWarn('Pas de place entre ' + cnStr(c.number) + ' et la suivante.');
+      uiWarn(trf('Pas de place entre {0} et la suivante.', cnStr(c.number)));
       return;
     }
-    copy.name += ' (copie)';
+    copy.name += tr(' (copie)');
     if (sendEdit({ op: 'cue_add', cue: copy })) {
-      toast('Cue ' + cnStr(c.number) + ' dupliquée en ' + cnStr(copy.number), 'ok');
+      toast(trf('Cue {0} dupliquée en {1}', cnStr(c.number), cnStr(copy.number)), 'ok');
     }
   }
 
@@ -1313,7 +1355,7 @@
     if (n === null) { uiWarn('Numéro invalide (ex. 12.5).'); return false; }
     if (n === c.number) { return false; }
     if (cues().some(function (x) { return x.number === n; })) {
-      uiWarn('Le numéro ' + cnStr(n) + ' existe déjà.');
+      uiWarn(trf('Le numéro {0} existe déjà.', cnStr(n)));
       return false;
     }
     var copy = JSON.parse(JSON.stringify(c));
@@ -1326,9 +1368,9 @@
 
   function deleteCueConfirm(c) {
     confirmDialog({
-      title: 'Supprimer la cue ' + cnStr(c.number) + ' ?',
-      message: (c.name ? '« ' + c.name + ' »' : 'Cue sans nom') +
-        ' — annulable ensuite avec Ctrl+Z.',
+      title: trf('Supprimer la cue {0} ?', cnStr(c.number)),
+      message: trf('{0} — annulable ensuite avec Ctrl+Z.',
+        c.name ? ('« ' + c.name + ' »') : tr('Cue sans nom')),
       confirm: 'Supprimer',
       onConfirm: function () {
         sendEdit({ op: 'cue_remove', number: c.number });
@@ -1342,7 +1384,7 @@
     var r = rt();
     var isStandby = r.standby === c.number;
     var items = [
-      { kind: 'head', label: 'Cue ' + cnStr(c.number) + (c.name ? ' — ' + c.name : '') },
+      { kind: 'head', label: trf('Cue {0}', cnStr(c.number)) + (c.name ? ' — ' + c.name : '') },
       {
         label: 'Armer (standby)', disabled: isStandby, reason: 'Déjà en standby',
         tip: 'Place cette cue en standby — le prochain GO la lance',
@@ -1362,7 +1404,7 @@
       ctxEdit({
         label: 'Renuméroter…',
         action: function () {
-          var v = window.prompt('Nouveau numéro pour la cue ' + cnStr(c.number) + ' :', cnStr(c.number));
+          var v = window.prompt(trf('Nouveau numéro pour la cue {0} :', cnStr(c.number)), cnStr(c.number));
           if (v === null) { return; }
           renumberCue(c, cnParse(v.trim()));
         }
@@ -1370,7 +1412,7 @@
       ctxEdit({
         label: 'Notes…', tip: 'Notes de régie, visibles en Live sous le transport',
         action: function () {
-          var v = window.prompt('Notes de régie de la cue ' + cnStr(c.number) + ' :', c.notes || '');
+          var v = window.prompt(trf('Notes de régie de la cue {0} :', cnStr(c.number)), c.notes || '');
           if (v !== null) { commitCue(c, function (x) { x.notes = v; }); }
         }
       })
@@ -1407,7 +1449,7 @@
       var row = el('div', {
         class: 'cue-row' + (disarmed ? ' disarmed' : ''), 'data-cn': c.number,
         role: 'button', tabindex: '0',
-        'aria-label': 'Cue ' + cnStr(c.number) + (c.name ? ' — ' + c.name : ''),
+        'aria-label': trf('Cue {0}', cnStr(c.number)) + (c.name ? ' — ' + c.name : ''),
         'data-tip': disarmed ? 'Cue désarmée : sautée par GO/follow (GOTO la joue quand même).' : null
       },
         el('span', { class: 'cue-num' },
@@ -1436,7 +1478,7 @@
   function transitionLabel(t) {
     if (!t) { return ''; }
     var k = { cut: 'Cut', crossfade: 'Fondu', through_black: 'Par le noir' }[t.kind] || t.kind;
-    return t.kind === 'cut' ? k : k + ' ' + fmtF(t.dur_s, 1) + ' s';
+    return t.kind === 'cut' ? tr(k) : trf('{0} {1} s', tr(k), fmtF(t.dur_s, 1));
   }
 
   /* Badges compacts d'une cue : follow, boucle de conduite (goto_after),
@@ -1449,19 +1491,19 @@
     }
     if (k === 'wait') {
       out.push(el('span', { class: 'cue-badge', 'data-tip': 'Follow : enchaîne après l’attente' },
-        'attente ' + fmtF(followWait(c.follow), 1) + ' s'));
+        trf('attente {0} s', fmtF(followWait(c.follow), 1))));
     }
     var tct = c.triggers && c.triggers.timecode;
     if (tct) {
       out.push(el('span', {
         class: 'cue-badge tc',
-        'data-tip': 'Déclenchée par timecode à ' + tct +
-          (settings().timecode_chase ? '' : ' — chase inactif (Réglages → Chase timecode)')
+        'data-tip': trf('Déclenchée par timecode à {0}', tct) +
+          (settings().timecode_chase ? '' : tr(' — chase inactif (Réglages → Chase timecode)'))
       }, 'TC ' + tct));
     }
     if (c.goto_after !== null && c.goto_after !== undefined) {
-      out.push(el('span', { class: 'cue-badge loop', 'data-tip': 'À la fin, saute à la cue ' + cnStr(c.goto_after) },
-        '⟳ vers ' + cnStr(c.goto_after)));
+      out.push(el('span', { class: 'cue-badge loop', 'data-tip': trf('À la fin, saute à la cue {0}', cnStr(c.goto_after)) },
+        trf('⟳ vers {0}', cnStr(c.goto_after))));
     }
     var states = c.states || [];
     if (states.some(function (st) { return st.playback && st.playback.end === 'loop'; })) {
@@ -1536,7 +1578,7 @@
       line.textContent = '';
       line.appendChild(rtItem('ACTIVE', cnStr(r.active), ''));
       line.appendChild(rtItem('STANDBY', cnStr(r.standby), 'rt-standby'));
-      if (r.remaining_s > 0) { line.appendChild(rtItem('RESTE', fmtF(r.remaining_s, 1) + ' s', '')); }
+      if (r.remaining_s > 0) { line.appendChild(rtItem('RESTE', trf('{0} s', fmtF(r.remaining_s, 1)), '')); }
       if (r.transition_active) { line.appendChild(rtItem('TRANSITION', 'en cours…', '')); }
     }
     var master = byId('master-range');
@@ -1552,7 +1594,7 @@
     if (dbo) {
       dbo.classList.toggle('engaged', !!r.dbo);
       var dlbl = dbo.querySelector('.dbo-label');
-      if (dlbl) { dlbl.textContent = r.dbo ? 'DBO ACTIF — relâcher' : 'DBO'; }
+      if (dlbl) { dlbl.textContent = r.dbo ? tr('DBO ACTIF — relâcher') : 'DBO'; }
     }
     /* anti double-GO : ré-applique l'état d'attente si le bouton GO vient
        d'être recréé par un re-render en plein délai */
@@ -1586,7 +1628,7 @@
     line.textContent = '';
     if (!h) {
       line.appendChild(chip(S.connected ? '' : 'bad',
-        S.connected ? 'En attente de données…' : 'Hors ligne'));
+        tr(S.connected ? 'En attente de données…' : 'Hors ligne')));
       return;
     }
     function grade(v, warnAt, badAt) {
@@ -1599,17 +1641,17 @@
       var v = p[1];
       var cls = (typeof v === 'number' && isFinite(v))
         ? (v >= 30 ? 'ok' : (v >= 15 ? 'warn' : 'bad')) : '';
-      line.appendChild(chip(cls, 'S' + p[0] + ' ' + fmtF(v, 0) + ' fps', 'Cadence de rendu de la sortie ' + p[0]));
+      line.appendChild(chip(cls, 'S' + p[0] + ' ' + fmtF(v, 0) + ' fps', trf('Cadence de rendu de la sortie {0}', p[0])));
     });
     var drops = 0;
     (h.drops || []).forEach(function (p) { drops += p[1]; });
     line.appendChild(chip(grade(drops, 1, 100), 'drops ' + drops, 'Frames perdues (cumul)'));
     line.appendChild(chip(grade(h.cpu_pct, 70, 90), 'CPU ' + fmtF(h.cpu_pct, 0) + ' %', 'Charge processeur du moteur'));
-    line.appendChild(chip('', fmtF(h.mem_mb, 0) + ' Mo', 'Mémoire utilisée par le moteur'));
+    line.appendChild(chip('', trf('{0} Mo', fmtF(h.mem_mb, 0)), 'Mémoire utilisée par le moteur'));
     if (h.temp_c !== null && h.temp_c !== undefined) {
       line.appendChild(chip(grade(h.temp_c, 70, 80), fmtF(h.temp_c, 0) + ' °C', 'Température (Raspberry Pi)'));
     }
-    line.appendChild(chip(S.connected ? 'ok' : 'bad', 'WS ' + (S.connected ? 'OK' : 'coupé'),
+    line.appendChild(chip(S.connected ? 'ok' : 'bad', 'WS ' + tr(S.connected ? 'OK' : 'coupé'),
       'Liaison WebSocket avec le moteur'));
   }
 
@@ -1628,12 +1670,12 @@
     if (txt) {
       sn.classList.remove('empty');
       sn.appendChild(el('span', { class: 'standby-notes-label' },
-        'NOTES — CUE ' + cnStr(cue.number)));
+        trf('NOTES — CUE {0}', cnStr(cue.number))));
       sn.appendChild(el('span', { class: 'standby-notes-text' }, txt));
     } else {
       sn.classList.add('empty');
       sn.textContent = cue
-        ? (isShowMode() ? 'Aucune note de régie.' : 'Aucune note de régie — touche O pour en ajouter.')
+        ? tr(isShowMode() ? 'Aucune note de régie.' : 'Aucune note de régie — touche O pour en ajouter.')
         : '';
     }
   }
@@ -1671,7 +1713,7 @@
       updateStandbyNotes(rt());
     });
     sn.appendChild(el('span', { class: 'standby-notes-label' },
-      'NOTES — CUE ' + cnStr(n) + ' (Échap ou clic ailleurs : terminer)'));
+      trf('NOTES — CUE {0} (Échap ou clic ailleurs : terminer)', cnStr(n))));
     sn.appendChild(ta);
     ta.focus();
   }
@@ -1690,9 +1732,9 @@
       .map(function (k) {
         var v = String(p[k]);
         var cls = v === 'ok' ? 'ok' : (v === 'inactif' ? '' : 'bad');
-        var text = v === 'ok' ? 'OK' : v;
-        return chip(cls, PROTO_LABELS[k] + ' — ' + text,
-          v.indexOf('erreur') === 0 ? v : ('État du protocole ' + PROTO_LABELS[k]));
+        var text = v === 'ok' ? 'OK' : tr(v);
+        return chip(cls, tr(PROTO_LABELS[k]) + ' — ' + text,
+          v.indexOf('erreur') === 0 ? v : trf('État du protocole {0}', tr(PROTO_LABELS[k])));
       });
   }
 
@@ -1713,7 +1755,7 @@
     var name = show().name || '';
     var t;
     if (r.active !== null && r.active !== undefined) {
-      t = '● Cue ' + cnStr(r.active) + (name ? ' — ' + name : ' — Conduite');
+      t = trf('● Cue {0}', cnStr(r.active)) + (name ? ' — ' + name : ' — Conduite');
     } else {
       t = (name ? name + ' — ' : '') + 'Conduite';
     }
@@ -1769,8 +1811,8 @@
     var t = byId('acue-time');
     if (t) {
       t.textContent = r.remaining_s > 0
-        ? ('reste ' + fmtF(r.remaining_s, 1) + ' s')
-        : (r.transition_active ? 'transition…' : 'en cours');
+        ? trf('reste {0} s', fmtF(r.remaining_s, 1))
+        : tr(r.transition_active ? 'transition…' : 'en cours');
     }
     var bar = byId('acue-bar');
     if (bar) { bar.style.width = Math.round(clamp(r.progress || 0, 0, 1) * 100) + '%'; }
@@ -1793,6 +1835,18 @@
     midi: { label: 'Ouvrir le patch', tab: 'patch' }
   };
 
+  /* Texte d'un avertissement moteur. Le moteur envoie la phrase française
+     toute faite (`msg`) ET sa forme démontée (`key` = gabarit, `args` =
+     valeurs) : on recompose depuis le gabarit pour l'avoir dans la langue de
+     l'opérateur, et on retombe sur `msg` si un moteur plus ancien ne publie
+     pas encore `key` (rétro-compatibilité du contrat). */
+  function warnText(w) {
+    if (w && typeof w.key === 'string' && w.key) {
+      return trf.apply(null, [w.key].concat(Array.isArray(w.args) ? w.args : []));
+    }
+    return tr(String((w && w.msg) || ''));
+  }
+
   function updateStatusBar(r) {
     var host = byId('sb-protos');
     if (host) {
@@ -1808,7 +1862,7 @@
             var cls = v === 'ok' ? 'ok' : (v === 'inactif' ? '' : 'bad');
             host.appendChild(el('span', {
               class: 'sb-proto' + (cls ? ' ' + cls : ''),
-              'data-tip': PROTO_LABELS[k] + ' — ' + (v === 'ok' ? 'OK' : v)
+              'data-tip': tr(PROTO_LABELS[k]) + ' — ' + (v === 'ok' ? 'OK' : tr(v))
             }, SB_PROTO_SHORT[k]));
           });
         }
@@ -1831,8 +1885,8 @@
         var tip = !t
           ? 'Chase timecode actif — aucun signal MTC reçu (brancher une source timecode sur un port MIDI).'
           : (t.locked
-            ? 'Timecode MTC verrouillé (' + tcRateLabel(t.rate) + ' i/s) — le chase suit.'
-            : 'Signal timecode perdu (' + tcRateLabel(t.rate) + ' i/s) — dernier timecode figé, les cues actives continuent.');
+            ? trf('Timecode MTC verrouillé ({0} i/s) — le chase suit.', tcRateLabel(t.rate))
+            : trf('Signal timecode perdu ({0} i/s) — dernier timecode figé, les cues actives continuent.', tcRateLabel(t.rate)));
         if (tcEl.getAttribute('data-tip') !== tip) { tcEl.setAttribute('data-tip', tip); }
       }
     }
@@ -1847,7 +1901,7 @@
         chip.classList.toggle('err', hasErr);
         chip.innerHTML = WARN_ICON;
         chip.appendChild(document.createTextNode(
-          ' ' + warns.length + ' — État du show'));
+          trf(' {0} — État du show', warns.length)));
         if (SB.panel) { renderStatusPanel(); }   /* panneau ouvert : rafraîchi */
       }
     }
@@ -1882,7 +1936,7 @@
       var act = WARN_ACTIONS[w.action];
       p.appendChild(el('div', { class: 'warn-item' + (w.level === 'err' ? ' err' : '') },
         el('span', { class: 'warn-dot' }),
-        el('span', { class: 'warn-msg' }, String(w.msg || '')),
+        el('span', { class: 'warn-msg' }, warnText(w)),
         (act && !isShowMode()) ? el('button', {
           'data-tip': 'Ouvre l’onglet concerné',
           onclick: function () { setTab(act.tab); closeStatusPanel(); }
@@ -1907,7 +1961,7 @@
     UPD.sig = sig;
     b.classList.toggle('hidden', !u);
     if (u) {
-      b.textContent = 'Mise à jour ' + (u.version || '?');
+      b.textContent = trf('Mise à jour {0}', u.version || '?');
     } else {
       closeUpdatePop();
     }
@@ -1925,7 +1979,7 @@
     var u = rt().update;
     if (!u) { return; }
     UPD.pop = el('div', { id: 'update-pop', role: 'dialog', 'aria-label': 'Mise à jour disponible' },
-      el('h3', null, 'Conduite ' + (u.version || '?') + ' disponible'),
+      el('h3', null, trf('Conduite {0} disponible', u.version || '?')),
       el('div', { class: 'muted' },
         'Rien n’est téléchargé automatiquement — la mise à jour reste à votre main, après le spectacle.'),
       u.notes ? el('div', { class: 'update-notes' }, u.notes) : null,
@@ -1950,7 +2004,7 @@
       var brand = byId('brand');
       if (brand) {
         brand.setAttribute('data-tip', 'Conduite v' + (a.version || '?') +
-          (a.git ? ' (' + a.git + ')' : '') + ' — régie vidéo de spectacle');
+          (a.git ? ' (' + a.git + ')' : '') + tr(' — régie vidéo de spectacle'));
       }
       if (S.tab === 'reglages') { requestRenderMain(); }
     }).catch(function () { /* hors ligne : pas de version affichée */ });
@@ -1995,7 +2049,7 @@
           active.states.forEach(function (st) {
             sendEdit({ op: 'cue_update_state', number: selCue.number, state: JSON.parse(JSON.stringify(st)) });
           });
-          uiInfo('État courant enregistré dans la cue ' + cnStr(selCue.number));
+          uiInfo(trf('État courant enregistré dans la cue {0}', cnStr(selCue.number)));
         }
       }, 'Enregistrer l’état courant dans la cue')));
 
@@ -2032,15 +2086,15 @@
   };
 
   function cueRow(c) {
-    var tr = el('tr', {
+    var row = el('tr', {
       class: (c.number === S.sel.cue ? 'selected' : '') + (c.armed === false ? ' disarmed' : '')
     });
-    tr.addEventListener('click', function (e) {
+    row.addEventListener('click', function (e) {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON') { return; }
       S.sel.cue = c.number;
       renderMain();
     });
-    onCtx(tr, function () { return cueCtxItems(c); });
+    onCtx(row, function () { return cueCtxItems(c); });
 
     function commit(mut) { commitCue(c, mut); }
 
@@ -2051,7 +2105,7 @@
         num.value = cnStr(c.number);
       }
     });
-    tr.appendChild(el('td', null, num));
+    row.appendChild(el('td', null, num));
 
     var armed = el('input', {
       type: 'checkbox', checked: c.armed !== false,
@@ -2060,29 +2114,29 @@
     armed.addEventListener('change', function () {
       commit(function (x) { x.armed = armed.checked; });
     });
-    tr.appendChild(el('td', null, armed));
+    row.appendChild(el('td', null, armed));
 
     var name = el('input', { type: 'text', value: c.name || '', 'data-tip': 'Nom de la cue' });
     name.addEventListener('change', function () { commit(function (x) { x.name = name.value; }); });
-    tr.appendChild(el('td', null, name));
+    row.appendChild(el('td', null, name));
 
     var kind = sel(['cut', 'crossfade', 'through_black'], ['Cut', 'Fondu', 'Par le noir'],
       (c.transition || {}).kind || 'cut',
       function (v) { commit(function (x) { x.transition = x.transition || {}; x.transition.kind = v; }); });
     kind.setAttribute('data-tip', 'Cut : bascule sèche. Fondu : crossfade A/B. Par le noir : descente puis montée.');
-    tr.appendChild(el('td', null, kind));
+    row.appendChild(el('td', null, kind));
 
     var dur = el('input', { type: 'number', min: 0, step: 0.1, value: (c.transition || {}).dur_s || 0 });
     dur.addEventListener('change', function () {
       commit(function (x) { x.transition = x.transition || {}; x.transition.dur_s = parseFloat(dur.value) || 0; });
     });
-    tr.appendChild(el('td', null, dur));
+    row.appendChild(el('td', null, dur));
 
     var curve = sel(['linear', 'ease_in', 'ease_out', 'ease_in_out', 's_curve'],
       ['Linéaire', 'Ease in', 'Ease out', 'Ease in-out', 'Courbe S'],
       (c.transition || {}).curve || 'linear',
       function (v) { commit(function (x) { x.transition = x.transition || {}; x.transition.curve = v; }); });
-    tr.appendChild(el('td', null, curve));
+    row.appendChild(el('td', null, curve));
 
     var fkind = followKind(c.follow);
     var fsel = sel(['manual', 'after_media', 'wait'], ['GO manuel', 'Fin de média', 'Attente (s)'], fkind, applyFollow);
@@ -2098,7 +2152,7 @@
         x.follow = k === 'wait' ? { wait: parseFloat(fwait.value) || 0 } : k;
       });
     }
-    tr.appendChild(el('td', null, fsel, fwait));
+    row.appendChild(el('td', null, fsel, fwait));
 
     var tcIn = el('input', {
       type: 'text', value: (c.triggers && c.triggers.timecode) || '',
@@ -2118,19 +2172,19 @@
         x.triggers.timecode = v;
       });
     });
-    tr.appendChild(el('td', null, tcIn));
+    row.appendChild(el('td', null, tcIn));
 
     var notes = el('input', { type: 'text', value: c.notes || '', 'data-tip': 'Notes de régie' });
     notes.addEventListener('change', function () { commit(function (x) { x.notes = notes.value; }); });
-    tr.appendChild(el('td', null, notes));
+    row.appendChild(el('td', null, notes));
 
     var contents = (c.states || []).map(function (st) {
       var slice = slices().find(function (s) { return s.id === st.slice; });
-      return (slice ? slice.name : ('slice ' + st.slice)) + ' : ' + contentLabel(st.content);
+      return (slice ? slice.name : trf('slice {0}', st.slice)) + ' : ' + contentLabel(st.content);
     }).join(' | ') || '—';
-    tr.appendChild(el('td', { class: 'muted' }, contents));
+    row.appendChild(el('td', { class: 'muted' }, contents));
 
-    return tr;
+    return row;
   }
 
   function sel(values, labels, current, onchange) {
@@ -2163,13 +2217,13 @@
       sendCornerSet(s.id, i, c[0], c[1]);
     });
     drawMapping();
-    toast('Coins de « ' + (s.name || ('slice ' + s.id)) + ' » réinitialisés', 'ok');
+    toast(trf('Coins de « {0} » réinitialisés', s.name || trf('slice {0}', s.id)), 'ok');
   }
 
   /* Sous-menu « Mire » d'un slice : toutes les mires + extinction. */
   function slicePatternSub(s) {
     return function () {
-      var items = [{ kind: 'head', label: 'Mire sur « ' + (s.name || s.id) + ' » (cue standby/active)' }];
+      var items = [{ kind: 'head', label: trf('Mire sur « {0} » (cue standby/active)', s.name || s.id) }];
       PATTERNS.forEach(function (p) {
         items.push(ctxEdit({
           label: p[1],
@@ -2188,7 +2242,7 @@
   /* Menu contextuel d'un slice (liste Mapping + canvas). */
   function sliceCtxItems(s) {
     return [
-      { kind: 'head', label: s.name || ('Slice ' + s.id) },
+      { kind: 'head', label: s.name || trf('Slice {0}', s.id) },
       ctxEdit({
         label: 'Réinitialiser les coins',
         tip: 'Repose les 4 coins plein cadre (0,0 → 1,1)',
@@ -2198,7 +2252,7 @@
       ctxEdit({
         label: 'Renommer…',
         action: function () {
-          var v = window.prompt('Nom du slice :', s.name || '');
+          var v = window.prompt(tr('Nom du slice :'), s.name || '');
           if (v === null || !v.trim()) { return; }
           var copy = JSON.parse(JSON.stringify(s));
           copy.name = v.trim();
@@ -2210,7 +2264,7 @@
         label: 'Supprimer', danger: true,
         action: function () {
           confirmDialog({
-            title: 'Supprimer le slice « ' + (s.name || ('slice ' + s.id)) + ' » ?',
+            title: trf('Supprimer le slice « {0} » ?', s.name || trf('slice {0}', s.id)),
             message: 'Son calage et ses contenus assignés dans les cues seront perdus — annulable ensuite avec Ctrl+Z.',
             confirm: 'Supprimer',
             onConfirm: function () {
@@ -2267,7 +2321,7 @@
           var id = slices().reduce(function (m, s) { return Math.max(m, s.id); }, 0) + 1;
           sendEdit({
             op: 'slice_add', slice: {
-              id: id, name: 'Slice ' + id, output: S.sel.output,
+              id: id, name: trf('Slice {0}', id), output: S.sel.output,
               corners: [[0, 0], [1, 0], [1, 1], [0, 1]],
               src: { x: 0, y: 0, w: 1, h: 1 }, z: 0, enabled: true
             }
@@ -2280,7 +2334,7 @@
         onclick: function () {
           if (!selSlice) { return; }
           confirmDialog({
-            title: 'Supprimer le slice « ' + (selSlice.name || ('slice ' + selSlice.id)) + ' » ?',
+            title: trf('Supprimer le slice « {0} » ?', selSlice.name || trf('slice {0}', selSlice.id)),
             message: 'Son calage et ses contenus assignés dans les cues seront perdus — annulable ensuite avec Ctrl+Z.',
             confirm: 'Supprimer',
             onConfirm: function () {
@@ -2298,7 +2352,7 @@
         role: 'button', tabindex: '0',
         'data-tip': 'Sélectionne ce slice dans l’éditeur (Entrée au clavier)',
         onclick: function () { S.sel.slice = s.id; S.sel.corner = null; renderMain(); }
-      }, s.name + ' (z ' + s.z + (s.enabled ? '' : ', désactivé') + ')');
+      }, trf('{0} (z {1}{2})', s.name, s.z, s.enabled ? '' : tr(', désactivé')));
       item.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') { e.preventDefault(); S.sel.slice = s.id; S.sel.corner = null; renderMain(); }
       });
@@ -2330,7 +2384,7 @@
           onclick: function () {
             var ok = 0;
             slicesOfOutput().forEach(function (s) { if (assignContent(s.id, { pattern: MIRE.kind }, null, true)) { ok++; } });
-            if (ok) { toast('Mire « ' + patternLabel(MIRE.kind) + ' » posée sur ' + ok + ' slice(s) (cue ' + cnStr(targetCueNumber()) + ')', 'ok'); }
+            if (ok) { toast(trf('Mire « {0} » posée sur {1} slice(s) (cue {2})', tr(patternLabel(MIRE.kind)), ok, cnStr(targetCueNumber())), 'ok'); }
           }
         }, 'Mire globale'),
         el('button', {
@@ -2338,13 +2392,13 @@
           onclick: function () {
             var ok = 0;
             slicesOfOutput().forEach(function (s) { if (assignContent(s.id, 'none', null, true)) { ok++; } });
-            if (ok) { toast('Contenu retiré de ' + ok + ' slice(s) (cue ' + cnStr(targetCueNumber()) + ')', 'ok'); }
+            if (ok) { toast(trf('Contenu retiré de {0} slice(s) (cue {1})', ok, cnStr(targetCueNumber())), 'ok'); }
           }
         }, 'Éteindre'))));
 
     /* paramètres du slice */
     if (selSlice) {
-      var p = el('div', { class: 'panel' }, el('h2', null, selSlice.name + ' — paramètres'));
+      var p = el('div', { class: 'panel' }, el('h2', null, trf('{0} — paramètres', selSlice.name)));
       p.appendChild(paramSlider('slice/' + selSlice.id + '/opacity', 'Opacité', 0, 1, 1));
       p.appendChild(paramSlider('slice/' + selSlice.id + '/gain/r', 'Gain R', 0, 2, 1));
       p.appendChild(paramSlider('slice/' + selSlice.id + '/gain/g', 'Gain V', 0, 2, 1));
@@ -2361,7 +2415,7 @@
   function paramSlider(addr, label, min, max, def) {
     var input = el('input', {
       type: 'range', min: min, max: max, step: 0.001, value: def,
-      'data-tip': label + ' — adresse : ' + addr
+      'data-tip': trf('{0} — adresse : {1}', tr(label), addr)
     });
     var val = el('span', { class: 'val' }, fmtF(def));
     input.addEventListener('input', function () {
@@ -2384,7 +2438,7 @@
       return [
         { kind: 'head', label: addr },
         {
-          label: 'Réinitialiser (' + fmtF(def) + ')',
+          label: trf('Réinitialiser ({0})', fmtF(def)),
           tip: 'Repose la valeur par défaut (équivaut au double-clic sur le curseur)',
           action: function () { sliderSet(input, def); }
         },
@@ -2392,10 +2446,10 @@
           label: 'Saisir une valeur…',
           tip: 'Valeur exacte au clavier (équivaut au clic sur la valeur affichée)',
           action: function () {
-            var v = window.prompt('Valeur pour ' + addr + ' (' + input.min + ' à ' + input.max + ') :', input.value);
+            var v = window.prompt(trf('Valeur pour {0} ({1} à {2}) :', addr, input.min, input.max), input.value);
             if (v === null) { return; }
             var f = parseFloat(String(v).replace(',', '.'));
-            if (!isFinite(f)) { uiWarn('Valeur invalide : ' + v); return; }
+            if (!isFinite(f)) { uiWarn(trf('Valeur invalide : {0}', v)); return; }
             sliderSet(input, f);
           }
         },
@@ -2459,7 +2513,7 @@
       ctx.fillStyle = seld ? '#e8eaed' : '#9aa0a6';
       ctx.font = '12.5px system-ui';
       ctx.textAlign = 'center';
-      ctx.fillText(s.name || ('slice ' + s.id), cx, cy);
+      ctx.fillText(s.name || trf('slice {0}', s.id), cx, cy);
     });
   }
 
@@ -2596,11 +2650,11 @@
   /* Menu contextuel d'une carte média. */
   function mediaCtxItems(m) {
     var sliceOk = S.sel.slice !== null;
-    var sliceName = sliceOk ? ((currentSlice() || {}).name || ('slice ' + S.sel.slice)) : '';
+    var sliceName = sliceOk ? ((currentSlice() || {}).name || trf('slice {0}', S.sel.slice)) : '';
     return [
       { kind: 'head', label: m.name || m.path },
       ctxEdit({
-        label: 'Assigner au slice' + (sliceOk ? ' « ' + sliceName + ' »' : ''),
+        label: sliceOk ? trf('Assigner au slice « {0} »', sliceName) : tr('Assigner au slice'),
         disabled: !sliceOk,
         reason: 'Sélectionnez d’abord un slice (onglet Mapping)',
         tip: 'Pose ce média sur le slice sélectionné, dans la cue standby/active',
@@ -2616,7 +2670,7 @@
           ? 'Le fichier est introuvable — indiquer son nouveau chemin (relatif à media/)'
           : 'Modifier le chemin du fichier (relatif à media/)',
         action: function () {
-          var v = window.prompt('Chemin du fichier, relatif au dossier media/ :', m.path || '');
+          var v = window.prompt(tr('Chemin du fichier, relatif au dossier media/ :'), m.path || '');
           if (v === null) { return; }
           v = v.trim();
           if (!v || v === m.path) { return; }
@@ -2642,7 +2696,7 @@
         tip: 'Retire le média du show (le fichier reste sur disque)',
         action: function () {
           confirmDialog({
-            title: 'Retirer « ' + (m.name || m.path) + ' » du pool ?',
+            title: trf('Retirer « {0} » du pool ?', m.name || m.path),
             message: 'Le fichier reste dans media/ ; les cues qui l’utilisent afficheront un contenu manquant. Annulable avec Ctrl+Z.',
             confirm: 'Retirer',
             onConfirm: function () {
@@ -2679,9 +2733,9 @@
             assignContent(S.sel.slice, { media: S.sel.media }, defaultPlayback());
           }
         }
-      }, 'Assigner au slice ' + (S.sel.slice !== null ? '« ' + (currentSlice() || {}).name + ' »' : '')),
+      }, S.sel.slice !== null ? trf('Assigner au slice « {0} »', (currentSlice() || {}).name) : tr('Assigner au slice')),
       el('span', { class: 'muted' },
-        S.sel.media !== null ? ('Sélection : ' + contentLabel({ media: S.sel.media })) : 'Aucun média sélectionné')));
+        S.sel.media !== null ? trf('Sélection : {0}', contentLabel({ media: S.sel.media })) : 'Aucun média sélectionné')));
 
     var grid = el('div', { id: 'media-grid' });
     medias().forEach(function (m) {
@@ -2693,13 +2747,13 @@
       var card = el('div', {
         class: 'media-card' + (m.id === S.sel.media ? ' selected' : '') + (m.missing ? ' missing' : ''),
         role: 'button', tabindex: '0', 'aria-label': m.name || m.path,
-        'data-tip': m.path + (m.missing ? ' — FICHIER MANQUANT' : '') + ' — clic : sélectionner, double-clic : assigner au slice'
+        'data-tip': m.path + (m.missing ? tr(' — FICHIER MANQUANT') : '') + tr(' — clic : sélectionner, double-clic : assigner au slice')
       },
         img,
         m.missing ? el('span', { class: 'badge-missing' }, 'MANQUANT') : null,
         el('div', { class: 'media-name' }, m.name),
         el('div', { class: 'media-meta' },
-          m.missing ? 'fichier introuvable' :
+          m.missing ? tr('fichier introuvable') :
             (m.width + '×' + m.height + (m.duration_s ? ' • ' + fmtF(m.duration_s, 1) + ' s' : ''))));
       card.addEventListener('click', function () { S.sel.media = m.id; renderMain(); });
       card.addEventListener('dblclick', function () {
@@ -2746,18 +2800,18 @@
             assignContent(S.sel.slice, { material: S.sel.material });
           }
         }
-      }, 'Assigner au slice ' + (S.sel.slice !== null ? '« ' + (currentSlice() || {}).name + ' »' : ''))));
+      }, S.sel.slice !== null ? trf('Assigner au slice « {0} »', (currentSlice() || {}).name) : tr('Assigner au slice'))));
 
     var table = el('table', { class: 'grid' },
       el('tr', null, el('th', null, 'Nom'), el('th', null, 'Fichier')));
     materials().forEach(function (m) {
-      var tr = el('tr', {
+      var row = el('tr', {
         class: m.id === S.sel.material ? 'selected' : '',
         'data-tip': 'Clic : sélectionner ce matériau'
       },
         el('td', null, m.name), el('td', { class: 'muted' }, m.path));
-      tr.addEventListener('click', function () { S.sel.material = m.id; renderMain(); });
-      table.appendChild(tr);
+      row.addEventListener('click', function () { S.sel.material = m.id; renderMain(); });
+      table.appendChild(row);
     });
     left.appendChild(table);
     if (!materials().length) {
@@ -2803,10 +2857,10 @@
         right.appendChild(el('details', { class: 'tech' },
           el('summary', null, 'Détail technique'),
           el('pre', null,
-            'Fichier : shaders/' + (mat ? mat.path : '?') + '\n' +
-            'Adresses de paramètres attendues : ' + prefix + '<input>\n' +
+            trf('Fichier : shaders/{0}', mat ? mat.path : '?') + '\n' +
+            trf('Adresses de paramètres attendues : {0}<input>', prefix) + '\n' +
             (isfLogs.length
-              ? ('Journal (dernières lignes ISF/shader) :\n' + isfLogs.map(function (l) {
+              ? (tr('Journal (dernières lignes ISF/shader) :') + '\n' + isfLogs.map(function (l) {
                   return '[' + l.level + '] ' + (l.target || '') + ' — ' + (l.message || '');
                 }).join('\n'))
               : 'Aucune erreur ISF/shader dans le journal récent.'))));
@@ -3128,8 +3182,8 @@
     if (chipEl) {
       chipEl.className = 'chip ' + (S.fft ? 'ok' : 'warn');
       chipEl.textContent = S.fft
-        ? ('Entrée : ' + (S.fft.device || 'active'))
-        : 'Aucune entrée audio';
+        ? trf('Entrée : {0}', S.fft.device || tr('active'))
+        : tr('Aucune entrée audio');
     }
   }
 
@@ -3391,7 +3445,7 @@
        ['random_sh', 'Random S&H'], ['drift', 'Drift (dérive douce)']].forEach(function (pair) {
         var btn = el('button', {
           class: 'wave-btn' + (pair[0] === waveVal ? ' active' : ''),
-          'data-tip': 'Forme d’onde : ' + pair[1],
+          'data-tip': trf('Forme d’onde : {0}', tr(pair[1])),
           onclick: function () {
             commit(function (x) {
               var old = x.kind.lfo.wave;
@@ -3439,8 +3493,8 @@
           presets.appendChild(el('button', {
             class: 'wave-btn' + (Math.abs(mult - p[0]) < 1e-6 ? ' active' : ''),
             'data-tip': p[0] < 1
-              ? ('Un cycle sur ' + Math.round(1 / p[0]) + ' temps')
-              : (p[0] === 1 ? 'Un cycle par temps' : (p[0] + ' cycles par temps')),
+              ? trf('Un cycle sur {0} temps', Math.round(1 / p[0]))
+              : (p[0] === 1 ? tr('Un cycle par temps') : trf('{0} cycles par temps', p[0])),
             onclick: function () {
               commit(function (x) { x.kind.lfo.freq = { bpm_sync: { mult: p[0] } }; });
             }
@@ -3502,7 +3556,7 @@
   }
 
   function routeRow(r) {
-    var tr = el('tr');
+    var row = el('tr');
     function commit(mut) {
       var copy = JSON.parse(JSON.stringify(r));
       mut(copy);
@@ -3514,7 +3568,7 @@
       String(r.source),
       function (v) { commit(function (x) { x.source = parseInt(v, 10); }); });
     src.setAttribute('data-tip', 'Modulateur source');
-    tr.appendChild(el('td', null, el('span', { class: 'toolbar', style: 'margin:0;flex-wrap:nowrap' },
+    row.appendChild(el('td', null, el('span', { class: 'toolbar', style: 'margin:0;flex-wrap:nowrap' },
       el('span', { class: 'mod-color-dot', style: 'background:' + modColor(r.source) + ';color:' + modColor(r.source) }),
       src)));
 
@@ -3522,7 +3576,7 @@
     if (addrs.indexOf(r.target_addr) < 0) { addrs.unshift(r.target_addr); }
     var tgt = sel(addrs, addrs, r.target_addr, function (v) { commit(function (x) { x.target_addr = v; }); });
     tgt.setAttribute('data-tip', 'Paramètre cible (adresse stable)');
-    tr.appendChild(el('td', null, tgt));
+    row.appendChild(el('td', null, tgt));
 
     var depth = el('input', {
       type: 'range', min: -1, max: 1, step: 0.01, value: r.depth,
@@ -3532,18 +3586,18 @@
     depth.addEventListener('input', function () { dval.textContent = fmtF(parseFloat(depth.value)); });
     depth.addEventListener('change', function () { commit(function (x) { x.depth = parseFloat(depth.value); }); });
     enhanceSlider(depth, dval, 0.5);
-    tr.appendChild(el('td', null, el('span', { class: 'toolbar' }, depth, dval)));
+    row.appendChild(el('td', null, el('span', { class: 'toolbar' }, depth, dval)));
 
     var mode = sel(['add', 'mul', 'replace'], ['Ajouter', 'Multiplier', 'Remplacer'], r.mode,
       function (v) { commit(function (x) { x.mode = v; }); });
-    tr.appendChild(el('td', null, mode));
+    row.appendChild(el('td', null, mode));
 
-    tr.appendChild(el('td', { class: 'edit-only' },
+    row.appendChild(el('td', { class: 'edit-only' },
       el('button', {
         class: 'danger', 'data-tip': 'Supprime cette route',
         onclick: function () { sendEdit({ op: 'route_remove', id: r.id }); }
       }, '✕')));
-    return tr;
+    return row;
   }
 
   /* ============================================= animation par paramètre
@@ -3557,12 +3611,12 @@
     var rs = routesFor(addr);
     var names = rs.map(function (r) {
       var m = modById(r.source);
-      return m ? m.name : ('mod ' + r.source);
+      return m ? m.name : trf('mod {0}', r.source);
     });
     var btn = el('button', {
       class: 'anim-btn edit-only' + (rs.length ? ' active' : ''),
       'data-tip': rs.length
-        ? ('Paramètre animé par : ' + names.join(', ') + ' — clic pour éditer l’animation')
+        ? trf('Paramètre animé par : {0} — clic pour éditer l’animation', names.join(', '))
         : 'Animer ce paramètre (LFO, bande FFT…) — clic pour choisir une source',
       onclick: function (e) {
         e.stopPropagation();
@@ -3808,8 +3862,9 @@
     /* --- Art-Net --- */
     var art = el('div', { class: 'panel' }, el('h2', null, 'Art-Net (DMX)'));
     art.appendChild(el('div', { class: 'muted' },
-      'Nœud ' + (st.artnet_enabled ? 'actif' : 'inactif') +
-      ' — univers écoutés : ' + ((st.artnet_universes || []).join(', ') || '—')));
+      trf('Nœud {0} — univers écoutés : {1}',
+        tr(st.artnet_enabled ? 'actif' : 'inactif'),
+        (st.artnet_universes || []).join(', ') || '—')));
     art.appendChild(el('div', { class: 'toolbar edit-only' },
       el('button', {
         'data-tip': 'Ajoute un patch DMX (univers 0, canal 1 → master) à modifier ensuite',
@@ -3848,7 +3903,7 @@
   }
 
   function midiRow(b, index) {
-    var tr = el('tr');
+    var row = el('tr');
     var isNote = b && typeof b === 'object' && 'note' in b;
     var body = isNote ? b.note : (b && b.cc) || {};
 
@@ -3858,13 +3913,13 @@
       sendEdit({ op: 'patch_midi_update', index: index, binding: copy });
     }
 
-    tr.appendChild(el('td', null, isNote ? 'Note' : ('CC' + (body.fourteen_bits ? ' 14 bits' : ''))));
+    row.appendChild(el('td', null, isNote ? 'Note' : ('CC' + (body.fourteen_bits ? ' 14 bits' : ''))));
 
     var ch = el('input', { type: 'number', min: 1, max: 16, value: (body.channel || 0) + 1, 'data-tip': 'Canal MIDI 1–16' });
     ch.addEventListener('change', function () {
       commit(function (x) { x.channel = clamp((parseInt(ch.value, 10) || 1) - 1, 0, 15); });
     });
-    tr.appendChild(el('td', null, ch));
+    row.appendChild(el('td', null, ch));
 
     var num = el('input', { type: 'number', min: 0, max: 127, value: isNote ? body.note : body.cc });
     num.addEventListener('change', function () {
@@ -3873,7 +3928,7 @@
         if (isNote) { x.note = v; } else { x.cc = v; }
       });
     });
-    tr.appendChild(el('td', null, num));
+    row.appendChild(el('td', null, num));
 
     if (isNote) {
       var cmds = ['go', 'back', 'dbo', 'dbo_release', 'tap_tempo', 'panic'];
@@ -3884,28 +3939,28 @@
         });
       });
       csel.setAttribute('data-tip', 'Commande déclenchée par la note');
-      tr.appendChild(el('td', null, csel));
-      tr.appendChild(el('td', { class: 'muted' }, '—'));
+      row.appendChild(el('td', null, csel));
+      row.appendChild(el('td', { class: 'muted' }, '—'));
     } else {
       var addrs = paramAddrs();
       if (addrs.indexOf(body.addr) < 0) { addrs.unshift(body.addr || ''); }
       var asel = sel(addrs, addrs, body.addr, function (v) { commit(function (x) { x.addr = v; }); });
-      tr.appendChild(el('td', null, asel));
+      row.appendChild(el('td', null, asel));
       var pk = el('input', { type: 'checkbox', checked: !!body.pickup });
       pk.addEventListener('change', function () { commit(function (x) { x.pickup = pk.checked; }); });
-      tr.appendChild(el('td', null, pk));
+      row.appendChild(el('td', null, pk));
     }
 
-    tr.appendChild(el('td', { class: 'edit-only' },
+    row.appendChild(el('td', { class: 'edit-only' },
       el('button', {
         class: 'danger', 'data-tip': 'Supprime ce binding',
         onclick: function () { sendEdit({ op: 'patch_midi_remove', index: index }); }
       }, '✕')));
-    return tr;
+    return row;
   }
 
   function artnetRow(e, index) {
-    var tr = el('tr');
+    var row = el('tr');
     function commit(mut) {
       var copy = JSON.parse(JSON.stringify(e));
       mut(copy);
@@ -3918,25 +3973,25 @@
       });
       return el('td', null, i);
     }
-    tr.appendChild(numCell('universe', 0, 32767));
-    tr.appendChild(numCell('channel', 1, 512));
+    row.appendChild(numCell('universe', 0, 32767));
+    row.appendChild(numCell('channel', 1, 512));
     var bits = sel(['eight', 'sixteen'], ['8 bits', '16 bits'], e.bits, function (v) {
       commit(function (x) { x.bits = v; });
     });
-    tr.appendChild(el('td', null, bits));
+    row.appendChild(el('td', null, bits));
     var addrs = paramAddrs();
     if (addrs.indexOf(e.addr) < 0) { addrs.unshift(e.addr || ''); }
     var asel = sel(addrs, addrs, e.addr, function (v) { commit(function (x) { x.addr = v; }); });
-    tr.appendChild(el('td', null, asel));
-    tr.appendChild(numCell('min', -1e9, 1e9, 0.01));
-    tr.appendChild(numCell('max', -1e9, 1e9, 0.01));
-    tr.appendChild(numCell('smoothing_ms', 0, 10000));
-    tr.appendChild(el('td', { class: 'edit-only' },
+    row.appendChild(el('td', null, asel));
+    row.appendChild(numCell('min', -1e9, 1e9, 0.01));
+    row.appendChild(numCell('max', -1e9, 1e9, 0.01));
+    row.appendChild(numCell('smoothing_ms', 0, 10000));
+    row.appendChild(el('td', { class: 'edit-only' },
       el('button', {
         class: 'danger', 'data-tip': 'Supprime cette entrée de patch',
         onclick: function () { sendEdit({ op: 'patch_artnet_remove', index: index }); }
       }, '✕')));
-    return tr;
+    return row;
   }
 
   /* ============================================================== SORTIES */
@@ -3952,7 +4007,7 @@
           var id = outputs().reduce(function (m, o) { return Math.max(m, o.id); }, 0) + 1;
           sendEdit({
             op: 'output_add',
-            output: { id: id, name: 'Sortie ' + id, monitor_index: null, width: 1920, height: 1080, fullscreen: true, enabled: false }
+            output: { id: id, name: trf('Sortie {0}', id), monitor_index: null, width: 1920, height: 1080, fullscreen: true, enabled: false }
           });
         }
       }, '+ Sortie')));
@@ -3967,7 +4022,7 @@
         el('th', null, ''), el('th', { class: 'edit-only' }, '')));
 
     outputs().forEach(function (o) {
-      var tr = el('tr');
+      var row = el('tr');
       function commit(mut) {
         var copy = JSON.parse(JSON.stringify(o));
         mut(copy);
@@ -3975,28 +4030,28 @@
       }
       var name = el('input', { type: 'text', value: o.name || '' });
       name.addEventListener('change', function () { commit(function (x) { x.name = name.value; }); });
-      tr.appendChild(el('td', null, name));
+      row.appendChild(el('td', null, name));
 
       var mon = el('input', { type: 'number', min: 0, value: o.monitor_index === null || o.monitor_index === undefined ? '' : o.monitor_index, placeholder: '—' });
       mon.addEventListener('change', function () {
         commit(function (x) { x.monitor_index = mon.value === '' ? null : Math.max(0, parseInt(mon.value, 10) || 0); });
       });
-      tr.appendChild(el('td', null, mon));
+      row.appendChild(el('td', null, mon));
 
       var w = el('input', { type: 'number', min: 1, value: o.width });
       w.addEventListener('change', function () { commit(function (x) { x.width = Math.max(1, parseInt(w.value, 10) || 1920); }); });
-      tr.appendChild(el('td', null, w));
+      row.appendChild(el('td', null, w));
       var h = el('input', { type: 'number', min: 1, value: o.height });
       h.addEventListener('change', function () { commit(function (x) { x.height = Math.max(1, parseInt(h.value, 10) || 1080); }); });
-      tr.appendChild(el('td', null, h));
+      row.appendChild(el('td', null, h));
 
       var fs = el('input', { type: 'checkbox', checked: !!o.fullscreen });
       fs.addEventListener('change', function () { commit(function (x) { x.fullscreen = fs.checked; }); });
-      tr.appendChild(el('td', null, fs));
+      row.appendChild(el('td', null, fs));
 
       var en = el('input', { type: 'checkbox', checked: !!o.enabled });
       en.addEventListener('change', function () { commit(function (x) { x.enabled = en.checked; }); });
-      tr.appendChild(el('td', null, en));
+      row.appendChild(el('td', null, en));
 
       /* mires : identification en un clic + sélecteur enrichi (grilles
          4/16, damier, barres SMPTE, extinction) */
@@ -4009,8 +4064,8 @@
           });
         if (!ok) { uiWarn('Aucun slice sur cette sortie — rien à afficher.'); return; }
         toast(kind === 'none'
-          ? 'Contenu retiré de « ' + (o.name || o.id) + ' » (' + ok + ' slice(s))'
-          : 'Mire « ' + patternLabel(kind) + ' » posée sur « ' + (o.name || o.id) + ' » (' + ok + ' slice(s))', 'ok');
+          ? trf('Contenu retiré de « {0} » ({1} slice(s))', o.name || o.id, ok)
+          : trf('Mire « {0} » posée sur « {1} » ({2} slice(s))', tr(patternLabel(kind)), o.name || o.id, ok), 'ok');
       }
       var mireOutSel = sel(
         ['', 'ident', 'grid', 'grid4', 'grid16', 'checker', 'bars', 'color_bars', 'none'],
@@ -4022,7 +4077,7 @@
         });
       mireOutSel.className = 'edit-only';
       mireOutSel.setAttribute('data-tip', 'Pose une mire sur tous les slices de cette sortie (cue standby/active) — « Éteindre » retire le contenu');
-      tr.appendChild(el('td', null,
+      row.appendChild(el('td', null,
         el('span', { class: 'toolbar', style: 'margin:0;flex-wrap:nowrap' },
           el('button', {
             class: 'edit-only',
@@ -4031,22 +4086,22 @@
           }, 'Identifier'),
           mireOutSel)));
 
-      tr.appendChild(el('td', { class: 'edit-only' },
+      row.appendChild(el('td', { class: 'edit-only' },
         el('button', {
           class: 'danger', 'data-tip': 'Supprime cette sortie (confirmation demandée)',
           onclick: function () {
             var nbSlices = slices().filter(function (s) { return s.output === o.id; }).length;
             confirmDialog({
-              title: 'Supprimer la sortie « ' + (o.name || ('sortie ' + o.id)) + ' » ?',
+              title: trf('Supprimer la sortie « {0} » ?', o.name || trf('sortie {0}', o.id)),
               message: (nbSlices
-                ? nbSlices + ' slice(s) calé(s) sur cette sortie deviendront orphelins. '
-                : '') + 'Annulable ensuite avec Ctrl+Z.',
+                ? trf('{0} slice(s) calé(s) sur cette sortie deviendront orphelins. ', nbSlices)
+                : '') + tr('Annulable ensuite avec Ctrl+Z.'),
               confirm: 'Supprimer',
               onConfirm: function () { sendEdit({ op: 'output_remove', id: o.id }); }
             });
           }
         }, '✕')));
-      table.appendChild(tr);
+      table.appendChild(row);
     });
 
     panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
@@ -4058,7 +4113,7 @@
             var id = outputs().reduce(function (m, o) { return Math.max(m, o.id); }, 0) + 1;
             sendEdit({
               op: 'output_add',
-              output: { id: id, name: 'Sortie ' + id, monitor_index: null, width: 1920, height: 1080, fullscreen: true, enabled: false }
+              output: { id: id, name: trf('Sortie {0}', id), monitor_index: null, width: 1920, height: 1080, fullscreen: true, enabled: false }
             });
           }
         })));
@@ -4121,7 +4176,7 @@
     }
     list.scrollTop = list.scrollHeight;
     var count = byId('journal-count');
-    if (count) { count.textContent = filteredLogs().length + ' ligne(s)'; }
+    if (count) { count.textContent = trf('{0} ligne(s)', filteredLogs().length); }
   }
 
   function logLineDom(l) {
@@ -4201,9 +4256,9 @@
           onclick: function () {
             var n = (loadName.value || '').trim();
             if (!n) { uiWarn('Choisissez un show à charger.'); return; }
-            if (n === show().name) { uiInfo('Le show « ' + n + ' » est déjà ouvert.'); return; }
+            if (n === show().name) { uiInfo(trf('Le show « {0} » est déjà ouvert.', n)); return; }
             confirmDialog({
-              title: 'Charger « ' + n + ' » ?',
+              title: trf('Charger « {0} » ?', n),
               message: 'Le show courant est sauvegardé automatiquement avant le chargement.',
               confirm: 'Charger', danger: false,
               onConfirm: function () { sendCmd({ cmd: 'show_load', name: n }); }
@@ -4215,8 +4270,7 @@
         onclick: function () {
           confirmDialog({
             title: 'Nouveau show ?',
-            message: 'Remplace la conduite courante par un show vide. ' +
-              'Le fichier du show actuel reste sur disque (shows/), mais les modifications non enregistrées seront perdues.',
+            message: tr('Remplace la conduite courante par un show vide. Le fichier du show actuel reste sur disque (shows/), mais les modifications non enregistrées seront perdues.'),
             confirm: 'Nouveau show',
             onConfirm: function () { sendCmd({ cmd: 'show_new' }); }
           });
@@ -4262,11 +4316,10 @@
       });
       return i;
     }
-    var lang = sel(['fr', 'en'], ['Français', 'English (à venir)'], st.language || 'fr', function (v) {
+    var lang = sel(['fr', 'en'], ['Français', 'English'], st.language || 'fr', function (v) {
       commitSettings(function (x) { x.language = v; });
-      if (v === 'en') { uiInfo('Interface anglaise : à venir — le réglage est enregistré.'); }
     });
-    lang.setAttribute('data-tip', 'Langue de l’interface (anglais : à venir)');
+    lang.setAttribute('data-tip', 'Langue de l’interface — appliquée immédiatement et enregistrée dans le show. Les messages émis par le moteur (journal) restent en français.');
     var fps = el('input', { type: 'number', min: 1, max: 30, value: st.mjpeg_fps || 8, 'data-tip': 'Cadence des préviews MJPEG (img/s)' });
     fps.addEventListener('change', function () {
       commitSettings(function (x) { x.mjpeg_fps = clamp(parseInt(fps.value, 10) || 8, 1, 30); });
@@ -4369,9 +4422,9 @@
           ? ('v' + about.version + (about.git ? ' (' + about.git + ')' : ''))
           : 'version non publiée par le moteur'),
       el('span', { class: 'spacer' }),
-      el('span', { class: 'muted' }, 'Licence ' + (about.license || 'MIT'))));
+      el('span', { class: 'muted' }, tr('Licence ') + (about.license || 'MIT'))));
     ap.appendChild(el('div', { class: 'about-desc' },
-      (about.description || 'Régie vidéo de spectacle — cues, mapping, ISF, MIDI/OSC/Art-Net') +
+      tr(about.description || 'Régie vidéo de spectacle — cues, mapping, ISF, MIDI/OSC/Art-Net') +
       (about.copyright ? ' — ' + about.copyright : '')));
     (Array.isArray(about.credits) ? about.credits : []).forEach(function (c) {
       if (!c || typeof c !== 'object') { return; }
@@ -4382,9 +4435,7 @@
           (c.license || '') + (c.notice ? ' — ' + c.notice : ''))));
     });
     ap.appendChild(el('div', { class: 'about-foot' },
-      'Licences tierces complètes : dossier licenses/ du portable ' +
-      '(THIRD-PARTY-NOTICES.html, FFMPEG.txt) et shaders/CREDITS.txt. ' +
-      'Réutilisation ciblée de Lanterne (MIT, même auteur).' +
+      tr('Licences tierces complètes : dossier licenses/ du portable (THIRD-PARTY-NOTICES.html, FFMPEG.txt) et shaders/CREDITS.txt. Réutilisation ciblée de Lanterne (MIT, même auteur).') +
       (about.website ? ' — ' + about.website : '')));
     root.appendChild(ap);
 
@@ -4428,10 +4479,10 @@
   function reservedReason(ks) {
     if (ks.indexOf('+') >= 0) { return null; }   /* avec modificateur : libre */
     if (RESERVED_BARE[ks]) {
-      return 'Touche réservée : ' + RESERVED_BARE[ks] + ' (raccourci système, non remappable).';
+      return trf('Touche réservée : {0} (raccourci système, non remappable).', tr(RESERVED_BARE[ks]));
     }
     if (/^[0-9]$/.test(ks)) {
-      return 'Touche réservée : les chiffres changent d’onglet. Ajoutez un modificateur (ex. Ctrl+' + ks + ').';
+      return trf('Touche réservée : les chiffres changent d’onglet. Ajoutez un modificateur (ex. Ctrl+{0}).', ks);
     }
     if (ks.indexOf('Arrow') === 0) {
       return 'Touche réservée : les flèches font le nudge des coins (Mapping).';
@@ -4494,7 +4545,7 @@
     LEARN.done = done;
     LEARN.prev = btn.textContent;
     btn.classList.add('key-learning');
-    btn.textContent = 'Appuyez sur une touche… (Échap : annuler)';
+    btn.textContent = tr('Appuyez sur une touche… (Échap : annuler)');
   }
 
   /* Écouteur en phase de CAPTURE : pendant le learn, la frappe est absorbée
@@ -4533,8 +4584,8 @@
     if (idx >= 0) {
       confirmDialog({
         title: 'Touche déjà affectée',
-        message: '« ' + ks + ' » déclenche déjà : ' + cmdTemplateLabel(keys[idx].command) +
-          '.\nRemplacer par : ' + cmdTemplateLabel(command) + ' ?',
+        message: trf('« {0} » déclenche déjà : {1}.\nRemplacer par : {2} ?',
+          ks, cmdTemplateLabel(keys[idx].command), cmdTemplateLabel(command)),
         confirm: 'Remplacer', danger: false,
         onConfirm: function () {
           sendEdit({ op: 'key_binding_remove', index: idx });
@@ -4572,8 +4623,8 @@
     if (other >= 0) {
       confirmDialog({
         title: 'Touche déjà affectée',
-        message: '« ' + ks + ' » déclenche déjà : ' + cmdTemplateLabel(keys[other].command) +
-          '.\nRemplacer par : ' + cmdTemplateLabel(b.command) + ' ?',
+        message: trf('« {0} » déclenche déjà : {1}.\nRemplacer par : {2} ?',
+          ks, cmdTemplateLabel(keys[other].command), cmdTemplateLabel(b.command)),
         confirm: 'Remplacer', danger: false,
         onConfirm: function () { apply(true); }
       });
@@ -4607,7 +4658,7 @@
      ['O', 'Notes de la cue en standby'], ['1–9, 0', 'Onglets'],
      ['Flèches', 'Nudge des coins (Mapping)'], ['Ctrl+Z', 'Annuler / rétablir']]
       .forEach(function (p) {
-        sys.appendChild(el('span', null, el('kbd', null, p[0]), ' ' + p[1]));
+        sys.appendChild(el('span', null, el('kbd', null, tr(p[0])), ' ' + tr(p[1])));
       });
     panel.appendChild(sys);
 
@@ -4620,23 +4671,23 @@
         el('th', { class: 'edit-only' }, ''),
         el('th', { class: 'edit-only' }, '')));
     keys.forEach(function (b, i) {
-      var tr = el('tr');
-      tr.appendChild(el('td', null, el('kbd', null, b.key || '?')));
-      tr.appendChild(el('td', null, cmdTemplateLabel(b.command)));
+      var row = el('tr');
+      row.appendChild(el('td', null, el('kbd', null, b.key || '?')));
+      row.appendChild(el('td', null, cmdTemplateLabel(b.command)));
       var learnBtn = el('button', {
         class: 'edit-only',
-        'data-tip': 'Capture la prochaine touche pour remplacer « ' + b.key + ' » (Échap : annuler)'
+        'data-tip': trf('Capture la prochaine touche pour remplacer « {0} » (Échap : annuler)', b.key)
       }, 'Learn');
       learnBtn.addEventListener('click', function () {
         startLearn(learnBtn, function (ks) { replaceKeyBinding(i, ks); });
       });
-      tr.appendChild(el('td', { class: 'edit-only' }, learnBtn));
-      tr.appendChild(el('td', { class: 'edit-only' },
+      row.appendChild(el('td', { class: 'edit-only' }, learnBtn));
+      row.appendChild(el('td', { class: 'edit-only' },
         el('button', {
           class: 'danger', 'data-tip': 'Supprime ce raccourci',
           onclick: function () { sendEdit({ op: 'key_binding_remove', index: i }); }
         }, '✕')));
-      table.appendChild(tr);
+      table.appendChild(row);
     });
     panel.appendChild(el('div', { style: 'overflow-x:auto' }, table));
     if (!keys.length) {
@@ -4786,7 +4837,7 @@
         break;
       case 'health_tick': S.health = ev.snapshot; updateHealth(); break;
       case 'timecode_locked':
-        toast('Timecode verrouillé (' + tcRateLabel(ev.rate) + ' i/s).', 'ok');
+        toast(trf('Timecode verrouillé ({0} i/s).', tcRateLabel(ev.rate)), 'ok');
         break;
       case 'timecode_unlocked':
         toast('Signal timecode perdu — les cues actives continuent.', 'warn');
@@ -4799,12 +4850,12 @@
         /* zip prêt (chemins expurgés) — chemin cliquable dans le toast */
         toast(el('span', null, 'Rapport de diagnostic prêt : ',
           el('code', null, String(ev.path || ''))), 'ok');
-        pushLog('info', 'ui', 'Rapport de diagnostic : ' + (ev.path || ''));
+        pushLog('info', 'ui', trf('Rapport de diagnostic : {0}', ev.path || ''));
         break;
       case 'warning':
         /* avertissement de conduite non bloquant (GO refusé par l'anti
            double-GO, commande impossible…) — throttlé côté moteur */
-        uiWarn(String(ev.message || 'Avertissement du moteur'));
+        uiWarn(tr(String(ev.message || 'Avertissement du moteur')));
         break;
       case 'show_loaded':
         /* re-synchronisation complète via un nouveau hello */
@@ -4817,15 +4868,15 @@
         var when = '';
         if (typeof ev.timestamp === 'number' && isFinite(ev.timestamp)) {
           var ms = ev.timestamp < 1e12 ? ev.timestamp * 1000 : ev.timestamp;
-          try { when = new Date(ms).toLocaleString('fr-FR'); } catch (e1) { when = String(ev.timestamp); }
+          try { when = new Date(ms).toLocaleString(I18N && I18N.lang() === 'en' ? 'en-GB' : 'fr-FR'); } catch (e1) { when = String(ev.timestamp); }
         } else if (ev.timestamp) {
           when = String(ev.timestamp);
         }
         confirmDialog({
           title: 'Récupération après arrêt inattendu',
-          message: 'Un état de récupération plus récent que le show enregistré a été trouvé'
+          message: tr('Un état de récupération plus récent que le show enregistré a été trouvé')
             + (when ? ' (' + when + ')' : '') + ' :\n'
-            + (ev.path || '') + '\n\nRestaurer cet état ? « Ignorer » conserve le show tel qu’enregistré.',
+            + (ev.path || '') + '\n\n' + tr('Restaurer cet état ? « Ignorer » conserve le show tel qu’enregistré.'),
           confirm: 'Restaurer', cancel: 'Ignorer', danger: false,
           onConfirm: function () { sendCmd({ cmd: 'recovery_load', path: ev.path }); },
           onCancel: function () { sendCmd({ cmd: 'recovery_dismiss' }); }
@@ -4841,6 +4892,10 @@
         } else if (opn === 'modulator_update' && S.dragging) {
           /* drag d'une bande sur le spectre : le canvas se redessine via la
              boucle d'animation, un re-render casserait le geste */
+        } else if (opn === 'settings_update' && syncLang()) {
+          /* changement de langue : le chrome (onglets, pied de page, badge de
+             mode) est hors du panneau courant — il faut TOUT re-rendre. */
+          renderAll();
         } else {
           requestRenderMain();
         }
@@ -4917,7 +4972,9 @@
   function startClock() {
     setInterval(function () {
       var c = byId('clock');
-      if (c) { c.textContent = new Date().toLocaleTimeString('fr-FR'); }
+      /* Horloge 24 h dans les deux langues : en régie on lit des heures de
+         conduite, jamais un « 9:05:03 PM ». */
+      if (c) { c.textContent = new Date().toLocaleTimeString('fr-FR', { hour12: false }); }
     }, 1000);
   }
 
