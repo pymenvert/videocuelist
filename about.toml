@@ -16,6 +16,9 @@ accepted = [
     "CC0-1.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # Magasin de certificats racines Mozilla (webpki-roots via ureq) : une
+    # donnée sous licence de données permissive, pas du code. Voir deny.toml.
+    "CDLA-Permissive-2.0",
 ]
 
 # Les cibles réellement distribuées (les notices couvrent les quatre OS).
